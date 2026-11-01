@@ -45,9 +45,11 @@ table.insert(alsa_monitor.rules, {
     ["priority.driver"] = 2000,
     -- ADSP reports position in whole periods. Reserve explicit pointer-jitter
     -- headroom without PipeWire halving the eight-period playback buffer.
+    -- At 2048 the fill dipped to one period, and a stream joining or leaving
+    -- the graph (music paused for a conversation) underran it several times in a row.
     ["api.alsa.disable-batch"] = true,
     ["api.alsa.period-size"] = 1024,
-    ["api.alsa.headroom"] = 2048,
+    ["api.alsa.headroom"] = 4096,
   },
 })
 
