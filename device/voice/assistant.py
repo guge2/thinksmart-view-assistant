@@ -44,6 +44,7 @@ UI_TEXT_LIMIT = 2000
 ASSISTANT_ROLE = "Assistant"
 FAREWELL_WORDS = re.compile(r"退下|没事|不用|再见|拜拜|休息|去休息|别说|不聊|结束对话|就这样")
 SLEEP_WORDS = re.compile(r"关机|关屏|关闭屏幕|关掉屏幕|息屏|熄屏|睡觉|去睡觉|晚安")
+QUESTION_END = re.compile(r"(?:[？?]|[吗呢么][。！!～~]?)[\s”」』\"')）]*$")
 END_TOOL = {
     "type": "function",
     "function": {
@@ -66,6 +67,7 @@ TOOL_RULES = (
     "使用工具时不要提前声称操作成功，以工具返回结果为准。"
     "用户想结束对话时调用end_conversation；说关机、关屏或睡觉时同时把screen_off设为true，你无法关闭设备电源。"
     "新闻、比赛、行情等需要最新信息的问题可以参考联网搜索结果，用一两句话概括，不要念出网址。"
+    "回答结束时不要说“还有什么需要”之类的客套追问；只有确实需要用户补充信息时才用问句结尾。"
 )
 
 
@@ -326,7 +328,10 @@ class ThinkSmartAssistant:
         self.thinking = os.getenv("THINKSMART_THINKING", "1") != "0"
         self.load_ui_prefs()
         self.thinking_budget = int(os.getenv("THINKSMART_THINKING_BUDGET", "1024"))
-        self.followup_seconds = float(os.getenv("THINKSMART_FOLLOWUP_SECONDS", "6"))
+        self.followup_seconds = float(os.getenv("THINKSMART_FOLLOWUP_SECONDS", "4"))
+        self.question_followup_seconds = float(os.getenv("THINKSMART_QUESTION_FOLLOWUP_SECONDS", "8"))
+        self.turn_effects = []
+        self.next_followup = 0.0
         self.ducker = Ducker(float(os.getenv("THINKSMART_DUCK_LEVEL", "0.45")))
         self.music = MusicService(ui.emit, float(os.getenv("THINKSMART_MUSIC_DUCK_LEVEL", "0.2")))
         self.alarms = AlarmService(ui.emit)
@@ -833,14 +838,18 @@ class ThinkSmartAssistant:
         logging.info("工具调用：%s %s", name, arguments)
         if name in ("get_current_time", "get_weather"):
             message, ok, _ = information.call_tool(name, arguments)
+            self.turn_effects.append("info")
             return message, ok, False
         if name == "manage_alarm":
             message, ok, _ = self.alarms.call_tool(name, arguments)
-            return message, ok, ok and args.get("action") != "list"
+            listing = args.get("action") == "list"
+            self.turn_effects.append("info" if listing else "action" if ok else "failed")
+            return message, ok, ok and not listing
         if name == "end_conversation":
             self.finish_conversation(bool(args.get("screen_off")))
             return ("" if has_reply else "好的"), True, True
         message, ok, started = self.music.call_tool(name, arguments)
+        self.turn_effects.append("action" if ok else "failed")
         self.music_started = self.music_started or started
         return message, ok, True
 
@@ -944,10 +953,14 @@ class ThinkSmartAssistant:
         self.set_phase("think")
         self.music_started = False
         self.conversation_over = False
+        self.turn_effects = []
+        self.next_followup = 0.0
         command = match_command(user_text, self.music.active())
         farewell = match_farewell(user_text, self.wake_phrase)
         if re.sub(r"[\s，。！？,.!?]", "", user_text) in ("停止闹钟", "关闭闹钟", "停止提醒"):
-            reply = "已停止提示音" if self.alarms.dismiss() else "现在没有正在响的闹钟或提醒"
+            dismissed = self.alarms.dismiss()
+            self.turn_effects.append("action" if dismissed else "failed")
+            reply = "已停止提示音" if dismissed else "现在没有正在响的闹钟或提醒"
             self.speak_reply(reply)
         elif farewell:
             self.finish_conversation(farewell == "sleep")
@@ -958,16 +971,35 @@ class ThinkSmartAssistant:
             self.speak_reply(reply)
         elif command:
             logging.info("本地指令：%s %s", *command)
-            reply, self.music_started = self.music.run_command(*command)
+            reply, ok, self.music_started = self.music.run_command(*command)
+            self.turn_effects.append("action" if ok else "failed")
             self.speak_reply(reply)
         elif self.offline_mode:
             reply = "离线时请说音量调大、音量调小、暂停播放、继续播放、上一首、下一首或现在几点。"
             self.speak_reply(reply)
         else:
-            logging.info("助手：%s", self.chat_turn(user_text))
+            reply = self.chat_turn(user_text)
+            logging.info("助手：%s", reply)
+            self.next_followup = self.followup_window(reply)
             return
         self.brain.note(user_text, reply)
         logging.info("助手：%s", reply)
+        self.next_followup = self.followup_window(reply)
+
+    def followup_window(self, reply):
+        """Seconds to keep listening without the wake word, judged by what this turn did.
+
+        A turn that only carried out actions (music, volume, alarms) is finished; a reply
+        that asks something waits longer; anything else gets a short window that closes
+        silently if the user does not speak."""
+        if self.conversation_over or self.music_started or self.offline_mode:
+            return 0.0
+        if QUESTION_END.search(reply or ""):
+            return self.question_followup_seconds
+        if self.turn_effects and all(effect == "action" for effect in self.turn_effects):
+            logging.info("指令已完成，结束对话")
+            return 0.0
+        return self.followup_seconds
 
     def finish_conversation(self, screen_off):
         self.conversation_over = True
@@ -1031,21 +1063,19 @@ class ThinkSmartAssistant:
     def follow_up(self):
         """Keep listening briefly after a reply so the user can continue without the wake word."""
         while (
-            self.followup_seconds > 0
+            self.next_followup > 0
             and not self.stop_requested
             and self.mic_enabled.is_set()
         ):
             self.set_phase("listen")
             self.open_capture()
-            text = self.transcribe_live(self.followup_seconds)
+            text = self.transcribe_live(self.next_followup)
             self.close_capture()
             if not text:
                 logging.info("追问窗口结束")
                 return
             self.duck()
             self.handle_turn(text)
-            if self.music_started or self.conversation_over:
-                return
 
     def run(self):
         self.start_control()
@@ -1099,8 +1129,7 @@ class ThinkSmartAssistant:
                 self.close_capture()
                 if text:
                     self.handle_turn(text)
-                    if not (self.music_started or self.offline_mode or self.conversation_over):
-                        self.follow_up()
+                    self.follow_up()
                 else:
                     logging.info("唤醒后未识别到有效语音")
                     self.ui.emit("nospeech")

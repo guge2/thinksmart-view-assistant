@@ -1148,14 +1148,15 @@ class MusicService:
         return f"音量已调到百分之{value}" if value is not None else "音量已调整"
 
     def run_command(self, name, argument):
-        """Returns (reply, playback_started)."""
+        """Returns (reply, ok, playback_started)."""
         if name == "play":
-            return self.play_query(argument)
-        if name == "louder":
-            return self.volume(change=10), False
-        if name == "quieter":
-            return self.volume(change=-10), False
-        return self.control(name)
+            reply, started = self.play_query(argument)
+            return reply, started, started
+        if name in ("louder", "quieter"):
+            reply = self.volume(change=10 if name == "louder" else -10)
+            return reply, reply != "音量调节失败", False
+        reply, started = self.control(name)
+        return reply, not reply.startswith(("现在没有", "不支持")), started
 
     def call_tool(self, name, arguments):
         """Returns (reply, ok, playback_started)."""

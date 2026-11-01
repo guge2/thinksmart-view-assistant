@@ -74,6 +74,8 @@ LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 # Reported position counts audio already queued in the pipe and PipeWire buffer.
 LYRIC_DELAY = 0.5
 LYRIC_SPAN = 4
+CARD_RECT = (16, 700, 784, 1264)
+CARD_EDGE = (56, 56, 56)
 UI_FONTS = (
     ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
     ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
@@ -248,7 +250,8 @@ class Orb:
             d.rounded_rectangle((c - w, c - core * 0.42, c + w, c + core * 0.12), radius=w, fill=240)
             d.ellipse((c - w * 1.2, c + core * 0.24, c + w * 1.2, c + core * 0.24 + w * 2.4), fill=240)
 
-        frame.paste(self.canvas.reduce(self.SCALE).convert("RGB"), rect[:2])
+        mask = self.canvas.reduce(self.SCALE)
+        frame.paste(WHITE, (rect[0], rect[1], rect[0] + mask.width, rect[1] + mask.height), mask)
 
 def draw_wifi(d, x, y, bars, on, off):
     for index, radius in enumerate((7, 13, 19)):
@@ -360,8 +363,8 @@ class App:
         self.console = Console()
         self.frame = Image.new("RGB", (W, H))
         self.draw = ImageDraw.Draw(self.frame)
-        self.bg = self.make_background()
-        self.bg_crops = {}
+        self.backgrounds = {assist: (self.make_background(assist), {}) for assist in (False, True)}
+        self.bg, self.bg_crops = self.backgrounds[False]
         self.fonts = Fonts()
         self.orb = Orb()
         self.ime = PinyinInput()
@@ -443,8 +446,11 @@ class App:
         self.link.send("hello")
 
     @staticmethod
-    def make_background():
-        return Image.new("RGB", (W, H), BG)
+    def make_background(assist):
+        image = Image.new("RGB", (W, H), BG)
+        if assist:
+            ImageDraw.Draw(image).rounded_rectangle(CARD_RECT, radius=44, fill=CARD, outline=CARD_EDGE, width=2)
+        return image
 
     # ---- layout -------------------------------------------------------
 
@@ -455,11 +461,16 @@ class App:
             return "music:account" if self.account["s"] == "ok" else "music:login"
         if self.screen != "home":
             return self.screen
-        if self.phase in ACTIVE or now < self.conv_until:
-            return "conv"
         if not self.music_visible(now):
-            return "idle"
-        return "idle:music:lyrics" if self.has_lyrics() else "idle:music"
+            base = "idle"
+        else:
+            base = "idle:music:lyrics" if self.has_lyrics() else "idle:music"
+        if self.phase in ACTIVE or now < self.conv_until:
+            return base + ":assist"
+        return base
+
+    def layout_has(self, flag):
+        return flag in (self.layout or "").split(":")
 
     def has_lyrics(self):
         return bool(self.lyric_lines) and self.lyric_key == self.music.get("k")
@@ -478,10 +489,10 @@ class App:
         self.active = None
         self.drag_value = None
         self.orb_rect = None
+        self.bg, self.bg_crops = self.backgrounds[self.layout_has("assist")]
         kind = layout.split(":")[0]
         builder = {
             "idle": self.build_idle,
-            "conv": self.build_conv,
             "settings": self.build_settings,
             "keyboard": self.build_keyboard,
             "places": self.build_places,
@@ -503,35 +514,43 @@ class App:
         ]
 
     def build_idle(self):
-        if self.layout == "idle:music:lyrics":
-            self.lyric_index = -2
-            center = Widget("lyrics", (24, 276, 776, 1016), self.paint_lyrics, tap=self.tap_orb)
-        else:
-            self.orb_rect = (180, 400, 620, 840)
-            center = Widget("orb", self.orb_rect, None, tap=self.tap_orb)
-        if self.layout.startswith("idle:music"):
-            bottom = Widget("player", (40, 1032, 760, 1142), self.paint_player, tap=self.tap_player)
-        else:
-            bottom = Widget("hint", (40, 880, 760, 960), self.paint_hint)
-        return [
+        widgets = [
             self.status_widget(),
             Widget("clock", (40, 64, 420, 190), self.paint_clock),
             Widget("date", (40, 190, 420, 236), self.paint_date),
             Widget("weather", (420, 64, 760, 236), self.paint_weather),
-            center,
-            bottom,
-        ] + self.bottom_buttons()
+        ]
+        if self.layout_has("lyrics"):
+            self.lyric_index = -2
+        if self.layout_has("assist"):
+            # The assistant card covers the bottom of the home screen; keep what is above it.
+            bottom = CARD_RECT[1] - 12
+            if self.layout_has("lyrics"):
+                widgets.append(Widget("lyrics", (24, 250, 776, bottom), self.paint_lyrics))
+            elif self.layout_has("music"):
+                widgets.append(Widget("player", (40, bottom - 110, 760, bottom), self.paint_player, tap=self.tap_player))
+            return widgets + self.card_widgets()
+        if self.layout_has("lyrics"):
+            widgets.append(Widget("lyrics", (24, 276, 776, 1016), self.paint_lyrics, tap=self.tap_orb))
+        else:
+            self.orb_rect = (180, 400, 620, 840)
+            widgets.append(Widget("orb", self.orb_rect, None, tap=self.tap_orb))
+        if self.layout_has("music"):
+            widgets.append(Widget("player", (40, 1032, 760, 1142), self.paint_player, tap=self.tap_player))
+        else:
+            widgets.append(Widget("hint", (40, 880, 760, 960), self.paint_hint))
+        return widgets + self.bottom_buttons()
 
-    def build_conv(self):
-        self.orb_rect = (260, 68, 540, 348)
+    def card_widgets(self):
+        x0, y0, x1, y1 = CARD_RECT
+        self.orb_rect = (x0 + 28, y0 + 24, x0 + 140, y0 + 136)
         return [
-            self.status_widget(),
             Widget("orb", self.orb_rect, None, tap=self.tap_orb),
-            Widget("phase", (0, 356, W, 420), self.paint_phase),
-            Widget("user", (40, 432, 760, 568), self.paint_user),
-            Widget("answer", (40, 580, 760, 1148), self.paint_answer),
-            Widget("stop", (290, 1168, 510, 1256), self.paint_stop, tap=self.tap_stop),
-        ] + self.bottom_buttons()
+            Widget("phase", (x0 + 160, y0 + 24, x1 - 112, y0 + 136), self.paint_phase),
+            Widget("stop", (x1 - 100, y0 + 44, x1 - 28, y0 + 116), self.paint_stop, tap=self.tap_stop),
+            Widget("user", (x0 + 36, y0 + 150, x1 - 36, y0 + 254), self.paint_user),
+            Widget("answer", (x0 + 36, y0 + 264, x1 - 36, y1 - 24), self.paint_answer),
+        ]
 
     def header(self, title, button, action):
         return [
@@ -841,10 +860,14 @@ class App:
     def paint_stop(self, d, rect, pressed):
         if self.phase not in ACTIVE and not self.alarm_active:
             return
-        d.rounded_rectangle(rect, radius=52, fill=CARD_PRESSED if pressed else BG, outline=FAINT, width=2)
-        cy = (rect[1] + rect[3]) // 2
-        d.rounded_rectangle((rect[0] + 58, cy - 12, rect[0] + 82, cy + 12), radius=4, fill=TEXT)
-        d.text((rect[0] + 100, cy), "停止" if self.alarm_active else "结束", font=self.fonts.ui(30), fill=TEXT, anchor="lm")
+        d.ellipse(rect, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
+        cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+        if self.alarm_active:
+            d.text((cx, cy), "停止", font=self.fonts.ui(24), fill=TEXT, anchor="mm")
+            return
+        r = 12
+        d.line((cx - r, cy - r, cx + r, cy + r), fill=TEXT, width=3)
+        d.line((cx - r, cy + r, cx + r, cy - r), fill=TEXT, width=3)
     @staticmethod
     def clock_text(seconds):
         seconds = max(0, int(seconds))
@@ -914,7 +937,8 @@ class App:
         x0, y0, x1, y1 = rect
         cy = (y0 + y1) // 2
         width = x1 - x0 - 32
-        for offset in range(-LYRIC_SPAN, LYRIC_SPAN + 1):
+        span = min(LYRIC_SPAN, ((y1 - y0) // 80 - 1) // 2)
+        for offset in range(-span, span + 1):
             index = self.lyric_index + offset
             if not 0 <= index < len(self.lyric_lines):
                 continue
@@ -925,7 +949,7 @@ class App:
                 color = TEXT
             else:
                 font = self.fonts.ui(36)
-                color = mix(DIM, BG, (abs(offset) - 1) / LYRIC_SPAN)
+                color = mix(DIM, BG, (abs(offset) - 1) / span)
             y = cy + offset * 80 + (14 if offset > 0 else -14 if offset < 0 else 0)
             d.text((W // 2, y), self.fit(text, font, width), font=font, fill=color, anchor="mm")
 
@@ -996,49 +1020,50 @@ class App:
 
     def paint_phase(self, d, rect, pressed):
         now = time.monotonic()
-        if self.phase in PHASE_TEXT:
+        if self.alarm_active:
+            text, color = "提醒", TEXT
+        elif self.phase in PHASE_TEXT:
             text, color = PHASE_TEXT[self.phase]
         elif self.error_code and now < self.error_until:
             text, color = self.hint(now)
         else:
-            text, color = f"说“{self.wake_phrase}”继续对话", FAINT
-        font = self.fonts.ui(36)
-        d.text((W // 2, (rect[1] + rect[3]) // 2), self.fit(text, font, W - 80), font=font, fill=color, anchor="mm")
+            return
+        font = self.fonts.ui(34)
+        d.text((rect[0], (rect[1] + rect[3]) // 2), self.fit(text, font, rect[2] - rect[0]),
+               font=font, fill=color, anchor="lm")
 
     def paint_user(self, d, rect, pressed):
         x0, y0, x1, _y1 = rect
         text = self.partial or self.user_text
-        final = bool(self.user_text) and not self.partial
-        if not text:
-            if self.phase not in ("wake", "listen"):
-                return
-            text = "请说出你的问题…"
-        d.text((x0 + 4, y0 + 14), "你说", font=self.fonts.ui(24), fill=FAINT, anchor="lm")
-        font = self.fonts.ui(36)
-        lines = self.wrap(font, text, x1 - x0 - 8)
+        if text:
+            color = DIM if self.partial else WARN
+        elif self.phase in ("wake", "listen"):
+            text, color = "请说出你的问题…", FAINT
+        else:
+            return
+        font = self.fonts.ui(32)
+        lines = self.wrap(font, text, x1 - x0)
         if len(lines) > 2:
             lines = ["…" + lines[-2]] + lines[-1:]
-        y = y0 + 34
+        y = y0 + 4
         for line in lines:
-            d.text((x0 + 4, y), line, font=font, fill=TEXT if final else DIM)
-            y += 48
+            d.text((x0, y), line, font=font, fill=color)
+            y += 46
 
     def paint_answer(self, d, rect, pressed):
         x0, y0, x1, y1 = rect
-        d.line((x0 + 4, y0 + 2, x1 - 4, y0 + 2), fill=LINE, width=2)
         if not self.answer:
             return
         font = self.fonts.ui(38)
-        line_height = 58
-        lines = self.wrap(font, self.answer, x1 - x0 - 8)
-        visible = (y1 - y0 - 40) // line_height
+        line_height = 56
+        lines = self.wrap(font, self.answer, x1 - x0)
+        visible = max(1, (y1 - y0) // line_height)
         if len(lines) > visible:
             lines = lines[-visible:]
-        y = y0 + 28
+        y = y0
         for line in lines:
-            d.text((x0 + 4, y), line, font=font, fill=TEXT)
+            d.text((x0, y), line, font=font, fill=TEXT)
             y += line_height
-
     def paint_title(self, d, rect, title):
         d.text((48, (rect[1] + rect[3]) // 2), title, font=self.fonts.ui(48), fill=TEXT, anchor="lm")
 
@@ -1518,7 +1543,7 @@ class App:
     def show_error(self, code, now, seconds):
         self.error_code = code
         self.error_until = now + seconds
-        if self.layout == "conv":
+        if self.layout_has("assist"):
             self.conv_until = max(self.conv_until, now + seconds)
         self.dirty |= {"hint", "phase"}
 
@@ -1576,7 +1601,7 @@ class App:
         if event == "alarm":
             self.activity(now)
             self.screen = "home"
-            self.user_text = "提醒"
+            self.user_text = ""
             self.partial = ""
             self.answer = text_field(message)
             self.alarm_active = True
@@ -1586,7 +1611,9 @@ class App:
             return
         if event == "alarm_end":
             self.alarm_active = False
-            self.dirty.add("stop")
+            if self.phase not in ACTIVE:
+                self.conv_until = now
+            self.dirty |= {"stop", "phase"}
             return
         if event == "sleep":
             self.sleep()
@@ -1603,8 +1630,8 @@ class App:
             self.dirty.add("user")
         elif event == "user":
             self.user_text = text_field(message)
-            self.partial = ""
-            self.dirty.add("user")
+            self.partial = self.answer = ""
+            self.dirty |= {"user", "answer"}
         elif event == "delta":
             if self.phase != "answer":
                 self.set_phase("answer", now)
@@ -1612,11 +1639,9 @@ class App:
             self.dirty.add("answer")
         elif event == "idle":
             if self.phase in ACTIVE:
-                hold = 12 if (self.answer or self.user_text) else 3
-                self.conv_until = max(self.conv_until, now + hold)
                 self.set_phase("idle", now)
         elif event == "nospeech":
-            self.show_error("nospeech", now, 5)
+            self.show_error("nospeech", now, 3)
         elif event == "error":
             code = message.get("code")
             if self.phase in ACTIVE:
@@ -1743,7 +1768,7 @@ class App:
                 self.wake_pending = None
                 self.set_notice("唤醒词更新失败，请稍后重试", BAD, 8)
                 self.dirty.add("wake")
-        if (self.layout or "").startswith("idle:music") and self.music.get("s") == "playing":
+        if self.layout_has("music") and self.music.get("s") == "playing":
             self.dirty.add("player")
         logging_in = self.screen == "music" and (self.login or {}).get("s") in LOGIN_FLOW
         if self.screen != "home" and now - self.last_activity > (300 if logging_in else 120):
@@ -1778,7 +1803,7 @@ class App:
         deadline = self.next_tick
         if animating:
             deadline = min(deadline, self.next_frame)
-        if self.layout == "idle:music:lyrics":
+        if self.layout_has("lyrics"):
             self.update_lyric(now)
             deadline = min(deadline, self.next_lyric)
         if self.dirty:
@@ -1800,7 +1825,7 @@ class App:
         wanted = self.wanted_layout(now)
         if wanted != self.layout:
             self.build(wanted)
-        if self.layout == "idle:music:lyrics":
+        if self.layout_has("lyrics"):
             self.update_lyric(now)
         self.render(now)
         if self.orb_rect is not None and not self.dimmed and now >= self.next_frame:
