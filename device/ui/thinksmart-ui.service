@@ -1,0 +1,56 @@
+[Unit]
+Description=ThinkSmart Display
+Wants=user@1000.service thinksmart-wake-request.path
+After=systemd-user-sessions.service user@1000.service getty@tty1.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=thinksmart
+Group=thinksmart
+SupplementaryGroups=video input
+TTYPath=/dev/tty1
+StandardInput=tty-force
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=HOME=/tmp
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/etc/thinksmart-ui.conf
+RuntimeDirectory=thinksmart-ui
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/thinksmart-ui/app.py
+Restart=always
+RestartSec=3
+Nice=5
+CPUWeight=50
+MemoryMax=220M
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ReadWritePaths=-/data/thinksmart/ui
+BindReadOnlyPaths=-/run/user/1000
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+DevicePolicy=closed
+DeviceAllow=char-fb rw
+DeviceAllow=char-input r
+DeviceAllow=/dev/tty1 rw
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=ThinkSmart wake word requests from the display
+
+[Path]
+PathExists=/run/thinksmart-ui/wake-request
+Unit=thinksmart-wake-request.service
+
+[Install]
+WantedBy=paths.target

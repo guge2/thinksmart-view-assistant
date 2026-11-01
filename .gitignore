@@ -1,0 +1,40 @@
+# Downloaded third-party tools and archives
+/tools/scrcpy/
+/tools/downloads/
+
+# Local diagnostics, temporary files, and runtime logs
+/work/
+/.local/
+*.log
+
+# Agent dependencies and bundle (rebuilt with npm run build)
+/device/agent/node_modules/
+/device/agent/dist/
+
+# Machine-specific shortcuts
+*.lnk
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Credentials and private keys (live only on the device or in .local/)
+.env
+*.pem
+*.key
+aliyun.json
+qq-credential.json
+qq-device*.json
+
+# Device backups and flashing tools
+/backups/
+/tools/edl/
+/tools/edl-env/
+/tools/ubuntu-thinksmart/
+/tools/msm8953-linux-6.12/
+/tools/usb/
+/tools/linux-runtime/
+/tools/aec-build/
+/tools/webrtc-audio-processing/
+/tools/pipewire/
+/outputs/audio/

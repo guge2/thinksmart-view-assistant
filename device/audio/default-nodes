@@ -1,0 +1,3 @@
+default.configured.audio.sink=alsa_output.platform-c051000.sound-card.HiFi__hw_cd18781y_0__sink
+default.configured.audio.source=alsa_input.platform-c051000.sound-card.HiFi__hw_cd18781y_1__source
+

@@ -1,0 +1,9 @@
+[Unit]
+Description=Save network-synchronized ThinkSmart RTC anchor
+After=systemd-timesyncd.service
+
+[Service]
+Type=oneshot
+StateDirectory=thinksmart-clock
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/thinksmart-clock/thinksmart-clock.py save

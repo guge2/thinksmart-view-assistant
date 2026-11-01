@@ -1,0 +1,15 @@
+[Unit]
+Description=ThinkSmart hardware volume keys
+After=user@1000.service
+Wants=user@1000.service
+
+[Service]
+User=thinksmart
+SupplementaryGroups=input
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/thinksmart-volume-keys
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

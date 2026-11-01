@@ -1,0 +1,21 @@
+#!/usr/bin/python3
+import glob, os, select, struct, subprocess
+
+KEY_VOLUMEDOWN, KEY_VOLUMEUP = 114, 115
+EVENT = struct.Struct("llHHi")
+STEP = {KEY_VOLUMEUP: "5%+", KEY_VOLUMEDOWN: "5%-"}
+
+devices = []
+for path in sorted(glob.glob("/sys/class/input/event*")):
+    with open(os.path.join(path, "device/name")) as f:
+        if f.read().strip() in ("gpio-keys", "pm8941_resin"):
+            devices.append(os.open("/dev/input/" + os.path.basename(path), os.O_RDONLY))
+
+while True:
+    ready, _, _ = select.select(devices, [], [])
+    for fd in ready:
+        data = os.read(fd, EVENT.size * 16)
+        for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _, _, etype, code, value = EVENT.unpack_from(data, i)
+            if etype == 1 and code in STEP and value in (1, 2):
+                subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", STEP[code]])

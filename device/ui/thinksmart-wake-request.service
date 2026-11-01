@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply ThinkSmart wake word request
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/thinksmart-set-wake-word --request /run/thinksmart-ui/wake-request
+TimeoutStartSec=120
+PrivateNetwork=true
+PrivateTmp=true

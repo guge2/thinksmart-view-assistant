@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore ThinkSmart clock from calibrated RTC counter
+DefaultDependencies=no
+After=local-fs.target systemd-timesyncd.service
+Before=time-set.target sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+StateDirectory=thinksmart-clock
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/thinksmart-clock/thinksmart-clock.py restore
+
+[Install]
+WantedBy=sysinit.target

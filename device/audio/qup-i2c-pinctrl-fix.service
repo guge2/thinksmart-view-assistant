@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore ThinkSmart I2C audio pinctrl
+After=systemd-modules-load.service sysinit.target
+Before=sound.target alsa-restore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/qup-i2c-pinctrl-fix.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+

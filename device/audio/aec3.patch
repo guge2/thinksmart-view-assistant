@@ -1,0 +1,20 @@
+--- a/aec-webrtc.cpp
++++ b/aec-webrtc.cpp
+@@ -171,12 +171,15 @@
+ #else
+ 	webrtc::AudioProcessing::Config config;
+ 	config.echo_canceller.enabled = true;
+-	// FIXME: Example code enables both gain controllers, but that seems sus
+-	config.gain_controller1.enabled = gain_control;
++	config.pipeline.multi_channel_render = true;
++	config.pipeline.multi_channel_capture = true;
++	// Use only AGC2, after echo cancellation, with its limiter.
++	config.gain_controller1.enabled = false;
+ 	config.gain_controller1.mode = webrtc::AudioProcessing::Config::GainController1::Mode::kAdaptiveDigital;
+ 	config.gain_controller1.analog_level_minimum = 0;
+ 	config.gain_controller1.analog_level_maximum = 255;
+ 	config.gain_controller2.enabled = gain_control;
++	config.gain_controller2.adaptive_digital.enabled = gain_control;
+ 	config.high_pass_filter.enabled = high_pass_filter;
+ 	config.noise_suppression.enabled = noise_suppression;
+ 	config.noise_suppression.level = webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
