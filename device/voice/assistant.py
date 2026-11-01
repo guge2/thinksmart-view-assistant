@@ -45,6 +45,13 @@ ASSISTANT_ROLE = "Assistant"
 FAREWELL_WORDS = re.compile(r"退下|没事|不用|再见|拜拜|休息|去休息|别说|不聊|结束对话|就这样")
 SLEEP_WORDS = re.compile(r"关机|关屏|关闭屏幕|关掉屏幕|息屏|熄屏|睡觉|去睡觉|晚安")
 QUESTION_END = re.compile(r"(?:[？?]|[吗呢么][。！!～~]?)[\s”」』\"')）]*$")
+# Thinking delays the first spoken word, so it is reserved for calculation, comparison and advice.
+THINK_WORDS = re.compile(
+    r"计算|算一下|算算|算出|等于多少|换算|折合|平均|百分之|几倍|多少倍|乘以|除以|加上|减去|\d\s*[+\-*/×÷^]\s*\d"
+    r"|比较|对比|相比|区别|差别|差异|优缺点|利弊|哪个(?:好|更|划算|值)|哪种|还是.{0,12}(?:好|划算|合适)"
+    r"|建议|推荐(?!.{0,6}(?:歌|曲|音乐))|怎么办|该不该|应不应该|值不值|值得|规划|计划|方案|攻略|分析"
+    r"|帮我(?:想|选|安排)|怎么选|如何选"
+)
 END_TOOL = {
     "type": "function",
     "function": {
@@ -1034,9 +1041,12 @@ class ThinkSmartAssistant:
 
     def chat_turn(self, user_text):
         spoken = []
+        thinking = self.thinking and bool(THINK_WORDS.search(user_text))
+        if thinking:
+            logging.info("本轮开启思考")
 
         def fragments():
-            for event in self.brain.chat(user_text, self.chat_context(), self.thinking, self.check_cancel):
+            for event in self.brain.chat(user_text, self.chat_context(), thinking, self.check_cancel):
                 if event[0] == "delta":
                     spoken.append(event[1])
                     yield event[1]

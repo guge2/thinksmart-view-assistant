@@ -73,6 +73,8 @@ LOGIN_APPS = {"mobile": "QQ音乐App", "qq": "QQ", "wx": "微信"}
 LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 # Reported position counts audio already queued in the pipe and PipeWire buffer.
 LYRIC_DELAY = 0.5
+# Lines switch slightly early so a singer can read ahead.
+LYRIC_LEAD = 0.2
 LYRIC_SPAN = 4
 CARD_RECT = (16, 700, 784, 1264)
 CARD_EDGE = (56, 56, 56)
@@ -923,7 +925,7 @@ class App:
         d.polygon([(cx - 15, cy - 15), (cx + 9, cy), (cx - 15, cy + 15)], fill=DIM)
 
     def update_lyric(self, now):
-        position = self.music_position(now)[0] - LYRIC_DELAY
+        position = self.music_position(now)[0] - LYRIC_DELAY + LYRIC_LEAD
         index = bisect.bisect_right(self.lyric_times, position) - 1
         if index != self.lyric_index:
             self.lyric_index = index
