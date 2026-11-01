@@ -74,7 +74,7 @@ LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 # Reported position counts audio already queued in the pipe and PipeWire buffer.
 LYRIC_DELAY = 0.5
 # Lines switch slightly early so a singer can read ahead.
-LYRIC_LEAD = 0.2
+LYRIC_LEAD = 0.5
 LYRIC_SPAN = 4
 CARD_RECT = (16, 700, 784, 1264)
 CARD_EDGE = (56, 56, 56)

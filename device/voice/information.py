@@ -36,6 +36,10 @@ def current_time():
     return result
 
 
+def home_city():
+    return ui_system.Settings()["location"]["name"]
+
+
 def weather(city="", day=0):
     location = ui_system.Settings()["location"]
     city = str(city or "").strip()[:40]

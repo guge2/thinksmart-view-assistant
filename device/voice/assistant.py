@@ -45,6 +45,10 @@ ASSISTANT_ROLE = "Assistant"
 FAREWELL_WORDS = re.compile(r"退下|没事|不用|再见|拜拜|休息|去休息|别说|不聊|结束对话|就这样")
 SLEEP_WORDS = re.compile(r"关机|关屏|关闭屏幕|关掉屏幕|息屏|熄屏|睡觉|去睡觉|晚安")
 QUESTION_END = re.compile(r"(?:[？?]|[吗呢么][。！!～~]?)[\s”」』\"')）]*$")
+# Without thinking the model often answers weather from web search or memory, so weather turns force
+# the tool and skip search; time is already in the context, so time turns only skip search.
+WEATHER_WORDS = re.compile(r"天气|气温|温度|几度|下雨|下雪|降雨|带伞|刮风|冷不冷|热不热|穿什么")
+TIME_WORDS = re.compile(r"几点|几号|星期几|礼拜几")
 # Thinking delays the first spoken word, so it is reserved for calculation, comparison and advice.
 THINK_WORDS = re.compile(
     r"计算|算一下|算算|算出|等于多少|换算|折合|平均|百分之|几倍|多少倍|乘以|除以|加上|减去|\d\s*[+\-*/×÷^]\s*\d"
@@ -831,6 +835,7 @@ class ThinkSmartAssistant:
             f"用户会用“{self.wake_phrase}”称呼你，这就是你的名字。"
             f"设备当前本地时间是{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}。"
             f"{information.current_time()}"
+            f"设备所在城市：{information.home_city()}。"
             f"当前计划：{scheduled}。"
             + self.music.describe()
         )
@@ -1041,12 +1046,16 @@ class ThinkSmartAssistant:
 
     def chat_turn(self, user_text):
         spoken = []
-        thinking = self.thinking and bool(THINK_WORDS.search(user_text))
+        weather = bool(WEATHER_WORDS.search(user_text))
+        search = not weather and not TIME_WORDS.search(user_text)
+        # Qwen rejects a forced tool choice while thinking.
+        thinking = self.thinking and not weather and bool(THINK_WORDS.search(user_text))
         if thinking:
             logging.info("本轮开启思考")
 
         def fragments():
-            for event in self.brain.chat(user_text, self.chat_context(), thinking, self.check_cancel):
+            force_tool = "get_weather" if weather else None
+            for event in self.brain.chat(user_text, self.chat_context(), thinking, search, force_tool, self.check_cancel):
                 if event[0] == "delta":
                     spoken.append(event[1])
                     yield event[1]

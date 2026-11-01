@@ -15,7 +15,7 @@ const EMPTY_USAGE = {
 
 let config;
 let agent;
-let current = { id: 0, context: "", thinking: false };
+let current = { id: 0, context: "", thinking: false, search: true, tool: null };
 let queue = Promise.resolve();
 const pendingTools = new Map();
 
@@ -100,7 +100,11 @@ function setup(message) {
 			const payload = { ...params, enable_thinking: current.thinking };
 			delete payload.thinking_budget;
 			if (current.thinking) payload.thinking_budget = config.thinkingBudget;
-			if (config.search) {
+			// Only the first request of a turn is forced; after the tool result the model must be free to answer.
+			if (current.tool && payload.messages?.at(-1)?.role === "user") {
+				payload.tool_choice = { type: "function", function: { name: current.tool } };
+			}
+			if (config.search && current.search) {
 				payload.enable_search = true;
 				payload.search_options = { search_strategy: "turbo" };
 			}
@@ -128,7 +132,13 @@ function trimHistory() {
 }
 
 async function chat(message) {
-	current = { id: message.id, context: message.context || "", thinking: !!message.thinking };
+	current = {
+		id: message.id,
+		context: message.context || "",
+		thinking: !!message.thinking,
+		search: message.search !== false,
+		tool: message.tool || null,
+	};
 	agent.state.thinkingLevel = current.thinking ? "low" : "off";
 	const before = [...agent.state.messages];
 	let failure;

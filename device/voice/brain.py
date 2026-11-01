@@ -58,12 +58,12 @@ class Brain:
             return {}
         return message if isinstance(message, dict) else {}
 
-    def chat(self, text, context, thinking, check_cancel):
+    def chat(self, text, context, thinking, search, force_tool, check_cancel):
         """Yields ("delta", text) and ("tool", call, name, args); answer each tool with tool_result()."""
         self.start()
         self.next_id += 1
         request = self.next_id
-        self.send({"t": "chat", "id": request, "text": text, "context": context, "thinking": thinking})
+        self.send({"t": "chat", "id": request, "text": text, "context": context, "thinking": thinking, "search": search, "tool": force_tool})
         finished = False
         deadline = time.monotonic() + IDLE_TIMEOUT
         try:
