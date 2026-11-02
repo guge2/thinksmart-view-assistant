@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import select
 import signal
@@ -21,6 +22,7 @@ import dashscope
 import sherpa_onnx
 
 from brain import Brain
+from playback import PCMPlayer, SpeechProgress
 from music import MUSIC_ROLE, MusicService, match_command
 import information
 import offline
@@ -28,7 +30,7 @@ from alarms import AlarmService
 
 
 SAMPLE_RATE = 16000
-FRAME_BYTES = 3200
+FRAME_BYTES = 1280  # 40 ms of 16 kHz s16 mono
 PLAYBACK_RATE = 22050
 VOICE_ROOT = "/data/thinksmart/voice"
 MODEL_NAME = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
@@ -55,6 +57,11 @@ THINK_WORDS = re.compile(
     r"|比较|对比|相比|区别|差别|差异|优缺点|利弊|哪个(?:好|更|划算|值)|哪种|还是.{0,12}(?:好|划算|合适)"
     r"|建议|推荐(?!.{0,6}(?:歌|曲|音乐))|怎么办|该不该|应不应该|值不值|值得|规划|计划|方案|攻略|分析"
     r"|帮我(?:想|选|安排)|怎么选|如何选"
+)
+EXPERT_REQUEST = re.compile(r"(?:用|请|让|交给|切换到?)\s*(?:openai|gpt|sol|6[.点]1|六点一)", re.I)
+HARD_TASK_WORDS = re.compile(
+    r"深入分析|详细分析|仔细分析|帮我分析|推导|证明|算法|调试|排查|代码|编程|架构"
+    r"|数学题|逻辑题|复杂|多步骤|详细规划|可行性|成本收益"
 )
 END_TOOL = {
     "type": "function",
@@ -86,15 +93,36 @@ class TurnCancelled(Exception):
     pass
 
 
+class WakeStream:
+    def __init__(self, spotter):
+        self.spotter = spotter
+        self.stream = spotter.create_stream()
+
+    def feed(self, samples, gain=1.0):
+        # Feed silence too: dropping quiet blocks reduced detections on the
+        # device's own known wake-word recording.
+        if gain != 1.0:
+            samples = [max(-1.0, min(1.0, v * gain)) for v in samples]
+        self.stream.accept_waveform(SAMPLE_RATE, samples)
+        while self.spotter.is_ready(self.stream):
+            self.spotter.decode_stream(self.stream)
+            result = self.spotter.get_result(self.stream)
+            if result:
+                self.spotter.reset_stream(self.stream)
+                return result
+        return ""
+
+
 class WakeDetector:
     """Keep AEC recognition and a separate, playback-only raw-mic fallback."""
 
     def __init__(self, assistant):
         self.assistant = assistant
         self.spotter = assistant.keyword_spotter
-        self.stream = self.spotter.create_stream()
+        self.stream = WakeStream(self.spotter)
         self.raw_capture = None
         self.raw_stream = None
+        self.last_hit = 0.0
 
     def __enter__(self):
         return self
@@ -109,27 +137,23 @@ class WakeDetector:
 
     def decode(self, stream, data, gain=1.0):
         samples = self.assistant.pcm_to_floats(data)
-        if gain != 1.0:
-            samples = [max(-1.0, min(1.0, v * gain)) for v in samples]
-        stream.accept_waveform(SAMPLE_RATE, samples)
-        while self.spotter.is_ready(stream):
-            self.spotter.decode_stream(stream)
-            result = self.spotter.get_result(stream)
-            if result:
-                return result
-        return ""
+        return stream.feed(samples, gain)
 
     def feed(self, data, raw_enabled=False):
         if not raw_enabled:
             self.close_raw()
         elif self.raw_capture is None:
             self.raw_capture = self.assistant.create_capture(RAW_CAPTURE_SOURCE)
-            self.raw_stream = self.spotter.create_stream()
+            self.raw_stream = WakeStream(self.spotter)
         result = self.decode(self.stream, data)
         raw_result = ""
         if self.raw_capture is not None:
-            raw_data = self.assistant.read_audio_bytes(self.raw_capture)
+            raw_data = self.assistant.read_capture(self.raw_capture)
             raw_result = self.decode(self.raw_stream, raw_data, gain=4.0)
+        now = time.monotonic()
+        if not (result or raw_result) or now - self.last_hit < 2.0:
+            return "", ""
+        self.last_hit = now
         return (result, "AEC") if result else (raw_result, "raw")
 
 
@@ -323,7 +347,11 @@ class ThinkSmartAssistant:
             "THINKSMART_ASR_MODEL",
             "qwen-audio-3.1-asr-flash-message",
         )
-        self.chat_model = os.getenv("THINKSMART_CHAT_MODEL", "qwen3.8-flash")
+        chat = self.load_chat_config()
+        expert = self.load_chat_config("expert.json")
+        self.expert_model = expert.get("model") if expert.get("api_key") else None
+        self.chat_provider = chat.get("provider", "bailian")
+        self.chat_model = chat.get("model") or os.getenv("THINKSMART_CHAT_MODEL", "qwen3.8-flash")
         self.tts_model = os.getenv(
             "THINKSMART_TTS_MODEL",
             "qwen-audio-3.1-tts-flash",
@@ -337,6 +365,7 @@ class ThinkSmartAssistant:
         )
         self.speech_rate = self.clamp_rate(os.getenv("THINKSMART_TTS_RATE", "1.5"))
         self.thinking = os.getenv("THINKSMART_THINKING", "1") != "0"
+        self.night = {"enabled": False, "start": 1320, "end": 420}
         self.load_ui_prefs()
         self.thinking_budget = int(os.getenv("THINKSMART_THINKING_BUDGET", "1024"))
         self.followup_seconds = float(os.getenv("THINKSMART_FOLLOWUP_SECONDS", "4"))
@@ -353,8 +382,12 @@ class ThinkSmartAssistant:
         self.screen_off_pending = False
         self.stop_requested = False
         self.capture = None
-        self.capture_prefix = b""
+        self.capture_thread = None
+        self.capture_stop = threading.Event()
+        self.audio_frames = queue.Queue()
         self.playback = None
+        self.speech_player = None
+        self.heard_reply = ""
         self.wake_phrase = self.read_wake_phrase()
         self.keyword_spotter = self.create_keyword_spotter()
         self.phase = "idle"
@@ -366,16 +399,41 @@ class ThinkSmartAssistant:
         self.barge_in_requested = threading.Event()
         self.raw_wake_allowed = True
         self.brain = Brain({
-            "apiKey": self.api_key,
-            "baseUrl": f"https://{self.workspace}.{self.region}.maas.aliyuncs.com/compatible-mode/v1",
+            "apiKey": chat.get("api_key") or self.api_key,
+            "baseUrl": chat.get("base_url") or f"https://{self.workspace}.{self.region}.maas.aliyuncs.com/compatible-mode/v1",
+            "provider": self.chat_provider,
+            "providerOrder": chat.get("provider_order", []),
             "model": self.chat_model,
-            "maxTokens": int(os.getenv("THINKSMART_MAX_REPLY_TOKENS", "256")),
+            "maxTokens": chat.get("max_tokens", int(os.getenv("THINKSMART_MAX_REPLY_TOKENS", "256"))),
+            "contextWindow": chat.get("context_window", 131072),
+            "expert": {
+                "apiKey": expert.get("api_key"),
+                "api": expert.get("api", "openai-responses"),
+                "provider": expert.get("provider", "openai"),
+                "baseUrl": expert.get("base_url", "https://api.openai.com/v1"),
+                "model": self.expert_model,
+                "reasoningEffort": expert.get("reasoning_effort", "high"),
+                "maxTokens": expert.get("max_tokens", 16384),
+                "contextWindow": expert.get("context_window", 1050000),
+            },
             "temperature": 0.6,
             "thinkingBudget": self.thinking_budget,
             "search": os.getenv("THINKSMART_WEB_SEARCH", "1") != "0",
-            "system": self.system_prompt + TOOL_RULES,
+            "system": self.system_prompt + TOOL_RULES + (
+                "默认使用简体中文与用户交流，回复正文和语音播报均使用中文。"
+                "即使用户夹带外文，或搜索结果、工具结果是外文，也要用中文解释和概括；"
+                "只有用户明确要求翻译成其他语言、使用其他语言回答或进行外语练习时，才切换语言。"
+                "歌名、歌手名、人名、型号、代码和接口标识符保留准确原文，不要为了中文化而误译。"
+            ) + (
+                "你可以按需调用联网搜索工具。涉及新闻、近期事件、比分、行情等实时信息时先搜索核实，"
+                "不要把记忆当成实时信息；普通聊天不必搜索。搜索后用自然中文概括，通常两三句话，"
+                "不要念网址、引用编号或Markdown标记。" if self.chat_provider == "openrouter" else ""
+            ),
             "tools": [END_TOOL] + self.music.tools + information.TOOLS + self.alarms.tools,
         })
+        logging.info("对话模型：%s / %s", self.chat_provider, self.chat_model)
+        if self.expert_model:
+            logging.info("困难任务模型：openai / %s / high", self.expert_model)
 
     @staticmethod
     def clamp_rate(value):
@@ -397,9 +455,21 @@ class ThinkSmartAssistant:
             self.speech_rate = self.clamp_rate(saved["speech_rate"])
         if isinstance(saved.get("thinking"), bool):
             self.thinking = saved["thinking"]
+        if isinstance(saved.get("night"), dict):
+            self.night.update(saved["night"])
+
+    def night_active(self):
+        now = datetime.datetime.now()
+        minute = now.hour * 60 + now.minute
+        start, end = self.night["start"], self.night["end"]
+        return self.night["enabled"] and start != end and (
+            start <= minute < end if start < end else minute >= start or minute < end
+        )
 
     def set_phase(self, phase):
         self.phase = phase
+        if phase == "think" and not self.barge_in_requested.is_set():
+            self.clear_audio()
         self.ui.emit(phase)
 
     def set_cloud(self, state):
@@ -489,6 +559,8 @@ class ThinkSmartAssistant:
                     self.speech_rate = self.clamp_rate(message.get("rate"))
                 if "think" in message:
                     self.thinking = bool(message.get("think"))
+                if "night" in message:
+                    self.night = message["night"]
                 logging.info("语速 %.1f，思考模式%s", self.speech_rate, "开启" if self.thinking else "关闭")
             elif command == "music":
                 self.music.ui_command(message.get("a"))
@@ -515,6 +587,15 @@ class ThinkSmartAssistant:
             samples.byteswap()
         peak = max(max(samples), -min(samples))
         return min(100, peak * 100 // 32768)
+
+    @staticmethod
+    def load_chat_config(filename="chat.json"):
+        directory = os.environ.get("CREDENTIALS_DIRECTORY", "")
+        path = os.path.join(directory, filename)
+        if not directory or not os.path.exists(path):
+            return {}
+        with open(path, encoding="utf-8") as source:
+            return json.load(source)
 
     @staticmethod
     def load_credentials():
@@ -599,7 +680,10 @@ class ThinkSmartAssistant:
     def open_capture(self):
         if self.capture is not None:
             return
+        self.capture_stop.clear()
         self.capture = self.create_capture(ECHO_CANCEL_SOURCE)
+        self.capture_thread = threading.Thread(target=self.capture_loop, name="microphone", daemon=True)
+        self.capture_thread.start()
 
     def create_capture(self, source):
         command = self.audio_command("--record", SAMPLE_RATE)
@@ -619,16 +703,32 @@ class ThinkSmartAssistant:
         )
 
     def close_capture(self):
+        self.capture_stop.set()
         self.stop_process(self.capture)
+        if self.capture_thread is not None:
+            self.capture_thread.join(timeout=5)
+        self.capture_thread = None
         self.capture = None
-        self.capture_prefix = b""
+        self.clear_audio()
 
-    def read_audio_bytes(self, capture=None):
-        if capture is None:
-            capture = self.capture
-            if self.capture_prefix:
-                frame, self.capture_prefix = self.capture_prefix[:FRAME_BYTES], self.capture_prefix[FRAME_BYTES:]
-                return frame
+    def clear_audio(self):
+        while not self.audio_frames.empty():
+            try:
+                self.audio_frames.get_nowait()
+            except queue.Empty:
+                break
+
+    def read_audio_bytes(self):
+        while True:
+            self.check_cancel()
+            try:
+                return self.audio_frames.get(timeout=0.1)
+            except queue.Empty:
+                if self.capture_thread is None or not self.capture_thread.is_alive():
+                    raise RuntimeError("microphone stream ended")
+
+    @staticmethod
+    def read_capture(capture):
         frame = bytearray()
         while len(frame) < FRAME_BYTES:
             if not select.select([capture.stdout], [], [], 4)[0]:
@@ -646,6 +746,40 @@ class ThinkSmartAssistant:
             frame.extend(data)
         return bytes(frame)
 
+    def capture_loop(self):
+        tail = deque(maxlen=8)
+        try:
+            with WakeDetector(self) as detector:
+                while not self.capture_stop.is_set() and not self.stop_requested:
+                    data = self.read_capture(self.capture)
+                    if not self.mic_enabled.is_set():
+                        detector.close_raw()
+                        tail.clear()
+                        continue
+                    tail.append(data)
+                    raw = self.raw_wake_allowed and (
+                        self.music.player.state == "playing" or self.speech_player is not None
+                    )
+                    result, source = detector.feed(data, raw)
+                    hit = result and self.phase != "wake" and not self.barge_in_requested.is_set()
+                    if hit:
+                        self.clear_audio()
+                        for frame in list(tail)[:-1]:
+                            self.audio_frames.put_nowait(frame)
+                        self.screen_off_pending = False
+                        if self.phase == "idle":
+                            self.set_phase("wake")
+                            self.talk_requested.set()
+                        else:
+                            self.barge_in_requested.set()
+                            self.cancel_requested.set()
+                        logging.info("%s检测到唤醒词：%s (%s)", self.phase, result, source)
+                    if self.phase in ("wake", "listen") or self.barge_in_requested.is_set():
+                        self.audio_frames.put_nowait(data)
+        except (OSError, RuntimeError, ValueError) as error:
+            if not self.capture_stop.is_set() and not self.stop_requested:
+                logging.error("麦克风监听失败：%s", error)
+
     @staticmethod
     def pcm_to_floats(data):
         samples = array.array("h")
@@ -656,78 +790,14 @@ class ThinkSmartAssistant:
 
     def wait_for_wake(self):
         logging.info("等待唤醒词：%s", self.wake_phrase)
-        self.talk_requested.clear()
-        with WakeDetector(self) as detector:
-            while not self.stop_requested:
-                if not self.mic_enabled.is_set():
-                    self.close_capture()
-                    detector.close_raw()
-                    while not self.stop_requested and not self.mic_enabled.wait(0.5):
-                        pass
-                    if self.stop_requested:
-                        break
-                    self.open_capture()
-                    detector.stream = self.keyword_spotter.create_stream()
-                    self.talk_requested.clear()
-                    continue
-                data = self.read_audio_bytes()
-                if self.talk_requested.is_set():
-                    self.talk_requested.clear()
-                    logging.info("界面请求开始对话")
-                    self.set_phase("wake")
-                    return True
-                result, source = detector.feed(data, self.music.player.state == "playing")
-                if result:
-                    logging.info("检测到唤醒词：%s (%s)", result, source)
-                    self.set_phase("wake")
-                    return True
+        while not self.stop_requested:
+            if self.talk_requested.wait(0.1):
+                self.talk_requested.clear()
+                self.set_phase("wake")
+                return True
+            if not self.capture_thread.is_alive():
+                raise RuntimeError("microphone stream ended")
         return False
-
-    def start_barge_in(self):
-        """Listen through AEC while speaking; hand the same capture to the next turn."""
-        stop = threading.Event()
-        if not self.mic_enabled.is_set():
-            return stop, None
-        self.open_capture()
-        capture = self.capture
-
-        def listen():
-            tail = deque(maxlen=3)
-            try:
-                with WakeDetector(self) as detector:
-                    while not stop.is_set() and not self.stop_requested and self.mic_enabled.is_set():
-                        data = self.read_audio_bytes(capture)
-                        if stop.is_set() or not self.mic_enabled.is_set():
-                            break
-                        tail.append(data)
-                        result, source = detector.feed(data, self.raw_wake_allowed)
-                        if result:
-                            # Keep the detection-delay window and the open pipe so a
-                            # command spoken straight after the wake word is retained.
-                            self.capture_prefix = b"".join(tail)
-                            self.barge_in_requested.set()
-                            self.cancel_requested.set()
-                            self.screen_off_pending = False
-                            logging.info("播报中检测到唤醒词：%s (%s)", result, source)
-                            playback = self.playback
-                            if playback is not None and playback.poll() is None:
-                                playback.terminate()
-                            return
-            except (OSError, RuntimeError, ValueError) as error:
-                if not stop.is_set() and not self.stop_requested:
-                    logging.warning("播报期间唤醒监听失败：%s", error)
-
-        thread = threading.Thread(target=listen, name="wake-during-speech", daemon=True)
-        thread.start()
-        return stop, thread
-
-    def stop_barge_in(self, listener):
-        stop, thread = listener
-        stop.set()
-        if thread is not None:
-            thread.join(timeout=5)
-        if not self.barge_in_requested.is_set():
-            self.close_capture()
 
     def play_wake_tone(self):
         duration_seconds = 0.12
@@ -741,7 +811,7 @@ class ThinkSmartAssistant:
                 index / max(1, fade_in),
                 (sample_count - index - 1) / max(1, fade_out),
             )
-            value = 0.18 * envelope * math.sin(
+            value = (0.09 if self.night_active() else 0.18) * envelope * math.sin(
                 2 * math.pi * 880 * index / PLAYBACK_RATE
             )
             samples.append(int(32767 * value))
@@ -775,7 +845,7 @@ class ThinkSmartAssistant:
                 payload = event.get("payload") or {}
                 sentence = (payload.get("output") or {}).get("sentence") or {}
                 text = sentence.get("text")
-                if text and not sentence.get("heartbeat"):
+                if text and not sentence.get("heartbeat") and not self.cancel_requested.is_set():
                     if text.strip() != state["text"]:
                         self.ui.emit("partial", text=text.strip())
                     state["text"] = text.strip()
@@ -816,7 +886,7 @@ class ThinkSmartAssistant:
                             break
                     recognition.stop()
                     stopped = True
-                    receiver.result(timeout=20)
+                    self.wait_receiver(receiver, 20)
                 except FutureTimeout as error:
                     raise RuntimeError("speech recognition did not finish") from error
                 finally:
@@ -846,6 +916,7 @@ class ThinkSmartAssistant:
 
     def run_tool(self, name, args, has_reply):
         """Returns (message, ok, final); final results are spoken as-is instead of going back to the model."""
+        self.check_cancel()
         arguments = json.dumps(args, ensure_ascii=False)
         logging.info("工具调用：%s %s", name, arguments)
         if name in ("get_current_time", "get_weather"):
@@ -866,43 +937,39 @@ class ThinkSmartAssistant:
         return message, ok, True
 
     def speak_stream(self, fragments):
-        self.playback = subprocess.Popen(
-            self.audio_command("--playback", PLAYBACK_RATE),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
+        player = PCMPlayer(PLAYBACK_RATE, 0.5 if self.night_active() else 1.0)
+        progress = SpeechProgress(PLAYBACK_RATE)
+        self.speech_player = player
+        self.heard_reply = ""
         reply_parts = []
         completed = False
         self.raw_wake_allowed = True
-        listener = (threading.Event(), None)
         try:
-            listener = self.start_barge_in()
             with self.client.audio.tts.connect(
                 model=self.tts_model,
                 voice=self.tts_voice,
                 format="pcm",
                 sample_rate=PLAYBACK_RATE,
                 rate=self.speech_rate,
+                parameters={"word_timestamp_enabled": True},
             ) as session:
 
                 def receive_audio():
-                    for chunk in session.audio_chunks():
+                    for event in session.events():
                         self.check_cancel()
-                        self.playback.stdin.write(chunk)
+                        if isinstance(event, bytes):
+                            progress.audio(event)
+                            player.write(event)
+                        else:
+                            progress.event(event)
 
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     receiver = pool.submit(receive_audio)
                     try:
                         for fragment in fragments:
-                            if self.stop_requested:
-                                break
-                            if self.cancel_requested.is_set():
-                                raise TurnCancelled()
+                            self.check_cancel()
                             if fragment:
                                 reply_parts.append(fragment)
-                                # Do not let the unfiltered path wake on our own name.
                                 if self.wake_phrase in re.sub(r"\s", "", "".join(reply_parts)):
                                     self.raw_wake_allowed = False
                                 self.ui.emit("delta", text=fragment)
@@ -910,43 +977,23 @@ class ThinkSmartAssistant:
                         session.stop()
                         self.set_phase("speak")
                         self.wait_receiver(receiver, 180)
+                        player.finish(self.check_cancel)
                     except Exception:
-                        try:
-                            session.cancel()
-                        except Exception:
-                            pass
-                        try:
-                            receiver.result(timeout=5)
-                        except Exception:
-                            pass
+                        player.close()
+                        session.close()
                         raise
             completed = True
         except Exception:
             self.check_cancel()
             raise
         finally:
-            if self.playback and self.playback.stdin:
-                try:
-                    self.playback.stdin.close()
-                except OSError:
-                    pass
-            try:
-                if completed:
-                    deadline = time.monotonic() + 30
-                    while self.playback.poll() is None:
-                        self.check_cancel()
-                        if time.monotonic() >= deadline:
-                            break
-                        try:
-                            self.playback.wait(timeout=0.1)
-                        except subprocess.TimeoutExpired:
-                            pass
-            finally:
-                self.stop_process(self.playback)
-                self.playback = None
-                self.stop_barge_in(listener)
+            player.close()
+            self.speech_player = None
+            self.heard_reply = "".join(reply_parts).strip() if completed else progress.heard(player.played_seconds)
+            if not completed:
+                logging.info("播报停止在 %.2f 秒，已听到：%s", player.played_seconds, self.heard_reply)
         self.check_cancel()
-        return "".join(reply_parts).strip()
+        return self.heard_reply
 
     def wait_receiver(self, receiver, timeout):
         deadline = time.monotonic() + timeout
@@ -954,12 +1001,26 @@ class ThinkSmartAssistant:
             try:
                 return receiver.result(timeout=0.25)
             except FutureTimeout:
-                if self.cancel_requested.is_set():
-                    raise TurnCancelled() from None
+                self.check_cancel()
                 if time.monotonic() >= deadline:
                     raise
 
     def handle_turn(self, user_text):
+        self.heard_reply = ""
+        self.local_result = ""
+        self.model_turn = False
+        try:
+            self.answer_turn(user_text)
+        finally:
+            if not self.model_turn:
+                reply = self.heard_reply
+                if self.cancel_requested.is_set() and reply:
+                    reply += "（播报被打断，只听到了以上内容。）"
+                if self.local_result and "action" in self.turn_effects:
+                    reply += f"（设备已执行：{self.local_result}）"
+                self.brain.note(user_text, reply)
+
+    def answer_turn(self, user_text):
         logging.info("用户：%s", user_text)
         self.ui.emit("user", text=user_text)
         self.set_phase("think")
@@ -973,28 +1034,25 @@ class ThinkSmartAssistant:
             dismissed = self.alarms.dismiss()
             self.turn_effects.append("action" if dismissed else "failed")
             reply = "已停止提示音" if dismissed else "现在没有正在响的闹钟或提醒"
-            self.speak_reply(reply)
         elif farewell:
             self.finish_conversation(farewell == "sleep")
             reply = "好的"
-            self.speak_reply(reply)
         elif self.offline_mode and any(word in user_text for word in ("几点", "几号", "星期")):
             reply = information.current_time()
-            self.speak_reply(reply)
         elif command:
             logging.info("本地指令：%s %s", *command)
             reply, ok, self.music_started = self.music.run_command(*command)
             self.turn_effects.append("action" if ok else "failed")
-            self.speak_reply(reply)
         elif self.offline_mode:
             reply = "离线时请说音量调大、音量调小、暂停播放、继续播放、上一首、下一首或现在几点。"
-            self.speak_reply(reply)
         else:
+            self.model_turn = True
             reply = self.chat_turn(user_text)
             logging.info("助手：%s", reply)
             self.next_followup = self.followup_window(reply)
             return
-        self.brain.note(user_text, reply)
+        self.local_result = reply
+        self.speak_reply(reply)
         logging.info("助手：%s", reply)
         self.next_followup = self.followup_window(reply)
 
@@ -1030,11 +1088,9 @@ class ThinkSmartAssistant:
         self.set_phase("speak")
         self.ui.emit("delta", text=reply)
         self.raw_wake_allowed = self.wake_phrase not in re.sub(r"\s", "", reply)
-        listener = self.start_barge_in()
-        try:
-            offline.speak(reply, lambda: self.cancel_requested.is_set() or self.stop_requested)
-        finally:
-            self.stop_barge_in(listener)
+        offline.speak(reply, lambda: self.cancel_requested.is_set() or self.stop_requested,
+                      gain=0.5 if self.night_active() else 1.0)
+        self.heard_reply = "" if self.cancel_requested.is_set() else reply
         self.check_cancel()
 
     def cloud_available(self):
@@ -1045,17 +1101,23 @@ class ThinkSmartAssistant:
             return False
 
     def chat_turn(self, user_text):
+        self.heard_reply = ""
         spoken = []
         weather = bool(WEATHER_WORDS.search(user_text))
         search = not weather and not TIME_WORDS.search(user_text)
+        expert = bool(self.expert_model and (
+            EXPERT_REQUEST.search(user_text) or (self.thinking and HARD_TASK_WORDS.search(user_text))
+        ))
         # Qwen rejects a forced tool choice while thinking.
         thinking = self.thinking and not weather and bool(THINK_WORDS.search(user_text))
-        if thinking:
+        if expert:
+            logging.info("本轮使用 %s，推理档位 high", self.expert_model)
+        elif thinking:
             logging.info("本轮开启思考")
 
         def fragments():
             force_tool = "get_weather" if weather else None
-            for event in self.brain.chat(user_text, self.chat_context(), thinking, search, force_tool, self.check_cancel):
+            for event in self.brain.chat(user_text, self.chat_context(), thinking, search, force_tool, self.check_cancel, expert=expert):
                 if event[0] == "delta":
                     spoken.append(event[1])
                     yield event[1]
@@ -1075,6 +1137,7 @@ class ThinkSmartAssistant:
                 reply = self.speak_stream(chain((first,), stream))
         finally:
             stream.close()
+            self.brain.heard(self.heard_reply, interrupted=self.cancel_requested.is_set() or not reply)
         if not reply:
             raise RuntimeError("language model returned an empty reply")
         return reply
@@ -1089,7 +1152,6 @@ class ThinkSmartAssistant:
             self.set_phase("listen")
             self.open_capture()
             text = self.transcribe_live(self.next_followup)
-            self.close_capture()
             if not text:
                 logging.info("追问窗口结束")
                 return
@@ -1107,12 +1169,12 @@ class ThinkSmartAssistant:
         while not self.stop_requested:
             try:
                 self.cancel_requested.clear()
-                self.open_capture()
                 if self.barge_in_requested.is_set():
-                    self.barge_in_requested.clear()
                     self.set_phase("wake")
+                    self.barge_in_requested.clear()
                 else:
                     self.set_phase("idle")
+                    self.open_capture()
                     if self.screen_off_pending:
                         self.screen_off_pending = False
                         self.ui.emit("sleep")
@@ -1126,6 +1188,7 @@ class ThinkSmartAssistant:
                     break
                 self.set_phase("listen")
                 self.offline_mode = not self.cloud_available()
+                self.check_cancel()
                 self.set_cloud("offline" if self.offline_mode else "busy")
                 if self.offline_mode:
                     text = self.offline_commands.listen(self)
@@ -1141,11 +1204,12 @@ class ThinkSmartAssistant:
                         self.close_capture()
                         self.offline_mode = True
                         self.set_cloud("offline")
+                        self.set_phase("think")
+                        self.open_capture()
                         self.speak_reply("网络不可用，请再说一次简单指令。")
                         self.set_phase("listen")
                         self.open_capture()
                         text = self.offline_commands.listen(self)
-                self.close_capture()
                 if text:
                     self.handle_turn(text)
                     self.follow_up()
@@ -1170,6 +1234,8 @@ class ThinkSmartAssistant:
         self.stop_requested = True
         self.close_capture()
         self.stop_process(self.playback)
+        if self.speech_player is not None:
+            self.speech_player.close()
         self.alarms.shutdown()
         self.music.shutdown()
         self.brain.close()

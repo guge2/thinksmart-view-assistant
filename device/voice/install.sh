@@ -56,14 +56,15 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
 	python3-venv curl ca-certificates bzip2
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-	python3-pil fonts-wqy-microhei fonts-dejavu-core fonts-dejavu-extra libmpg123-0t64 espeak-ng
+	python3-pil fonts-wqy-microhei fonts-dejavu-core fonts-dejavu-extra libmpg123-0t64 libpulse0 pipewire-pulse espeak-ng
+runuser -u thinksmart -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable --now pipewire-pulse.socket
 
 install -d -m 0755 "$APP_ROOT" "$DATA_ROOT" "$MODEL_ROOT" "$CACHE_ROOT"
 install -d -m 0755 /etc/thinksmart-voice
 install -m 0755 "$BASE/assistant.py" "$APP_ROOT/assistant.py"
 install -m 0644 "$BASE/music.py" "$APP_ROOT/music.py"
 install -m 0644 "$BASE/alarms.py" "$APP_ROOT/alarms.py"
-install -m 0644 "$BASE/offline.py" "$BASE/information.py" "$BASE/brain.py" "$APP_ROOT/"
+install -m 0644 "$BASE/offline.py" "$BASE/information.py" "$BASE/brain.py" "$BASE/playback.py" "$APP_ROOT/"
 install -d -m 0755 "$AGENT_ROOT"
 install -m 0644 "$AGENT_SRC" "$AGENT_ROOT/agent.mjs"
 if [ "$("$NODE_ROOT/bin/node" --version 2>/dev/null)" != "v$NODE_VERSION" ]; then
@@ -81,6 +82,8 @@ if [ "$("$NODE_ROOT/bin/node" --version 2>/dev/null)" != "v$NODE_VERSION" ]; the
 fi
 install -d -o thinksmart -g thinksmart -m 0700 /data/thinksmart/music
 install -m 0755 "$BASE/configure_voice.py" /usr/local/sbin/thinksmart-configure-voice
+install -m 0755 "$BASE/configure_chat.py" /usr/local/sbin/thinksmart-configure-chat
+install -m 0755 "$BASE/configure_expert.py" /usr/local/sbin/thinksmart-configure-expert
 install -m 0755 "$BASE/set-wake-word.sh" /usr/local/sbin/thinksmart-set-wake-word
 install -m 0644 "$BASE/thinksmart-voice.service" /etc/systemd/system/thinksmart-voice.service
 install -m 0644 "$BASE/thinksmart-voice.conf" /etc/thinksmart-voice.conf

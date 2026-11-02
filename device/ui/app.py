@@ -57,7 +57,7 @@ PHASE_TEXT = {
 }
 ERRORS = {
     "network": "网络连接失败，请检查 Wi-Fi",
-    "auth": "阿里云鉴权失败，请重新配置凭据",
+    "auth": "云端鉴权失败，请检查 API 密钥",
     "config": "语音助手尚未正确配置",
     "mic": "麦克风暂时不可用",
     "llm": "模型没有返回内容，请再试一次",
@@ -423,6 +423,7 @@ class App:
         self.last_activity = now
         self.dimmed = False
         self.asleep = False
+        self.applied_brightness = None
         self.status_version = -1
         self.clock_key = None
         self.next_tick = 0.0
@@ -496,6 +497,7 @@ class App:
         builder = {
             "idle": self.build_idle,
             "settings": self.build_settings,
+            "night": self.build_night,
             "keyboard": self.build_keyboard,
             "places": self.build_places,
             "music": self.build_music,
@@ -564,18 +566,37 @@ class App:
 
     def build_settings(self):
         return self.header("设置", "完成", self.close_settings) + [
-            Widget("volume", (40, 190, 760, 302), self.paint_volume, drag=self.drag_volume),
-            Widget("brightness", (40, 306, 760, 418), self.paint_brightness, drag=self.drag_brightness),
-            Widget("speed", (40, 422, 760, 534), self.paint_speed, drag=self.drag_speed),
-            Widget("wake", (40, 538, 760, 622), self.paint_wake_row, tap=lambda x, y: self.open_keyboard("wake")),
-            Widget("city", (40, 626, 760, 710), self.paint_city_row, tap=lambda x, y: self.open_keyboard("city")),
-            Widget("microw", (40, 714, 760, 798), self.paint_mic_row, tap=self.toggle_mic),
-            Widget("think", (40, 802, 760, 886), self.paint_think_row, tap=self.toggle_thinking),
-            Widget("dim", (40, 890, 760, 974), self.paint_dim_row, tap=self.cycle_dim),
-            Widget("qqmusic", (40, 978, 760, 1062), self.paint_qqmusic_row, tap=self.open_music),
-            Widget("notice", (40, 1066, 760, 1100), self.paint_notice),
-            Widget("info", (40, 1104, 760, 1280), self.paint_info),
+            Widget("volume", (40, 178, 760, 286), self.paint_volume, drag=self.drag_volume),
+            Widget("brightness", (40, 290, 760, 398), self.paint_brightness, drag=self.drag_brightness),
+            Widget("speed", (40, 402, 760, 510), self.paint_speed, drag=self.drag_speed),
+            Widget("wake", (40, 514, 760, 588), self.paint_wake_row, tap=lambda x, y: self.open_keyboard("wake")),
+            Widget("city", (40, 592, 760, 666), self.paint_city_row, tap=lambda x, y: self.open_keyboard("city")),
+            Widget("microw", (40, 670, 760, 744), self.paint_mic_row, tap=self.toggle_mic),
+            Widget("think", (40, 748, 760, 822), self.paint_think_row, tap=self.toggle_thinking),
+            Widget("dim", (40, 826, 760, 900), self.paint_dim_row, tap=self.cycle_dim),
+            Widget("qqmusic", (40, 904, 760, 978), self.paint_qqmusic_row, tap=self.open_music),
+            Widget("night", (40, 982, 760, 1056), self.paint_night_row, tap=lambda x, y: self.set_screen("night")),
+            Widget("notice", (40, 1060, 760, 1094), self.paint_notice),
+            Widget("info", (40, 1098, 760, 1280), self.paint_info),
         ]
+
+    def build_night(self):
+        widgets = self.header("夜间模式", "返回", lambda x, y: self.set_screen("settings"))
+        widgets.append(Widget("night_toggle", (40, 200, 760, 300),
+                              lambda d, r, p: self.paint_toggle(d, r, p, "定时开启", self.settings["night"]["enabled"]),
+                              tap=self.toggle_night))
+        for field, title, top in (("start", "开始时间", 360), ("end", "结束时间", 660)):
+            widgets.append(Widget(field + "_label", (40, top, 760, top + 64),
+                                  lambda d, r, p, t=title: self.paint_title(d, r, t)))
+            widgets.append(Widget(field + "_time", (240, top + 84, 560, top + 188),
+                                  lambda d, r, p, f=field: d.text((400, (r[1] + r[3]) // 2),
+                                      self.night_time(f), font=self.fonts.digits(64), fill=TEXT, anchor="mm")))
+            for side, label, delta in ((40, "−", -30), (580, "+", 30)):
+                widgets.append(Widget(f"{field}:{delta}", (side, top + 92, side + 180, top + 180),
+                                      lambda d, r, p, t=label: self.paint_button(d, r, p, t),
+                                      tap=lambda x, y, f=field, n=delta: self.change_night_time(f, n)))
+        widgets.append(Widget("night_hint", (40, 1000, 760, 1200), self.paint_night_hint))
+        return widgets
 
     def build_music(self):
         widgets = self.header("QQ音乐", "返回", self.close_music)
@@ -741,12 +762,12 @@ class App:
         if not self.voice_online:
             return "语音离线", BAD
         return {
-            "ready": ("阿里云 就绪", FAINT),
-            "busy": ("阿里云 处理中", DIM),
-            "offline": ("阿里云 离线", BAD),
-            "auth": ("阿里云 鉴权失败", BAD),
-            "error": ("阿里云 异常", WARN),
-        }.get(self.cloud, ("阿里云 连接中", DIM))
+            "ready": ("云端 就绪", FAINT),
+            "busy": ("云端 处理中", DIM),
+            "offline": ("云端 离线", BAD),
+            "auth": ("云端 鉴权失败", BAD),
+            "error": ("云端 异常", WARN),
+        }.get(self.cloud, ("云端 连接中", DIM))
 
     def current_volume(self):
         if self.drag_value is not None and self.active is self.named.get("volume"):
@@ -1132,6 +1153,30 @@ class App:
     def paint_dim_row(self, d, rect, pressed):
         self.paint_row(d, rect, pressed, "自动调暗", DIM_LABELS.get(self.settings["dim_after"], "5 分钟"))
 
+    def night_time(self, field):
+        minutes = self.settings["night"][field]
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+    def night_active(self):
+        night = self.settings["night"]
+        local = time.localtime()
+        minute = local.tm_hour * 60 + local.tm_min
+        start, end = night["start"], night["end"]
+        return night["enabled"] and start != end and (
+            start <= minute < end if start < end else minute >= start or minute < end
+        )
+
+    def paint_night_row(self, d, rect, pressed):
+        value = f"{self.night_time('start')}–{self.night_time('end')}" if self.settings["night"]["enabled"] else "关闭"
+        self.paint_row(d, rect, pressed, "夜间模式", value)
+
+    def paint_night_hint(self, d, rect, pressed):
+        lines = ["每次调整 30 分钟，支持跨午夜", "夜间助手音量减半，屏幕亮度降低", "闹钟和计时提醒保持原音量"]
+        if self.settings["night"]["start"] == self.settings["night"]["end"]:
+            lines[0] = "开始与结束相同，夜间模式不生效"
+        for index, line in enumerate(lines):
+            d.text((400, rect[1] + index * 52), line, font=self.fonts.ui(28), fill=DIM, anchor="mt")
+
     def paint_mic_row(self, d, rect, pressed):
         self.paint_toggle(d, rect, pressed, "语音唤醒", self.mic_on)
 
@@ -1180,7 +1225,7 @@ class App:
             ("网络", net),
             ("地址", network.get("ip") or "—"),
             ("语音服务", voice),
-            ("阿里云", self.cloud_label()[0].replace("阿里云 ", "")),
+            ("云端", self.cloud_label()[0].replace("云端 ", "")),
             ("天气", sky),
         )
         font = self.fonts.ui(24)
@@ -1379,7 +1424,22 @@ class App:
         self.dirty |= {"mic", "microw", "hint"}
 
     def send_prefs(self):
-        self.link.send("prefs", rate=self.settings["speech_rate"], think=int(self.settings["thinking"]))
+        self.link.send("prefs", rate=self.settings["speech_rate"], think=int(self.settings["thinking"]),
+                       night=self.settings["night"])
+
+    def toggle_night(self, *_args):
+        night = dict(self.settings["night"])
+        night["enabled"] = not night["enabled"]
+        self.settings.update(night=night)
+        self.send_prefs()
+        self.dirty |= {"night_toggle", "night"}
+
+    def change_night_time(self, field, delta):
+        night = dict(self.settings["night"])
+        night[field] = (night[field] + delta) % 1440
+        self.settings.update(night=night)
+        self.send_prefs()
+        self.dirty |= {field + "_time", "night_hint"}
 
     def toggle_thinking(self, *_args):
         self.settings.update(thinking=not self.settings["thinking"])
@@ -1413,7 +1473,7 @@ class App:
         if not self.status.backlight.writable():
             return
         self.brightness = max(5, self.slider_value("brightness", x))
-        self.status.set_brightness(self.brightness)
+        self.update_dim(time.monotonic())
         if phase == "up":
             self.settings.update(brightness=self.brightness)
         self.dirty.add("brightness")
@@ -1663,6 +1723,7 @@ class App:
         self.screen = "home"
         self.conv_until = 0.0
         self.asleep = self.dimmed = True
+        self.applied_brightness = 0
         self.status.set_brightness(0)
 
     def update_dim(self, now):
@@ -1677,9 +1738,13 @@ class App:
             and now - self.last_activity > limit
             and backlight.writable()
         )
-        if wanted != self.dimmed:
-            self.dimmed = wanted
-            self.status.set_brightness(max(1.0, self.brightness * 0.12) if wanted else self.brightness)
+        self.dimmed = wanted
+        brightness = min(self.brightness, 20) if self.night_active() else self.brightness
+        if wanted:
+            brightness = max(1.0, brightness * 0.12)
+        if brightness != self.applied_brightness:
+            self.applied_brightness = brightness
+            self.status.set_brightness(brightness)
 
     def on_touch(self, kind, x, y, now):
         was_dimmed = self.dimmed

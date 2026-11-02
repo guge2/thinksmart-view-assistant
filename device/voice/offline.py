@@ -43,11 +43,11 @@ class OfflineCommands:
         return ""
 
 
-def speak(text, cancelled=None):
+def speak(text, cancelled=None, gain=1.0):
     """Speak a short response without network; return whether playback succeeded."""
     try:
         synthesis = subprocess.run(
-            ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "160", "--stdout", text],
+            ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "160", "-a", str(round(100 * gain)), "--stdout", text],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, check=True,
         )
         if cancelled is not None and cancelled():

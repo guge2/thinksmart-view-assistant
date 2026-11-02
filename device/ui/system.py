@@ -110,6 +110,7 @@ class Settings:
             "mic": True,
             "speech_rate": 1.5,
             "thinking": True,
+            "night": {"enabled": False, "start": 22 * 60, "end": 7 * 60},
             "location": {
                 "name": os.getenv("THINKSMART_UI_CITY", "上海")[:40] or "上海",
                 "lat": env_float("THINKSMART_UI_LATITUDE", 31.2304),
@@ -134,6 +135,13 @@ class Settings:
                 self.data["speech_rate"] = round(float(rate), 1)
             if isinstance(saved.get("thinking"), bool):
                 self.data["thinking"] = saved["thinking"]
+            night = saved.get("night")
+            if isinstance(night, dict):
+                self.data["night"] = {
+                    "enabled": bool(night.get("enabled", False)),
+                    "start": int(night.get("start", 1320)) % 1440,
+                    "end": int(night.get("end", 420)) % 1440,
+                }
             location = valid_location(saved.get("location"))
             if location:
                 self.data["location"] = location

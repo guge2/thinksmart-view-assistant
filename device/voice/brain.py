@@ -18,6 +18,7 @@ class Brain:
         self.process = None
         self.buffer = b""
         self.next_id = 0
+        self.request = None
 
     def alive(self):
         return self.process is not None and self.process.poll() is None
@@ -58,14 +59,16 @@ class Brain:
             return {}
         return message if isinstance(message, dict) else {}
 
-    def chat(self, text, context, thinking, search, force_tool, check_cancel):
+    def chat(self, text, context, thinking, search, force_tool, check_cancel, expert=False):
         """Yields ("delta", text) and ("tool", call, name, args); answer each tool with tool_result()."""
         self.start()
         self.next_id += 1
         request = self.next_id
-        self.send({"t": "chat", "id": request, "text": text, "context": context, "thinking": thinking, "search": search, "tool": force_tool})
+        self.request = request
+        self.send({"t": "chat", "id": request, "text": text, "context": context, "thinking": thinking, "search": search, "tool": force_tool, "expert": expert})
         finished = False
-        deadline = time.monotonic() + IDLE_TIMEOUT
+        timeout = 270 if expert else IDLE_TIMEOUT
+        deadline = time.monotonic() + timeout
         try:
             while True:
                 check_cancel()
@@ -88,16 +91,21 @@ class Brain:
                 elif kind == "error":
                     finished = True
                     raise RuntimeError(f"chat request failed: {message.get('message')}")
-                deadline = time.monotonic() + IDLE_TIMEOUT
+                deadline = time.monotonic() + timeout
         finally:
             if not finished and self.alive():
                 try:
-                    self.send({"t": "abort"})
+                    self.send({"t": "abort", "id": request})
                 except RuntimeError:
                     pass
 
     def tool_result(self, call, text, ok, final):
         self.send({"t": "tool_result", "call": call, "text": text, "ok": ok, "final": final})
+
+    def heard(self, text, interrupted=False):
+        if self.request is not None and self.alive():
+            self.send({"t": "heard", "id": self.request, "text": text, "interrupted": interrupted})
+        self.request = None
 
     def note(self, user, reply):
         """Records a turn answered locally so the model keeps the conversation context."""

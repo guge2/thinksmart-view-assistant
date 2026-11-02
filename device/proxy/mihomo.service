@@ -1,0 +1,16 @@
+[Unit]
+Description=ThinkSmart Mihomo proxy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/thinksmart/proxy
+ExecStart=/data/thinksmart/proxy/bin/mihomo -d /data/thinksmart/proxy -f /data/thinksmart/proxy/config.yaml
+Restart=on-failure
+RestartSec=3
+UMask=0077
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

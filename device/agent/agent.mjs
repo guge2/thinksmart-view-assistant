@@ -1,9 +1,9 @@
 import { createInterface } from "node:readline";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
+import { streamSimple as streamResponses } from "@earendil-works/pi-ai/api/openai-responses";
 
 const HISTORY_TURNS = 6;
-const PROVIDER = "bailian";
 const EMPTY_USAGE = {
 	input: 0,
 	output: 0,
@@ -15,16 +15,20 @@ const EMPTY_USAGE = {
 
 let config;
 let agent;
-let current = { id: 0, context: "", thinking: false, search: true, tool: null };
+let current = { id: 0, context: "", thinking: false, search: true, tool: null, expert: false };
 let queue = Promise.resolve();
 const pendingTools = new Map();
+let lastTurn;
 
 function send(message) {
 	process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
 function describeError(message) {
-	const text = String(message || "unknown error");
+	let text = String(message || "unknown error");
+	for (const key of [config?.apiKey, config?.expert?.apiKey]) {
+		if (key) text = text.split(key).join("[redacted]");
+	}
 	return /^\d{3}\b/.test(text) ? `HTTP ${text}` : text;
 }
 
@@ -52,27 +56,35 @@ function callTool(toolCallId, name, args, signal) {
 	}));
 }
 
-function setup(message) {
-	config = message;
-	const model = {
-		id: message.model,
-		name: message.model,
-		api: "openai-completions",
-		provider: PROVIDER,
-		baseUrl: message.baseUrl,
+function profile() {
+	return current.expert && config.expert?.apiKey ? config.expert : config;
+}
+
+function modelFor(target) {
+	return {
+		id: target.model,
+		name: target.model,
+		api: target.api || "openai-completions",
+		provider: target.provider || "bailian",
+		baseUrl: target.baseUrl,
 		input: ["text"],
 		reasoning: true,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 131072,
-		maxTokens: message.maxTokens,
-		compat: {
-			thinkingFormat: "qwen",
+		contextWindow: target.contextWindow || 131072,
+		maxTokens: target.maxTokens,
+		compat: target.api === "openai-responses" ? {} : {
+			thinkingFormat: target.provider === "openrouter" ? "openrouter" : "qwen",
 			supportsDeveloperRole: false,
 			supportsStore: false,
 			supportsReasoningEffort: false,
 			maxTokensField: "max_tokens",
 		},
 	};
+}
+
+function setup(message) {
+	config = message;
+	const model = modelFor(message);
 	const tools = message.tools.map(({ function: spec }) => ({
 		name: spec.name,
 		label: spec.name,
@@ -82,31 +94,55 @@ function setup(message) {
 	}));
 	agent = new Agent({
 		initialState: { systemPrompt: message.system, model, thinkingLevel: "off", tools },
-		streamFn: (target, context, options) =>
-			streamSimple(target, context, {
+		streamFn: (target, context, options) => {
+			const selected = profile();
+			const responses = target.api === "openai-responses";
+			return (responses ? streamResponses : streamSimple)(target, context, {
 				...options,
-				maxTokens: config.maxTokens,
-				temperature: config.temperature,
-				timeoutMs: 60000,
+				maxTokens: selected.maxTokens,
+				...(responses ? {} : { temperature: config.temperature }),
+				timeoutMs: responses ? 240000 : 60000,
 				maxRetries: 1,
-			}),
-		getApiKey: () => config.apiKey,
+			});
+		},
+		getApiKey: () => profile().apiKey,
 		transformContext: async (messages) => {
 			const [head, ...rest] = messages;
 			if (head?.role !== "system" || !current.context) return messages;
 			return [{ ...head, content: `${config.system}${current.context}` }, ...rest];
 		},
 		onPayload: (params) => {
-			const payload = { ...params, enable_thinking: current.thinking };
+			const payload = { ...params };
+			const selected = profile();
 			delete payload.thinking_budget;
-			if (current.thinking) payload.thinking_budget = config.thinkingBudget;
+			if (selected.api === "openai-responses") {
+				payload.reasoning = { ...payload.reasoning, effort: selected.reasoningEffort || "high" };
+				if (config.search && current.search) {
+					payload.tools = [...(payload.tools || []), { type: "web_search" }];
+				}
+				if (current.tool && payload.input?.at(-1)?.role === "user") {
+					payload.tool_choice = { type: "function", name: current.tool };
+				}
+			} else if (selected.provider === "openrouter") {
+				payload.reasoning = { effort: current.thinking ? "low" : "minimal" };
+				if (config.providerOrder?.length) payload.provider = { order: config.providerOrder };
+				if (config.search && current.search) {
+					payload.tools = [...(payload.tools || []), {
+						// Gemini's native search currently times out inside streamed OpenRouter requests.
+						type: "openrouter:web_search", parameters: { engine: "exa", mode: "fast" },
+					}];
+				}
+			} else {
+				payload.enable_thinking = current.thinking;
+				if (current.thinking) payload.thinking_budget = config.thinkingBudget;
+				if (config.search && current.search) {
+					payload.enable_search = true;
+					payload.search_options = { search_strategy: "turbo" };
+				}
+			}
 			// Only the first request of a turn is forced; after the tool result the model must be free to answer.
 			if (current.tool && payload.messages?.at(-1)?.role === "user") {
 				payload.tool_choice = { type: "function", function: { name: current.tool } };
-			}
-			if (config.search && current.search) {
-				payload.enable_search = true;
-				payload.search_options = { search_strategy: "turbo" };
 			}
 			return payload;
 		},
@@ -127,7 +163,8 @@ function trimHistory() {
 	const users = [];
 	messages.forEach((message, index) => message.role === "user" && users.push(index));
 	if (users.length > HISTORY_TURNS) {
-		agent.state.messages = [messages[0], ...messages.slice(users[users.length - HISTORY_TURNS])];
+		const system = messages[0]?.role === "system" ? [messages[0]] : [];
+		agent.state.messages = [...system, ...messages.slice(users[users.length - HISTORY_TURNS])];
 	}
 }
 
@@ -138,26 +175,60 @@ async function chat(message) {
 		thinking: !!message.thinking,
 		search: message.search !== false,
 		tool: message.tool || null,
+		expert: !!message.expert && !!config.expert?.apiKey,
 	};
-	agent.state.thinkingLevel = current.thinking ? "low" : "off";
+	agent.state.model = modelFor(profile());
+	agent.state.thinkingLevel = current.expert ? (config.expert.reasoningEffort || "high") : current.thinking ? "low" : "off";
 	const before = [...agent.state.messages];
+	lastTurn = { id: message.id, before, messages: [] };
 	let failure;
 	try {
 		await agent.prompt(message.text);
 		const last = agent.state.messages.findLast((item) => item.role === "assistant");
 		if (last?.stopReason === "error") failure = last.errorMessage;
-		// Cancelled or failed turns are dropped so the next request does not continue them.
-		if (last?.stopReason === "error" || last?.stopReason === "aborted") agent.state.messages = before;
 	} catch (error) {
 		failure = error?.message;
-		agent.state.messages = before;
 	} finally {
+		lastTurn.messages = agent.state.messages.slice(before.length);
 		pendingTools.clear();
 	}
-	trimHistory();
 	send(failure === undefined
 		? { t: "done", id: message.id }
 		: { t: "error", id: message.id, message: describeError(failure) });
+}
+
+function heard(message) {
+	if (lastTurn?.id !== message.id) return;
+	// Keep completed tool calls even when their spoken acknowledgement was cut:
+	// setting an alarm or starting music has already happened on the device.
+	const results = new Set(lastTurn.messages.filter((m) => m.role === "toolResult").map((m) => m.toolCallId));
+	const turn = [];
+	for (const item of lastTurn.messages) {
+		if (item.role === "user" || item.role === "toolResult") turn.push(item);
+		else if (item.role === "assistant") {
+			const content = item.content.filter((block) => block.type === "toolCall" && results.has(block.id));
+			if (content.length) turn.push({ ...item, content, stopReason: "toolUse" });
+		}
+	}
+	agent.state.messages = [...lastTurn.before];
+	if (message.text || results.size) {
+		agent.state.messages.push(...turn);
+		const text = message.text
+			? message.text + (message.interrupted ? "（播报被用户打断，只听到了以上内容。）" : "")
+			: "（工具已执行，用户在播报前打断了回复。）";
+		appendReply(text);
+	}
+	lastTurn = undefined;
+	trimHistory();
+}
+
+function appendReply(text) {
+	const selected = profile();
+	agent.state.messages.push({
+		role: "assistant", content: [{ type: "text", text }],
+		api: selected.api || "openai-completions", provider: selected.provider || "bailian", model: selected.model,
+		usage: EMPTY_USAGE, stopReason: "stop", timestamp: Date.now(),
+	});
 }
 
 function note(message) {
@@ -169,7 +240,7 @@ function note(message) {
 			role: "assistant",
 			content: [{ type: "text", text: message.reply }],
 			api: "openai-completions",
-			provider: PROVIDER,
+			provider: config.provider || "bailian",
 			model: config.model,
 			usage: EMPTY_USAGE,
 			stopReason: "stop",
@@ -190,12 +261,15 @@ function handle(message) {
 		case "note":
 			queue = queue.then(() => note(message));
 			break;
+		case "heard":
+			queue = queue.then(() => heard(message));
+			break;
 		case "tool_result":
 			pendingTools.get(message.call)?.(message);
 			pendingTools.delete(message.call);
 			break;
 		case "abort":
-			agent?.abort();
+			if (message.id === current.id) agent?.abort();
 			break;
 		case "reset":
 			queue = queue.then(() => agent.reset());

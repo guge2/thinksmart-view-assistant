@@ -1,6 +1,7 @@
 # Downloaded third-party tools and archives
 /tools/scrcpy/
 /tools/downloads/
+/tools/mihomo/
 
 # Local diagnostics, temporary files, and runtime logs
 /work/
@@ -23,6 +24,8 @@ __pycache__/
 *.pem
 *.key
 aliyun.json
+chat.json
+expert.json
 qq-credential.json
 qq-device*.json
 

@@ -1,5 +1,6 @@
 # Project conventions
 
+- 本项目内与用户交流和变更说明默认使用简体中文；代码标识符、型号及原文名称保持准确。
 - Treat this project folder (`D:\thinksmart`) as the working root. Run project commands from here and prefer project-relative paths.
 - Keep downloaded third-party tools in their own `tools/<tool-name>/` folders. scrcpy and its bundled ADB belong in `tools/scrcpy/`.
 - Keep diagnostics, logs, downloads awaiting inspection, and temporary files in `work/`. Keep final deliverables in `outputs/` when needed.
