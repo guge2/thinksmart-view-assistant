@@ -55,6 +55,15 @@ table.insert(alsa_monitor.rules, {
 
 table.insert(alsa_monitor.rules, {
   matches = {
+    { { "node.name", "equals", "alsa_input.platform-c051000.sound-card.HiFi__hw_cd18781y_1__source" } },
+  },
+  apply_properties = {
+    ["api.alsa.headroom"] = 768,
+  },
+})
+
+table.insert(alsa_monitor.rules, {
+  matches = {
     { { "node.name", "equals", "alsa_output.platform-c051000.sound-card.playback.2.0" } },
     { { "node.name", "equals", "alsa_output.platform-c051000.sound-card.playback.4.0" } },
     { { "node.name", "equals", "alsa_input.platform-c051000.sound-card.capture.4.0" } },

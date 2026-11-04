@@ -51,6 +51,13 @@ printf '%s @%s\n' "$phrase" "$phrase" > "$RAW_FILE"
 	--tokens-type ppinyin \
 	"$RAW_FILE" \
 	"$KEYWORDS_FILE"
+if [ "$phrase" = "小爱同学" ]; then
+	cat << 'EOF' >> "$KEYWORDS_FILE"
+x iào ài t óng x ué @小爱同学
+x iǎo y ī t óng x ué @小爱同学
+x iào y ī t óng x ué @小爱同学
+EOF
+fi
 mv "$KEYWORDS_FILE" "$VOICE_ROOT/keywords.txt"
 printf '%s\n' "$phrase" > "$PHRASE_FILE.new"
 mv "$PHRASE_FILE.new" "$PHRASE_FILE"

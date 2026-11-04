@@ -114,7 +114,7 @@ class WakeStream:
 
 
 class WakeDetector:
-    """Keep AEC recognition and a separate, playback-only raw-mic fallback."""
+    """Keep AEC recognition and a separate, continuous raw-mic stream."""
 
     def __init__(self, assistant):
         self.assistant = assistant
@@ -125,10 +125,19 @@ class WakeDetector:
         self.last_hit = 0.0
 
     def __enter__(self):
+        self.open_raw()
         return self
 
     def __exit__(self, *_):
         self.close_raw()
+
+    def open_raw(self):
+        if self.raw_capture is None:
+            try:
+                self.raw_capture = self.assistant.create_capture(RAW_CAPTURE_SOURCE)
+                self.raw_stream = WakeStream(self.spotter)
+            except Exception as error:
+                logging.warning("启动原始麦克风流失败: %s", error)
 
     def close_raw(self):
         self.assistant.stop_process(self.raw_capture)
@@ -139,21 +148,27 @@ class WakeDetector:
         samples = self.assistant.pcm_to_floats(data)
         return stream.feed(samples, gain)
 
-    def feed(self, data, raw_enabled=False):
-        if not raw_enabled:
-            self.close_raw()
-        elif self.raw_capture is None:
-            self.raw_capture = self.assistant.create_capture(RAW_CAPTURE_SOURCE)
-            self.raw_stream = WakeStream(self.spotter)
-        result = self.decode(self.stream, data)
+    def feed(self, data, is_playing=False, raw_wake_allowed=True):
+        if self.raw_capture is None:
+            self.open_raw()
+
         raw_result = ""
         if self.raw_capture is not None:
-            raw_data = self.assistant.read_capture(self.raw_capture)
-            raw_result = self.decode(self.raw_stream, raw_data, gain=4.0)
+            try:
+                raw_data = self.assistant.read_capture(self.raw_capture)
+                if not is_playing or raw_wake_allowed:
+                    raw_result = self.decode(self.raw_stream, raw_data, gain=4.0)
+            except Exception as error:
+                logging.warning("读取原始麦克风流失败: %s", error)
+                self.close_raw()
+
+        result = self.decode(self.stream, data, gain=2.0)
         now = time.monotonic()
         if not (result or raw_result) or now - self.last_hit < 2.0:
             return "", ""
         self.last_hit = now
+        if not is_playing:
+            return (raw_result, "raw") if raw_result else (result, "AEC")
         return (result, "AEC") if result else (raw_result, "raw")
 
 
@@ -468,7 +483,7 @@ class ThinkSmartAssistant:
 
     def set_phase(self, phase):
         self.phase = phase
-        if phase == "think" and not self.barge_in_requested.is_set():
+        if phase in ("idle", "think") and not self.barge_in_requested.is_set():
             self.clear_audio()
         self.ui.emit(phase)
 
@@ -678,8 +693,9 @@ class ThinkSmartAssistant:
         )
 
     def open_capture(self):
-        if self.capture is not None:
+        if self.capture is not None and self.capture_thread is not None and self.capture_thread.is_alive():
             return
+        self.close_capture()
         self.capture_stop.clear()
         self.capture = self.create_capture(ECHO_CANCEL_SOURCE)
         self.capture_thread = threading.Thread(target=self.capture_loop, name="microphone", daemon=True)
@@ -757,10 +773,10 @@ class ThinkSmartAssistant:
                         tail.clear()
                         continue
                     tail.append(data)
-                    raw = self.raw_wake_allowed and (
+                    is_playing = (
                         self.music.player.state == "playing" or self.speech_player is not None
                     )
-                    result, source = detector.feed(data, raw)
+                    result, source = detector.feed(data, is_playing, self.raw_wake_allowed)
                     hit = result and self.phase != "wake" and not self.barge_in_requested.is_set()
                     if hit:
                         self.clear_audio()
@@ -1201,14 +1217,11 @@ class ThinkSmartAssistant:
                         if classify_error(error) == "mic":
                             raise
                         logging.warning("云端识别不可用，改用离线指令：%s", error)
-                        self.close_capture()
                         self.offline_mode = True
                         self.set_cloud("offline")
                         self.set_phase("think")
-                        self.open_capture()
                         self.speak_reply("网络不可用，请再说一次简单指令。")
                         self.set_phase("listen")
-                        self.open_capture()
                         text = self.offline_commands.listen(self)
                 if text:
                     self.handle_turn(text)
@@ -1221,13 +1234,14 @@ class ThinkSmartAssistant:
                 logging.info("本轮对话已取消")
                 self.set_cloud("ready")
             except Exception as error:
+                if classify_error(error) == "mic" or self.capture_thread is None or not self.capture_thread.is_alive():
+                    self.close_capture()
                 if not self.stop_requested:
                     logging.exception("语音处理失败：%s", error)
                     self.report_error(error)
                     time.sleep(2)
             finally:
                 if not self.barge_in_requested.is_set():
-                    self.close_capture()
                     self.unduck()
 
     def stop(self, *_args):
