@@ -46,6 +46,8 @@ UI_TEXT_LIMIT = 2000
 ASSISTANT_ROLE = "Assistant"
 FAREWELL_WORDS = re.compile(r"退下|没事|不用|再见|拜拜|休息|去休息|别说|不聊|结束对话|就这样")
 SLEEP_WORDS = re.compile(r"关机|关屏|关闭屏幕|关掉屏幕|息屏|熄屏|睡觉|去睡觉|晚安")
+# Sleep words that also stop music; screen-only words leave playback running.
+POWER_OFF_WORDS = re.compile(r"关机|睡觉|晚安")
 QUESTION_END = re.compile(r"(?:[？?]|[吗呢么][。！!～~]?)[\s”」』\"')）]*$")
 # Without thinking the model often answers weather from web search or memory, so weather turns force
 # the tool and skip search; time is already in the context, so time turns only skip search.
@@ -72,6 +74,7 @@ END_TOOL = {
             "type": "object",
             "properties": {
                 "screen_off": {"type": "boolean", "description": "用户要求关机、关屏或睡觉时为true"},
+                "stop_music": {"type": "boolean", "description": "用户要求关机、睡觉或说晚安时为true，同时停止播放音乐；只关屏时为false"},
             },
         },
     },
@@ -83,7 +86,7 @@ TOOL_RULES = (
     "根据当前设备本地时间计算具体日期，不得假装已设置。"
     "取消时根据用户的描述匹配编号；不明确时先询问。编号仅供取消时传参，不要读给用户。"
     "使用工具时不要提前声称操作成功，以工具返回结果为准。"
-    "用户想结束对话时调用end_conversation；说关机、关屏或睡觉时同时把screen_off设为true，你无法关闭设备电源。"
+    "用户想结束对话时调用end_conversation；说关机、关屏或睡觉时同时把screen_off设为true，说关机、睡觉或晚安时还要把stop_music设为true，你无法关闭设备电源。"
     "新闻、比赛、行情等需要最新信息的问题可以参考联网搜索结果，用一两句话概括，不要念出网址。"
     "回答结束时不要说“还有什么需要”之类的客套追问；只有确实需要用户补充信息时才用问句结尾。"
 )
@@ -945,7 +948,7 @@ class ThinkSmartAssistant:
             self.turn_effects.append("info" if listing else "action" if ok else "failed")
             return message, ok, ok and not listing
         if name == "end_conversation":
-            self.finish_conversation(bool(args.get("screen_off")))
+            self.finish_conversation(bool(args.get("screen_off")), bool(args.get("stop_music")))
             return ("" if has_reply else "好的"), True, True
         message, ok, started = self.music.call_tool(name, arguments)
         self.turn_effects.append("action" if ok else "failed")
@@ -1051,7 +1054,8 @@ class ThinkSmartAssistant:
             self.turn_effects.append("action" if dismissed else "failed")
             reply = "已停止提示音" if dismissed else "现在没有正在响的闹钟或提醒"
         elif farewell:
-            self.finish_conversation(farewell == "sleep")
+            self.finish_conversation(farewell == "sleep",
+                                     farewell == "sleep" and bool(POWER_OFF_WORDS.search(user_text)))
             reply = "好的"
         elif self.offline_mode and any(word in user_text for word in ("几点", "几号", "星期")):
             reply = information.current_time()
@@ -1087,10 +1091,13 @@ class ThinkSmartAssistant:
             return 0.0
         return self.followup_seconds
 
-    def finish_conversation(self, screen_off):
+    def finish_conversation(self, screen_off, stop_music=False):
         self.conversation_over = True
         self.screen_off_pending = self.screen_off_pending or screen_off
-        logging.info("用户结束对话%s", "，关闭屏幕" if screen_off else "")
+        if stop_music:
+            # Also clears the conversation hold, so unduck() will not resume it.
+            self.music.control("stop")
+        logging.info("用户结束对话%s%s", "，关闭屏幕" if screen_off else "", "，停止音乐" if stop_music else "")
 
     def speak_reply(self, reply):
         if not self.offline_mode:
