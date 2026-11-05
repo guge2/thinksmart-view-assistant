@@ -1337,22 +1337,24 @@ class ThinkSmartAssistant:
                 raise RuntimeError("microphone stream ended")
         return False
 
-    def play_wake_tone(self):
-        duration_seconds = 0.12
-        sample_count = int(PLAYBACK_RATE * duration_seconds)
-        fade_in = int(PLAYBACK_RATE * 0.01)
-        fade_out = int(PLAYBACK_RATE * 0.02)
+    def start_listening(self):
+        """Every entry into listening: the cue means "you can speak now"; speech over it is kept."""
+        self.set_phase("listen")
+        self.play_listen_tone()
+
+    def play_listen_tone(self):
+        # A soft bell: smooth 15 ms attack, then a natural decay instead of a flat beep.
+        level = 0.065 if self.night_active() else 0.13
+        attack, decay, length = 0.015, 0.085, 0.32
         samples = array.array("h")
-        for index in range(sample_count):
-            envelope = min(
-                1.0,
-                index / max(1, fade_in),
-                (sample_count - index - 1) / max(1, fade_out),
-            )
-            value = (0.09 if self.night_active() else 0.18) * envelope * math.sin(
-                2 * math.pi * 880 * index / PLAYBACK_RATE
-            )
-            samples.append(int(32767 * value))
+        for index in range(int(PLAYBACK_RATE * length)):
+            t = index / PLAYBACK_RATE
+            if t < attack:
+                envelope = 0.5 - 0.5 * math.cos(math.pi * t / attack)
+            else:
+                envelope = math.exp(-(t - attack) / decay) * min(1.0, (length - t) / 0.02)
+            tone = math.sin(2 * math.pi * 660 * t) + 0.25 * math.sin(2 * math.pi * 1320 * t)
+            samples.append(int(32767 * level * envelope * tone / 1.25))
         if sys.byteorder == "big":
             samples.byteswap()
 
@@ -1366,9 +1368,9 @@ class ThinkSmartAssistant:
         try:
             self.playback.communicate(samples.tobytes(), timeout=5)
             if self.playback.returncode != 0:
-                logging.warning("唤醒提示音播放失败")
+                logging.warning("聆听提示音播放失败")
         except (OSError, subprocess.TimeoutExpired) as error:
-            logging.warning("唤醒提示音播放失败：%s", error)
+            logging.warning("聆听提示音播放失败：%s", error)
             self.stop_process(self.playback)
         finally:
             self.playback = None
@@ -1768,8 +1770,8 @@ class ThinkSmartAssistant:
             self.begin_turn()
             self.wake_started = time.monotonic()
             self.turn_timing = {"wake_at": time.time(), "source": "followup"}
-            self.set_phase("listen")
             self.open_capture()
+            self.start_listening()
             text = self.transcribe_live(self.next_followup)
             if not text:
                 logging.info("追问窗口结束")
@@ -1806,10 +1808,9 @@ class ThinkSmartAssistant:
                 self.begin_turn()
                 # Keep the wake stream running through the tone and network
                 # check, so an immediate follow-on command is still captured.
-                self.play_wake_tone()
+                self.start_listening()
                 if self.stop_requested:
                     break
-                self.set_phase("listen")
                 self.offline_mode = not self.cloud_available()
                 self.check_cancel()
                 self.set_cloud("offline" if self.offline_mode else "busy")
@@ -1828,7 +1829,7 @@ class ThinkSmartAssistant:
                         self.set_cloud("offline")
                         self.set_phase("think")
                         self.speak_reply("网络不可用，请再说一次简单指令。")
-                        self.set_phase("listen")
+                        self.start_listening()
                         text = self.offline_commands.listen(self)
                 if text:
                     self.handle_turn(text)
