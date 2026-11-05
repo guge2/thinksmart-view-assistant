@@ -99,6 +99,88 @@ TOOL_RULES = (
 )
 
 
+LINK = re.compile(r"\[([^\]\n]*)\]\((?:[^()\s]|\([^()\s]*\))*\)")
+# A parenthesised aside holding a link is a source note, e.g. "([site.com](https://...))".
+LINK_ASIDE = re.compile(r"[（(][^（()）\n]*?" + LINK.pattern + r"[^（()）\n]*?[)）]")
+URL = re.compile(r"(?:https?://|www\.)[^\s，。！？；、）)】\]]*")
+DOMAIN = re.compile(r"[\w.-]+\.[A-Za-z]{2,}(?:/\S*)?")
+CITATION = re.compile(r"\ue200.*?\ue201|[\ue000-\uf8ff]|\[\^?\d+\]|【\d+[^】]*】")
+EMPTY_ASIDE = re.compile(r"[（(]\s*(?:(?:来源|参考|出处|引自)[:：]?)?[\s,，、;；]*[)）]")
+MARKDOWN = re.compile(r"\*\*|__|`|(?<=\n)[ \t]*(?:#+|>)[ \t]*")
+URL_START = re.compile(r"(?:https?:/{0,2}|https?|htt|ht|h|www\.?|ww|w)$")
+MARKDOWN_START = re.compile(r"(?:\n[ \t]*[#>]*[ \t]*|[*_]+)$")
+
+
+def spoken_text(text, line_start=True):
+    """Removes links, URLs and citation marks that web search adds to replies."""
+    if line_start:
+        return spoken_text("\n" + text, False)[1:]
+    text = LINK_ASIDE.sub("", text)
+    text = LINK.sub(lambda m: "" if not m.group(1).strip() or DOMAIN.fullmatch(m.group(1).strip()) else m.group(1), text)
+    text = CITATION.sub("", URL.sub("", text))
+    text = re.sub(r"[（(]\s*" + DOMAIN.pattern + r"\s*[)）]", "", text)
+    return MARKDOWN.sub("", EMPTY_ASIDE.sub("", text))
+
+
+class SpokenStream:
+    """Holds back a possibly unfinished link or URL until it can be removed whole."""
+    HOLD = 400
+
+    def __init__(self):
+        self.pending = ""
+        self.line_start = True
+
+    def feed(self, text):
+        self.pending += text
+        cut = self._safe_end(self.pending)
+        out, self.pending = self.pending[:cut], self.pending[cut:]
+        return self._emit(out)
+
+    def flush(self):
+        out, self.pending = self.pending, ""
+        return self._emit(out)
+
+    def _emit(self, text):
+        if not text:
+            return ""
+        cleaned = spoken_text(text, self.line_start)
+        self.line_start = text.endswith("\n")
+        return cleaned
+
+    def _safe_end(self, text):
+        if len(text) > self.HOLD:
+            return len(text)
+        stack, hold = [], len(text)
+        pairs = {"]": "[", ")": "(", "）": "(", "】": "【", "\ue201": "\ue200"}
+        label = None  # (start, end) of the last "[text]", which a "(url)" may follow
+        for index, char in enumerate(text):
+            opener = "(" if char == "（" else char
+            if opener in ("[", "(", "【", "\ue200"):
+                linked = opener == "(" and label is not None and label[1] == index - 1
+                stack.append((opener, label[0] if linked else index))
+            elif char in pairs and stack and stack[-1][0] == pairs[char]:
+                start = stack.pop()[1]
+                if char == "]":
+                    label = (start, index)
+                    if index == len(text) - 1:
+                        hold = min(hold, start)
+        if stack:
+            hold = min(hold, stack[0][1])
+        url = URL.search(text)
+        while url and url.end() != len(text):
+            url = URL.search(text, url.end())
+        if url:
+            hold = min(hold, url.start())
+        partial = URL_START.search(text)
+        if partial:
+            hold = min(hold, partial.start())
+        prefix = "\n" if self.line_start else ""
+        partial = MARKDOWN_START.search(prefix + text)
+        if partial:
+            hold = min(hold, max(0, partial.start() - len(prefix)))
+        return hold
+
+
 class WakeStream:
     def __init__(self, spotter):
         self.spotter = spotter
@@ -605,9 +687,9 @@ class ThinkSmartAssistant:
                 "歌名、歌手名、人名、型号、代码和接口标识符保留准确原文，不要为了中文化而误译。"
             ) + (
                 "你可以按需调用联网搜索工具。涉及新闻、近期事件、比分、行情等实时信息时先搜索核实，"
-                "不要把记忆当成实时信息；普通聊天不必搜索。搜索后用自然中文概括，通常两三句话，"
-                "不要念网址、引用编号或Markdown标记。" if self.chat_provider == "openrouter" else ""
-            ),
+                "不要把记忆当成实时信息；普通聊天不必搜索。搜索后用自然中文概括，通常两三句话。"
+                if self.chat_provider == "openrouter" else ""
+            ) + "回复会被直接朗读：不要输出网址、链接、来源标注、引用编号或Markdown标记。",
             "tools": [END_TOOL] + self.music.tools + information.TOOLS + self.alarms.tools,
         })
         self.brain.configure_models(self.chat_model, self.expert_model, self.chat_provider)
@@ -1625,11 +1707,18 @@ class ThinkSmartAssistant:
 
         def fragments():
             nonlocal model_failed
+            cleaner = SpokenStream()
             for event in model_events():
                 if event[0] == "delta":
-                    spoken.append(event[1])
-                    yield event[1]
+                    text = cleaner.feed(event[1])
+                    if text:
+                        spoken.append(text)
+                        yield text
                     continue
+                text = cleaner.flush()
+                if text:
+                    spoken.append(text)
+                    yield text
                 _, call, name, args = event
                 try:
                     message, ok, final = self.run_tool(name, args, bool("".join(spoken).strip()))
@@ -1640,6 +1729,10 @@ class ThinkSmartAssistant:
                 if final and message:
                     spoken.append(message)
                     yield message
+            text = cleaner.flush()
+            if text:
+                spoken.append(text)
+                yield text
 
         stream = fragments()
         reply = ""
