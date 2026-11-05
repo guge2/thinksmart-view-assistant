@@ -1,21 +1,87 @@
 #!/usr/bin/python3
-import glob, os, select, struct, subprocess
+import array
+import fcntl
+import glob
+import logging
+import os
+import select
+import socket
+import struct
+import subprocess
+import time
 
-KEY_VOLUMEDOWN, KEY_VOLUMEUP = 114, 115
 EVENT = struct.Struct("llHHi")
-STEP = {KEY_VOLUMEUP: "5%+", KEY_VOLUMEDOWN: "5%-"}
+STEP = {115: "5%+", 114: "5%-"}
+EVIOCGSW = 0x8008451B
+MIC_SWITCH = 4
+STATE = "/run/thinksmart-keys/mic-state"
+CONTROL = "/run/thinksmart-voice/control.sock"
 
-devices = []
-for path in sorted(glob.glob("/sys/class/input/event*")):
-    with open(os.path.join(path, "device/name")) as f:
-        if f.read().strip() in ("gpio-keys", "pm8941_resin"):
-            devices.append(os.open("/dev/input/" + os.path.basename(path), os.O_RDONLY))
 
-while True:
-    ready, _, _ = select.select(devices, [], [])
-    for fd in ready:
-        data = os.read(fd, EVENT.size * 16)
-        for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
-            _, _, etype, code, value = EVENT.unpack_from(data, i)
-            if etype == 1 and code in STEP and value in (1, 2):
-                subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", STEP[code]])
+def mic_state(fd):
+    bits = array.array("B", [0] * 8)
+    fcntl.ioctl(fd, EVIOCGSW, bits)
+    return bool(int.from_bytes(bits.tobytes(), "little") & (1 << MIC_SWITCH))
+
+
+def main():
+    devices = {}
+    last_mic = None
+    next_scan = 0.0
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    while True:
+        if time.monotonic() >= next_scan:
+            next_scan = time.monotonic() + 5
+            opened = {path for path, _ in devices.values()}
+            for path in sorted(glob.glob("/sys/class/input/event*")):
+                try:
+                    with open(path + "/device/name") as source:
+                        name = source.read().strip()
+                    node = "/dev/input/" + os.path.basename(path)
+                    if name in ("gpio-keys", "pm8941_resin") and node not in opened:
+                        fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+                        devices[fd] = (node, name)
+                except OSError:
+                    continue
+        for fd, (_, name) in list(devices.items()):
+            if name != "gpio-keys":
+                continue
+            try:
+                enabled = mic_state(fd)
+                if enabled != last_mic or not os.path.exists(STATE):
+                    with open(STATE + ".new", "w") as target:
+                        target.write("1\n" if enabled else "0\n")
+                    os.replace(STATE + ".new", STATE)
+                    last_mic = enabled
+                try:
+                    sock.sendto(b'{"c":"hardware_mic"}', CONTROL)
+                except OSError:
+                    pass
+            except OSError:
+                os.close(fd)
+                devices.pop(fd, None)
+        readable, _, _ = select.select(list(devices), [], [], 2)
+        for fd in readable:
+            try:
+                data = os.read(fd, EVENT.size * 32)
+                if not data:
+                    raise OSError("input disconnected")
+            except BlockingIOError:
+                continue
+            except OSError:
+                os.close(fd)
+                devices.pop(fd, None)
+                continue
+            for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, etype, code, value = EVENT.unpack_from(data, i)
+                if etype == 1 and code in STEP and value in (1, 2):
+                    try:
+                        subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", STEP[code]],
+                                       timeout=3, check=True, stdout=subprocess.DEVNULL)
+                    except (OSError, subprocess.SubprocessError):
+                        logging.warning("硬件音量调整失败")
+
+
+if __name__ == "__main__":
+    main()

@@ -15,6 +15,16 @@ class Brain:
 
     def __init__(self, config):
         self.config = config
+        profile_fields = ('apiKey', 'api', 'provider', 'baseUrl', 'maxTokens', 'contextWindow')
+        self.profiles = {config['provider']: {key: config.get(key) for key in profile_fields}}
+        expert = config.get('expert', {})
+        if expert.get('provider') == 'openai' and expert.get('apiKey') and 'openai' not in self.profiles:
+            self.profiles['openai'] = {key: expert.get(key) for key in profile_fields}
+            self.profiles['openai'].update(maxTokens=4096, api='openai-responses')
+        self.provider_order = config.get('providerOrder', [])
+        self.provider_order_model = config.get('providerOrderModel', config['model'])
+        if config['model'] != self.provider_order_model:
+            self.config['providerOrder'] = []
         self.process = None
         self.buffer = b""
         self.next_id = 0
@@ -42,6 +52,17 @@ class Brain:
             self.process.stdin.write(json.dumps(message, ensure_ascii=False).encode("utf-8") + b"\n")
         except (OSError, AttributeError, ValueError) as error:
             raise RuntimeError(f"agent process unavailable: {error}") from error
+
+    def configure_models(self, model, expert_model, provider):
+        if provider not in self.profiles:
+            raise ValueError('所选服务尚未配置日常对话凭据')
+        self.config.update(self.profiles[provider])
+        self.config['model'] = model
+        self.config['expert']['model'] = expert_model
+        # Provider preferences belong to the original model; other models choose their own route.
+        self.config['providerOrder'] = self.provider_order if model == self.provider_order_model else []
+        if self.alive():
+            self.send(dict(self.config, t='models'))
 
     def receive(self, timeout):
         while b"\n" not in self.buffer:

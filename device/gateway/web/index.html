@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ThinkSmart · 设备控制台</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<aside class="sidebar">
+ <a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true"></span><span>ThinkSmart<small>设备控制台</small></span></a>
+ <nav aria-label="主导航">
+  <button class="nav active" data-page="overview">设备概览</button>
+  <button class="nav" data-page="settings">参数设置</button>
+  <button class="nav" data-page="diagnostics">语音诊断</button>
+  <button class="nav" data-page="maintenance">服务维护</button>
+ </nav>
+ <div class="sidebar-bottom"><span class="live-dot"></span> 独立运行<small>浏览器关闭后，设备照常工作。</small><span id="version">管理网关</span></div>
+</aside>
+<main>
+ <header class="topbar"><div><span class="eyebrow">ThinkSmart View · CD-18781Y</span><h1 id="page-title">设备概览</h1></div><div class="connection"><span id="connection" class="pill neutral">正在连接</span><small id="refreshed">等待设备响应</small></div></header>
+ <div id="connection-error" class="banner" role="status" hidden>暂时无法连接设备。请确认设备已开机，管理入口保持连接。</div>
+ <section data-section="overview">
+  <div class="hero panel"><div class="hero-copy"><h2 id="phase-title">正在读取设备状态</h2><p id="phase-detail">连接后，可在这里查看状态、唤醒设备和控制播放。</p><div class="actions"><button class="primary" data-action="talk" id="wake-button">唤醒设备</button><button data-action="stop">结束对话</button><button id="mic-button">麦克风</button></div><div class="hero-meta"><span id="wake-label">唤醒词 —</span><span id="hardware-label">硬件麦克风 —</span></div></div>
+  <div class="hero-clock" aria-hidden="true"><span id="art-time">—</span><small>设备时间</small></div></div>
+  <div class="grid three status-cards">
+   <article class="panel"><div class="card-label">收音状态</div><h3 id="mic-title">—</h3><div class="meter"><i id="overview-level"></i></div><p id="capture-note">等待采集状态</p></article>
+   <article class="panel"><div class="card-label">对话模型</div><h3 class="model-value" id="model-name">—</h3><p id="model-provider">读取当前运行配置</p></article>
+   <article class="panel"><div class="card-label">设备负载</div><h3><span id="load">—</span><small> / 1 分钟</small></h3><p id="memory-note">读取服务内存占用</p></article>
+  </div>
+  <div class="grid two">
+   <article class="panel"><div class="section-title"><h3>播放控制</h3><span id="music-state" class="pill neutral">—</span></div><h4 id="music-title">当前没有播放音乐</h4><p id="music-artist">通过语音点歌，或继续上次的播放。</p><div class="player-controls"><button data-action="prev">上一首</button><button class="primary" data-action="toggle">播放 / 暂停</button><button data-action="next">下一首</button><button data-action="music_stop">停止</button></div><label class="slider-label" for="volume">设备音量 <output id="volume-output">—</output></label><input id="volume" type="range" min="0" max="100" value="0"><small class="muted">松开滑块后应用</small></article>
+   <article class="panel"><div class="section-title"><h3>最近一轮对话</h3></div><div class="conversation"><span class="speaker">你</span><p id="user-text">暂无对话内容</p><span class="speaker assistant">ThinkSmart</span><p id="answer-text">唤醒设备后，对话会显示在这里。</p></div><div id="alarm-box" class="alarm" hidden><span id="alarm-text"></span><button data-action="alarm_stop">停止提醒</button></div></article>
+  </div>
+ </section>
+ <section data-section="settings" hidden>
+  <div class="section-intro"><h2>让设备按你的习惯工作</h2><p>模型与音色保存后从下一轮对话开始使用，当前播报会继续完成。</p></div>
+  <form id="model-form" class="panel"><div class="section-title"><h3>对话模型与音色</h3><span id="model-update-state" class="pill neutral" role="status">正在读取</span></div>
+   <p>日常对话可选 OpenAI GPT 模型和 OpenRouter 日常低价模型，自动使用对应服务的已有凭据。</p>
+   <div class="form-grid model-form">
+    <label>日常对话模型<select name="chat_model" required></select><input type="hidden" name="chat_provider"><small id="configured-provider">正在读取服务</small></label>
+    <label>复杂任务模型<select name="expert_model" required></select><small id="expert-note">正在读取服务</small></label>
+    <label>语音合成模型<select name="tts_model" required></select><small>阿里云百炼 · 切换后会更新可选音色</small></label>
+    <label>播报音色<select name="tts_voice" required></select><small id="voice-compatibility">只显示当前合成模型兼容的中文音色</small></label>
+   </div>
+   <div class="voice-preview"><button type="button" id="preview-voice">试听所选音色</button><span id="preview-state" role="status">点击后在这台电脑播放，试听不会保存设置</span><audio id="voice-audio" controls hidden preload="none"></audio></div>
+   <div class="effective-models"><div class="section-title"><h3>设备当前使用</h3><span class="tiny">运行进程回报</span></div><dl>
+    <div><dt>日常对话</dt><dd id="effective-chat">正在读取</dd></div><div><dt>复杂任务</dt><dd id="effective-expert">正在读取</dd></div>
+    <div><dt>语音合成</dt><dd id="effective-tts">正在读取</dd></div><div><dt>播报音色</dt><dd id="effective-voice">正在读取</dd></div>
+   </dl><p id="turn-models">暂无本轮使用记录</p></div>
+   <div class="form-footer"><span id="model-config-state" role="status">从下一轮对话开始使用，不打断当前播报</span><button type="submit" class="primary">保存模型与音色</button></div>
+  </form>
+  <form id="preferences-form" class="panel"><div class="section-title"><h3>常用设置</h3><span class="pill green">即时设置</span></div><div class="form-grid">
+   <label>播报语速<select name="speech_rate"><option value="0.5">0.5 倍</option><option value="0.8">0.8 倍</option><option value="1">1.0 倍</option><option value="1.2">1.2 倍</option><option value="1.5">1.5 倍</option><option value="1.8">1.8 倍</option><option value="2">2.0 倍</option></select></label>
+   <label>屏幕亮度<input name="brightness" type="number" min="1" max="100" step="1"><small>1–100，夜间模式仍会限制实际亮度</small></label>
+   <label>自动调暗<select name="dim_after"><option value="0">从不</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option></select></label>
+   <div class="toggles"><label class="toggle"><input type="checkbox" name="mic"><span>允许麦克风收音</span></label><label class="toggle"><input type="checkbox" name="thinking"><span>复杂问题开启思考</span></label></div>
+  </div><div class="night-row"><label class="toggle"><input type="checkbox" name="night_enabled"><span>夜间模式</span></label><label>开始<input type="time" name="night_start"></label><span class="muted">至</span><label>结束<input type="time" name="night_end"></label></div><div class="form-footer"><span id="preferences-state">与设备屏幕共用设置</span><button type="submit" class="primary">保存常用设置</button></div></form>
+  <form id="wake-form" class="panel compact"><div><h3>唤醒词</h3><p>2–8 个汉字，应用时语音服务会短暂重启。</p></div><div class="inline-form"><label class="sr-only" for="wake-word">新的唤醒词</label><input id="wake-word" minlength="2" maxlength="8" required><button type="submit">应用唤醒词</button></div></form>
+  <form id="voice-form" class="panel"><div class="section-title"><h3>识别与唤醒</h3><span class="pill amber">应用后重启语音</span></div><div class="form-grid">
+   <label>唤醒阈值<input type="number" name="kws_threshold" min="0.01" max="0.9" step="0.01"><small>越低越容易唤醒，也更容易误触发</small></label>
+   <label>唤醒词加分<input type="number" name="kws_score" min="1" max="10" step="0.5"><small>越高越偏向识别唤醒词</small></label>
+   <label>等待开口 / 秒<input type="number" name="speech_wait_seconds" min="3" max="20" step="1"></label>
+   <label>最长讲话 / 秒<input type="number" name="max_speech_seconds" min="5" max="60" step="1"></label>
+   <label>普通追问窗口 / 秒<input type="number" name="followup_seconds" min="0" max="15" step="1"></label>
+   <label>需要补充信息时 / 秒<input type="number" name="question_followup_seconds" min="0" max="30" step="1"></label>
+   <label>语音识别模型<input name="asr_model" maxlength="128" autocomplete="off" required></label>
+  </div><div class="form-footer"><span id="voice-config-state">识别与唤醒参数应用后会重启语音，失败时恢复原配置</span><button type="submit" class="primary">应用识别与唤醒参数</button></div></form>
+ </section>
+ <section data-section="diagnostics" hidden>
+  <div class="section-intro"><h2>看清每一段语音流程</h2><p>电平变化代表收到了声音；唤醒命中代表模型识别到了唤醒词。指标来自现有音频线程，不额外开启录音流。</p><p id="wake-model">正在读取本地唤醒模型</p><p id="capture-continuity">正在观察收音连续性</p></div>
+  <article class="panel"><div class="section-title"><h3>最近一次聆听</h3><span id="turn-source" class="pill neutral">等待唤醒</span></div><div class="timeline"><div><span class="step">01</span><strong>唤醒 / 开始聆听</strong><b id="turn-at">—</b></div><div><span class="step">02</span><strong>识别连接就绪</strong><b id="asr-delay">—</b></div><div><span class="step">03</span><strong>首次返回文字</strong><b id="text-delay">—</b></div></div><small class="muted">耗时以本轮聆听起点计算；尚未到达的环节显示为 —。</small></article>
+  <div class="grid two"><article class="panel"><div class="section-title"><h3>原始麦克风</h3><span id="raw-age" class="tiny">—</span></div><div class="level-value"><span id="raw-level">—</span><small>% 峰值</small></div><div class="meter"><i id="raw-meter"></i></div><p>用于辅助唤醒</p></article><article class="panel"><div class="section-title"><h3>消回声收音</h3><span id="aec-age" class="tiny">—</span></div><div class="level-value"><span id="aec-level">—</span><small>% 峰值</small></div><div class="meter"><i id="aec-meter"></i></div><p>当前语音识别使用的音频流</p></article></div>
+  <div class="grid three small-stats"><article class="panel"><span>待处理音频</span><h3 id="buffer-ms">—</h3></article><article class="panel"><span>缓存溢出丢帧</span><h3 id="dropped-frames">—</h3></article><article class="panel"><span>语音服务重启次数</span><h3 id="restart-count">—</h3></article></div>
+  <article class="panel"><div class="section-title"><h3>运行日志</h3><div class="inline-form"><label class="sr-only" for="log-source">日志来源</label><select id="log-source"><option value="voice">语音服务</option><option value="ui">设备屏幕</option><option value="keys">硬件输入</option><option value="gateway">管理网关</option></select><button id="refresh-logs">刷新</button></div></div><p class="muted">最近 15 分钟，最多 70 条；对话正文及敏感字段会隐藏。</p><div id="logs" class="logs" role="log" aria-label="运行日志">正在读取日志…</div></article>
+ </section>
+ <section data-section="maintenance" hidden>
+  <div class="section-intro"><h2>维护需要恢复的那一部分</h2><p>重启语音会中断当前对话和播放；重启屏幕不会重启语音。管理网页无需一直打开。</p></div>
+  <div id="service-cards" class="grid two"></div>
+  <article class="panel architecture"><div><h3>设备独立运行</h3><p>语音、音乐和闹钟仍在 ThinkSmart 上执行。管理网页由你的浏览器渲染，网关按需读取状态。</p></div><div class="connection-path"><span>你的浏览器</span><i>→</i><span>管理网关</span><i>→</i><span>设备服务</span></div><p class="muted">模型凭据保留在设备上，管理页面不读取或显示密钥。</p></article>
+ </section>
+ <footer>ThinkSmart View <span>·</span> 设备管理 <span>·</span> <span id="footer-time">等待同步</span></footer>
+</main>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+</body></html>

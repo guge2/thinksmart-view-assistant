@@ -1,4 +1,5 @@
 import glob
+import fcntl
 import json
 import logging
 import os
@@ -82,10 +83,6 @@ def credentials_configured():
     return os.path.exists(CREDENTIAL_FILE)
 
 
-def voice_running():
-    return os.path.exists(CONTROL_SOCKET)
-
-
 def valid_location(value):
     if not isinstance(value, dict):
         return None
@@ -149,15 +146,20 @@ class Settings:
     def __getitem__(self, key):
         return self.data[key]
 
-    def update(self, **values):
-        self.data.update(values)
+    def update(self, strict=False, **values):
         try:
-            write_atomic(
-                SETTINGS_FILE,
-                json.dumps(self.data, ensure_ascii=False).encode("utf-8"),
-            )
+            with open(SETTINGS_FILE + ".lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                current = Settings().data
+                current.update(values)
+                write_atomic(SETTINGS_FILE, json.dumps(current, ensure_ascii=False).encode("utf-8"))
+                self.data = current
+            return True
         except OSError as error:
             logging.warning("设置保存失败：%s", error)
+            if strict:
+                raise
+            return False
 
 
 class Backlight:

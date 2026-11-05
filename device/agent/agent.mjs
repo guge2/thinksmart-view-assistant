@@ -116,7 +116,7 @@ function setup(message) {
 			const selected = profile();
 			delete payload.thinking_budget;
 			if (selected.api === "openai-responses") {
-				payload.reasoning = { ...payload.reasoning, effort: selected.reasoningEffort || "high" };
+				payload.reasoning = { ...payload.reasoning, effort: current.expert ? (selected.reasoningEffort || "high") : "low" };
 				if (config.search && current.search) {
 					payload.tools = [...(payload.tools || []), { type: "web_search" }];
 				}
@@ -254,6 +254,9 @@ function handle(message) {
 	switch (message.t) {
 		case "config":
 			setup(message);
+			break;
+		case "models":
+			queue = queue.then(() => { config = message; });
 			break;
 		case "chat":
 			queue = queue.then(() => chat(message));

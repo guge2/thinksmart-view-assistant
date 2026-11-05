@@ -1,7 +1,7 @@
 [Unit]
 Description=ThinkSmart Voice Assistant
-Wants=network-online.target user@1000.service
-After=network-online.target sound.target user@1000.service
+Wants=network-online.target user@1000.service thinksmart-volume-keys.service
+After=network-online.target sound.target user@1000.service thinksmart-volume-keys.service
 ConditionPathExists=/etc/thinksmart-voice/aliyun.json
 
 [Service]
@@ -13,7 +13,9 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=HOME=/tmp
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/thinksmart-voice.conf
+EnvironmentFile=-/etc/thinksmart-voice/gateway.conf
 LoadCredential=aliyun.json:/etc/thinksmart-voice/aliyun.json
+ExecStartPre=/usr/bin/systemctl --user start pipewire-pulse.socket pipewire-pulse.service
 ExecStart=/data/thinksmart/voice/venv/bin/python3 /usr/local/lib/thinksmart-voice/assistant.py
 Restart=always
 RestartSec=5

@@ -1,0 +1,9 @@
+[Unit]
+Description=ThinkSmart management requests
+
+[Path]
+PathExists=/run/thinksmart-gateway/request.json
+Unit=thinksmart-gateway-maintenance.service
+
+[Install]
+WantedBy=multi-user.target

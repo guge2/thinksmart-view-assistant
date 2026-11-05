@@ -9,6 +9,22 @@ BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KERNEL=$(uname -r)
 AEC_PLUGIN=${AEC_PLUGIN:-"$BASE/../../outputs/audio/libspa-aec-thinksmart.so"}
 
+for required in "$AEC_PLUGIN" "$BASE/snd-soc-tas5782m.ko" "$BASE/tas5728m_dsp_lenovo_cd-18781y.bin"; do
+	[ -s "$required" ] || { echo "缺少音频安装文件：$required" >&2; exit 1; }
+done
+VOICE_ACTIVE=0
+systemctl is-active --quiet thinksmart-voice.service && VOICE_ACTIVE=1
+restore_voice() {
+	result=$?
+	trap - EXIT
+	if [ "$VOICE_ACTIVE" -eq 1 ]; then
+		systemctl start thinksmart-voice.service || result=1
+	fi
+	exit "$result"
+}
+trap restore_voice EXIT
+if [ "$VOICE_ACTIVE" -eq 1 ]; then systemctl stop thinksmart-voice.service; fi
+
 install -D -m 0644 "$AEC_PLUGIN" /usr/lib/aarch64-linux-gnu/spa-0.2/aec/libspa-aec-thinksmart.so
 install -d /usr/local/share/thinksmart-aec/licenses
 install -m 0644 "$(dirname -- "$AEC_PLUGIN")"/licenses/*.txt /usr/local/share/thinksmart-aec/licenses/
@@ -44,4 +60,31 @@ systemctl start qup-i2c-pinctrl-fix.service
 modprobe snd_soc_tas5782m
 systemctl start user@1000.service
 systemctl enable --now thinksmart-volume-keys.service
+
+timeout 15 sh -c 'until [ -S /run/user/1000/bus ]; do sleep 1; done'
+runuser -u thinksmart -- env XDG_RUNTIME_DIR=/run/user/1000 \
+	systemctl --user restart pipewire.service wireplumber.service pipewire-pulse.service
+runuser -u thinksmart -- env XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/python3 - <<'PY'
+import json
+import subprocess
+import time
+
+wanted = {
+    "alsa_output.platform-c051000.sound-card.HiFi__hw_cd18781y_0__sink",
+    "alsa_input.platform-c051000.sound-card.HiFi__hw_cd18781y_1__source",
+}
+for attempt in range(20):
+    result = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5, check=True)
+    objects, _ = json.JSONDecoder().raw_decode(result.stdout)
+    applied = set()
+    for obj in objects:
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("node.name") in wanted and props.get("api.alsa.disable-mmap") is True:
+            applied.add(props["node.name"])
+    if applied == wanted:
+        break
+    time.sleep(.5)
+else:
+    raise SystemExit("音频节点没有加载新配置")
+PY
 

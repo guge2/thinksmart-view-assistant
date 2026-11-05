@@ -1,5 +1,5 @@
 [Unit]
-Description=ThinkSmart hardware volume keys
+Description=ThinkSmart hardware volume keys and microphone switch
 After=user@1000.service
 Wants=user@1000.service
 
@@ -7,6 +7,8 @@ Wants=user@1000.service
 User=thinksmart
 SupplementaryGroups=input
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+RuntimeDirectory=thinksmart-keys
+RuntimeDirectoryMode=0755
 ExecStart=/usr/local/bin/thinksmart-volume-keys
 Restart=always
 RestartSec=2

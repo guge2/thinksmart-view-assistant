@@ -1,0 +1,33 @@
+[Unit]
+Description=ThinkSmart local management gateway
+Wants=thinksmart-gateway-maintenance.path user@1000.service
+After=thinksmart-gateway-maintenance.path user@1000.service
+
+[Service]
+User=thinksmart
+Group=thinksmart
+SupplementaryGroups=systemd-journal
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/tmp
+EnvironmentFile=-/etc/thinksmart-ui.conf
+RuntimeDirectory=thinksmart-gateway
+RuntimeDirectoryMode=0700
+ExecStart=/data/thinksmart/voice/venv/bin/python3 /usr/local/lib/thinksmart-gateway/app.py
+Restart=on-failure
+RestartSec=3
+MemoryMax=96M
+CPUWeight=20
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=true
+ReadWritePaths=/data/thinksmart/ui
+ReadWritePaths=-/run/thinksmart-ui
+BindReadOnlyPaths=/run/user/1000
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

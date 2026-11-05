@@ -39,7 +39,7 @@ case "$phrase" in
 esac
 
 VOICE_ROOT=/data/thinksmart/voice
-MODEL_DIR="$VOICE_ROOT/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+MODEL_DIR="$VOICE_ROOT/models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
 RAW_FILE="$VOICE_ROOT/keywords.raw.new"
 KEYWORDS_FILE="$VOICE_ROOT/keywords.txt.new"
 PHRASE_FILE=/etc/thinksmart-voice/wake-phrase

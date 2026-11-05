@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply validated ThinkSmart management request
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/thinksmart-gateway/helper.py
+TimeoutStartSec=90
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ReadWritePaths=/etc/thinksmart-voice /run/thinksmart-gateway
+RestrictAddressFamilies=AF_UNIX

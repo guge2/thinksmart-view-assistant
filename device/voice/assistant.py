@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import array
 import datetime
+import io
 import json
 import logging
 import math
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from collections import deque
 from itertools import chain
@@ -22,8 +24,8 @@ import dashscope
 import sherpa_onnx
 
 from brain import Brain
-from playback import PCMPlayer, SpeechProgress
-from music import MUSIC_ROLE, MusicService, match_command
+from playback import PCMPlayer, SpeechProgress, AudioStalled
+from music import MUSIC_ROLE, MusicService, match_command, CommandCancelled as TurnCancelled
 import information
 import offline
 from alarms import AlarmService
@@ -33,7 +35,7 @@ SAMPLE_RATE = 16000
 FRAME_BYTES = 1280  # 40 ms of 16 kHz s16 mono
 PLAYBACK_RATE = 22050
 VOICE_ROOT = "/data/thinksmart/voice"
-MODEL_NAME = "sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01"
+MODEL_NAME = "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
 KWS_MODEL = f"{VOICE_ROOT}/models/{MODEL_NAME}"
 KEYWORDS_FILE = f"{VOICE_ROOT}/keywords.txt"
 WAKE_PHRASE_FILE = "/etc/thinksmart-voice/wake-phrase"
@@ -42,6 +44,10 @@ CONTROL_SOCKET = "/run/thinksmart-voice/control.sock"
 ECHO_CANCEL_SOURCE = "thinksmart.echo-cancel-source"
 RAW_CAPTURE_SOURCE = "alsa_input.platform-c051000.sound-card.HiFi__hw_cd18781y_1__source"
 UI_SETTINGS_FILE = "/data/thinksmart/ui/settings.json"
+MIC_STATE_FILE = "/run/thinksmart-keys/mic-state"
+MODEL_OVERRIDES = "/etc/thinksmart-voice/gateway.conf"
+MODEL_ENV = {"chat_model": "THINKSMART_CHAT_MODEL", "chat_provider": "THINKSMART_CHAT_PROVIDER", "expert_model": "THINKSMART_EXPERT_MODEL",
+             "tts_model": "THINKSMART_TTS_MODEL", "tts_voice": "THINKSMART_TTS_VOICE"}
 UI_TEXT_LIMIT = 2000
 ASSISTANT_ROLE = "Assistant"
 FAREWELL_WORDS = re.compile(r"退下|没事|不用|再见|拜拜|休息|去休息|别说|不聊|结束对话|就这样")
@@ -83,17 +89,14 @@ TOOL_RULES = (
     "你可以用工具播放QQ音乐、控制播放和调节音量，只在用户明确提出时调用。"
     "询问当前时间、日期或天气时必须使用对应工具，不得猜测实时信息。"
     "设置、查看、取消闹钟、计时器、提醒时必须调用manage_alarm。"
-    "根据当前设备本地时间计算具体日期，不得假装已设置。"
+    "设置闹钟时传钟点time和相对天数days_from_today（明天1、后天2），由设备计算日期。"
+    "多久以后传hours/minutes/seconds；重复传repeat规则；不要自行计算完整日期，不得假装已设置。"
     "取消时根据用户的描述匹配编号；不明确时先询问。编号仅供取消时传参，不要读给用户。"
     "使用工具时不要提前声称操作成功，以工具返回结果为准。"
     "用户想结束对话时调用end_conversation；说关机、关屏或睡觉时同时把screen_off设为true，说关机、睡觉或晚安时还要把stop_music设为true，你无法关闭设备电源。"
     "新闻、比赛、行情等需要最新信息的问题可以参考联网搜索结果，用一两句话概括，不要念出网址。"
     "回答结束时不要说“还有什么需要”之类的客套追问；只有确实需要用户补充信息时才用问句结尾。"
 )
-
-
-class TurnCancelled(Exception):
-    pass
 
 
 class WakeStream:
@@ -126,6 +129,10 @@ class WakeDetector:
         self.raw_capture = None
         self.raw_stream = None
         self.last_hit = 0.0
+        self.raw_buffer = bytearray()
+        self.raw_retry_at = 0.0
+        self.raw_started = 0.0
+        self.raw_enabled = True
 
     def __enter__(self):
         self.open_raw()
@@ -135,17 +142,68 @@ class WakeDetector:
         self.close_raw()
 
     def open_raw(self):
-        if self.raw_capture is None:
+        if self.raw_capture is None and time.monotonic() >= self.raw_retry_at:
             try:
                 self.raw_capture = self.assistant.create_capture(RAW_CAPTURE_SOURCE)
+                os.set_blocking(self.raw_capture.stdout.fileno(), False)
                 self.raw_stream = WakeStream(self.spotter)
+                self.raw_started = time.monotonic()
             except Exception as error:
                 logging.warning("启动原始麦克风流失败: %s", error)
+                self.close_raw()
 
     def close_raw(self):
-        self.assistant.stop_process(self.raw_capture)
-        self.raw_capture = None
+        capture, self.raw_capture = self.raw_capture, None
         self.raw_stream = None
+        self.raw_buffer.clear()
+        self.raw_retry_at = time.monotonic() + 5
+        if capture is not None:
+            threading.Thread(target=self.assistant.stop_process, args=(capture,),
+                             name="raw-capture-close", daemon=True).start()
+
+    def read_raw(self, allowed):
+        capture = self.raw_capture
+        if capture is None:
+            return ""
+        result = ""
+        try:
+            received = 0
+            while received < 128 * 1024:
+                try:
+                    data = os.read(capture.stdout.fileno(), 16384)
+                except BlockingIOError:
+                    break
+                if not data:
+                    raise RuntimeError("raw microphone stream ended")
+                self.raw_buffer.extend(data)
+                received += len(data)
+            if received:
+                self.assistant.raw_progress = time.monotonic()
+            elif time.monotonic() - max(self.raw_started, self.assistant.raw_progress) > 2:
+                raise RuntimeError("raw microphone stream timed out")
+            if not allowed:
+                self.raw_buffer.clear()
+                if self.raw_enabled:
+                    self.raw_stream = WakeStream(self.spotter)
+                self.raw_enabled = False
+                return ""
+            self.raw_enabled = True
+            limit = FRAME_BYTES * 8
+            if len(self.raw_buffer) > limit:
+                drop = (len(self.raw_buffer) - limit + FRAME_BYTES - 1) // FRAME_BYTES * FRAME_BYTES
+                del self.raw_buffer[:drop]
+                self.raw_stream = WakeStream(self.spotter)
+            while len(self.raw_buffer) >= FRAME_BYTES:
+                frame = bytes(self.raw_buffer[:FRAME_BYTES])
+                del self.raw_buffer[:FRAME_BYTES]
+                self.assistant.capture_levels["raw"] = self.assistant.frame_level(frame)
+                detected = self.decode(self.raw_stream, frame, gain=4.0)
+                result = result or detected
+            return result
+        except (OSError, RuntimeError, ValueError) as error:
+            logging.warning("读取原始麦克风流失败: %s", error)
+            self.close_raw()
+            return ""
 
     def decode(self, stream, data, gain=1.0):
         samples = self.assistant.pcm_to_floats(data)
@@ -155,15 +213,7 @@ class WakeDetector:
         if self.raw_capture is None:
             self.open_raw()
 
-        raw_result = ""
-        if self.raw_capture is not None:
-            try:
-                raw_data = self.assistant.read_capture(self.raw_capture)
-                if not is_playing or raw_wake_allowed:
-                    raw_result = self.decode(self.raw_stream, raw_data, gain=4.0)
-            except Exception as error:
-                logging.warning("读取原始麦克风流失败: %s", error)
-                self.close_raw()
+        raw_result = self.read_raw(not is_playing or raw_wake_allowed)
 
         result = self.decode(self.stream, data, gain=2.0)
         now = time.monotonic()
@@ -194,6 +244,13 @@ class UiPublisher:
 
     def __init__(self, path=UI_EVENT_SOCKET):
         self.path = path
+        self.lock = threading.RLock()
+        self.generation = str(time.monotonic_ns())
+        self.sequence = 0
+        self.state = {"phase": "idle", "cloud": "unknown", "mic": True,
+                      "hardware_mic": None, "requested_mic": True,
+                      "partial": "", "user_text": "", "answer": "",
+                      "alarm_active": False, "alarm_text": ""}
         try:
             self.sock = socket.socket(
                 socket.AF_UNIX,
@@ -204,19 +261,71 @@ class UiPublisher:
             self.sock = None
 
     def emit(self, event, **fields):
+        with self.lock:
+            self._record(event, fields)
+            self._send(event, fields, self.path)
+
+    def _record(self, event, fields):
+        state = self.state
+        if event in ("idle", "wake", "listen", "think", "speak"):
+            state["phase"] = event
+        if event == "wake":
+            state.update(partial="", user_text="", answer="", error_code=None)
+        elif event == "user":
+            state.update(user_text=str(fields.get("text", ""))[-2000:], partial="", answer="")
+        elif event == "partial":
+            state["partial"] = str(fields.get("text", ""))[-2000:]
+        elif event == "delta":
+            state["answer"] = (state["answer"] + str(fields.get("text", "")))[-4000:]
+            state["phase"] = "answer"
+        elif event == "reply":
+            state["answer"] = str(fields.get("text", ""))[-4000:]
+        elif event == "cloud":
+            state["cloud"] = fields.get("s")
+        elif event == "ready":
+            state.update({k: fields[k] for k in ("wake", "mic", "requested_mic", "hardware_mic") if k in fields})
+        elif event == "mic":
+            state.update(mic=bool(fields.get("on")), requested_mic=fields.get("requested_mic", True),
+                         hardware_mic=fields.get("hardware_mic"))
+        elif event in ("music", "lyric"):
+            state[event] = dict(fields)
+        elif event == "mlogin":
+            if fields.get("s") in ("ok", "none", "expired"):
+                state["account"], state["login"] = dict(fields), None
+            else:
+                state["login"] = dict(fields)
+        elif event == "alarm":
+            state.update(alarm_active=True, alarm_text=str(fields.get("text", ""))[-2000:])
+        elif event == "alarm_end":
+            state.update(alarm_active=False, alarm_text="")
+        elif event == "error":
+            state.update(error_code=fields.get("code"), error_until=time.monotonic() + 10)
+
+    def snapshot(self, target=None):
+        with self.lock:
+            fields = dict(self.state)
+            if len(json.dumps(fields, ensure_ascii=False).encode()) > 58000:
+                fields.pop("lyric", None)
+                fields.pop("login", None)
+            self._send("snapshot", fields, target or self.path)
+
+    def _send(self, event, fields, target):
+        self.sequence += 1
         if self.sock is None:
             return
         text = fields.get("text")
         if isinstance(text, str) and len(text) > UI_TEXT_LIMIT:
             fields["text"] = text[-UI_TEXT_LIMIT:]
         fields["e"] = event
+        fields["generation"] = self.generation
+        fields["event_seq"] = self.sequence
         try:
             payload = json.dumps(
                 fields,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
-            self.sock.sendto(payload, self.path)
+            self.sock.sendto(payload, target)
         except (OSError, TypeError, ValueError):
             pass
 
@@ -230,6 +339,8 @@ def classify_error(error):
     text = " ".join(parts).lower()
     if "microphone" in text:
         return "mic"
+    if "speaker" in text or "pipewire-pulse" in text:
+        return "speaker"
     if "credential" in text:
         return "config"
     if any(
@@ -368,6 +479,7 @@ class ThinkSmartAssistant:
         chat = self.load_chat_config()
         expert = self.load_chat_config("expert.json")
         self.expert_model = expert.get("model") if expert.get("api_key") else None
+        self.expert_provider = expert.get("provider", "openai") if self.expert_model else None
         self.chat_provider = chat.get("provider", "bailian")
         self.chat_model = chat.get("model") or os.getenv("THINKSMART_CHAT_MODEL", "qwen3.8-flash")
         self.tts_model = os.getenv(
@@ -375,6 +487,11 @@ class ThinkSmartAssistant:
             "qwen-audio-3.1-tts-flash",
         )
         self.tts_voice = os.getenv("THINKSMART_TTS_VOICE", "longxiaocheng_v3.1")
+        self.model_defaults = {key: getattr(self, key) for key in MODEL_ENV}
+        for key, value in self.model_overrides().items():
+            setattr(self, key, value)
+        self.turn_models = {}
+        self.preview_lock = threading.Lock()
         self.system_prompt = os.getenv(
             "THINKSMART_SYSTEM_PROMPT",
             "你是运行在联想ThinkSmart独立设备上的语音助手。"
@@ -399,19 +516,61 @@ class ThinkSmartAssistant:
         self.conversation_over = False
         self.screen_off_pending = False
         self.stop_requested = False
+        self.last_progress = time.monotonic()
         self.capture = None
         self.capture_thread = None
         self.capture_stop = threading.Event()
-        self.audio_frames = queue.Queue()
+        self.audio_frames = queue.Queue(maxsize=200)
+        self.capture_progress = time.monotonic()
+        self.capture_clock_start = self.capture_progress
+        self.capture_clock_bytes = 0
+        self.capture_clock = None
+        self.raw_progress = 0.0
+        self.capture_levels = {"raw": 0.0, "aec": 0.0}
+        self.dropped_frames = 0
+        self.audio_overflow = threading.Event()
+        self.bad_capture_windows = 0
+        self.capture_failures = deque()
+        self.recovery_requested = threading.Event()
+        self.recovery_in_progress = False
+        self.recovery_attempts = deque()
+        self.recovery_state_file = "/data/thinksmart/music/audio-recovery.json"
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as source:
+                self.recovery_boot = source.read().strip()
+            with open(self.recovery_state_file, encoding="utf-8") as source:
+                saved_recovery = json.load(source)
+            if saved_recovery.get("boot") == self.recovery_boot:
+                now = time.monotonic()
+                self.recovery_attempts.extend(t for t in saved_recovery.get("attempts", [])
+                                              if type(t) in (int, float) and 0 <= now - t < 600)
+        except (OSError, ValueError, TypeError, AttributeError):
+            self.recovery_boot = getattr(self, "recovery_boot", "")
+        self.recovery_retry_at = 0.0
+        self.recovery_status = "idle"
+        self.recovery_reason = ""
+        self.turn_timing = {}
+        self.wake_started = None
+        self.wake_hits = 0
+        self.last_wake = None
         self.playback = None
         self.speech_player = None
+        self.local_speaking = False
         self.heard_reply = ""
         self.wake_phrase = self.read_wake_phrase()
         self.keyword_spotter = self.create_keyword_spotter()
         self.phase = "idle"
         self.cloud_state = "ready"
         self.mic_enabled = threading.Event()
-        self.mic_enabled.set()
+        self.mic_requested = True
+        self.hardware_mic = self.read_hardware_mic()
+        try:
+            with open(UI_SETTINGS_FILE, encoding="utf-8") as source:
+                self.mic_requested = json.load(source).get("mic", True) is not False
+        except (OSError, ValueError, AttributeError):
+            pass
+        if self.mic_requested and self.hardware_mic is not False:
+            self.mic_enabled.set()
         self.talk_requested = threading.Event()
         self.cancel_requested = threading.Event()
         self.barge_in_requested = threading.Event()
@@ -419,8 +578,10 @@ class ThinkSmartAssistant:
         self.brain = Brain({
             "apiKey": chat.get("api_key") or self.api_key,
             "baseUrl": chat.get("base_url") or f"https://{self.workspace}.{self.region}.maas.aliyuncs.com/compatible-mode/v1",
-            "provider": self.chat_provider,
+            "provider": chat.get("provider", "bailian"),
+            "api": chat.get("api", "openai-completions"),
             "providerOrder": chat.get("provider_order", []),
+            "providerOrderModel": chat.get("model") or self.chat_model,
             "model": self.chat_model,
             "maxTokens": chat.get("max_tokens", int(os.getenv("THINKSMART_MAX_REPLY_TOKENS", "256"))),
             "contextWindow": chat.get("context_window", 131072),
@@ -449,9 +610,63 @@ class ThinkSmartAssistant:
             ),
             "tools": [END_TOOL] + self.music.tools + information.TOOLS + self.alarms.tools,
         })
+        self.brain.configure_models(self.chat_model, self.expert_model, self.chat_provider)
         logging.info("对话模型：%s / %s", self.chat_provider, self.chat_model)
         if self.expert_model:
             logging.info("困难任务模型：openai / %s / high", self.expert_model)
+
+    def model_overrides(self):
+        values = dict(self.model_defaults)
+        try:
+            with open(MODEL_OVERRIDES, encoding='utf-8') as source:
+                env = dict(line.strip().split('=', 1) for line in source if '=' in line and not line.lstrip().startswith('#'))
+            for key, name in MODEL_ENV.items():
+                if name in env:
+                    values[key] = env[name]
+        except OSError:
+            pass
+        return values
+
+    def begin_turn(self):
+        # Only the conversation thread changes these values, before recognition starts.
+        values = self.model_overrides()
+        if any(getattr(self, key) != value for key, value in values.items()):
+            self.brain.configure_models(values['chat_model'], values['expert_model'], values['chat_provider'])
+            for key, value in values.items():
+                setattr(self, key, value)
+            logging.info('下一轮模型与音色配置已加载')
+
+    def preview_voice(self, sock, sender, message):
+        try:
+            output = io.BytesIO()
+            with wave.open(output, 'wb') as target:
+                target.setnchannels(1)
+                target.setsampwidth(2)
+                target.setframerate(PLAYBACK_RATE)
+                with self.client.audio.tts.connect(model=message['model'], voice=message['voice'], format='pcm',
+                                                   sample_rate=PLAYBACK_RATE, rate=1.0, timeout=15) as session:
+                    session.send_text('你好，我是你的语音助手。很高兴为你服务。')
+                    session.stop()
+                    total = 0
+                    for event in session.events():
+                        if isinstance(event, bytes):
+                            total += len(event)
+                            if total > PLAYBACK_RATE * 2 * 20:
+                                raise ValueError('试听音频过长')
+                            target.writeframesraw(event)
+                    if not total:
+                        raise ValueError('没有收到试听音频，请稍后重试')
+            path = '/run/thinksmart-voice/preview-' + message['id'] + '.wav'
+            with open(path, 'wb') as target:
+                target.write(output.getvalue())
+            cleanup = threading.Timer(60, lambda: os.path.exists(path) and os.unlink(path))
+            cleanup.daemon = True
+            cleanup.start()
+            self.control_reply(sock, sender, message, True, 'ready')
+        except Exception:
+            self.control_reply(sock, sender, message, False, '试听生成失败，请检查语音服务或稍后重试')
+        finally:
+            self.preview_lock.release()
 
     @staticmethod
     def clamp_rate(value):
@@ -499,10 +714,13 @@ class ThinkSmartAssistant:
             "ready",
             wake=self.wake_phrase,
             mic=int(self.mic_enabled.is_set()),
+            requested_mic=self.mic_requested,
+            hardware_mic=self.hardware_mic,
             phase=self.phase,
         )
         self.ui.emit("cloud", s=self.cloud_state)
         self.music.announce()
+        self.ui.snapshot()
 
     def duck(self):
         self.music.hold()
@@ -515,15 +733,34 @@ class ThinkSmartAssistant:
         self.ducker.restore()
 
     def set_mic(self, enabled):
-        if enabled:
+        self.mic_requested = enabled
+        active = enabled and self.hardware_mic is not False
+        if active:
             self.mic_enabled.set()
         else:
             self.mic_enabled.clear()
+            self.talk_requested.clear()
+            self.clear_audio()
             self.barge_in_requested.clear()
             if self.phase != "idle":
                 self.cancel_requested.set()
-        logging.info("麦克风已%s", "开启" if enabled else "关闭")
-        self.ui.emit("mic", on=int(enabled))
+        logging.info("麦克风已%s", "开启" if active else "关闭")
+        self.ui.emit("mic", on=int(active), requested_mic=enabled, hardware_mic=self.hardware_mic)
+
+    @staticmethod
+    def read_hardware_mic():
+        try:
+            with open(MIC_STATE_FILE, encoding="ascii") as source:
+                value = source.read(4).strip()
+            return {"1": True, "0": False}.get(value)
+        except OSError:
+            return None
+
+    def refresh_hardware_mic(self):
+        state = self.read_hardware_mic()
+        if state is not None and state != self.hardware_mic:
+            self.hardware_mic = state
+            self.set_mic(self.mic_requested)
 
     def start_control(self):
         try:
@@ -549,7 +786,7 @@ class ThinkSmartAssistant:
     def control_loop(self, sock):
         while not self.stop_requested:
             try:
-                data = sock.recv(512)
+                data, sender = sock.recvfrom(2048)
             except OSError:
                 return
             try:
@@ -558,35 +795,106 @@ class ThinkSmartAssistant:
                 continue
             if not isinstance(message, dict):
                 continue
-            command = message.get("c")
-            if command == "talk":
-                if self.mic_enabled.is_set() and self.phase == "idle":
+            try:
+                command = message.get("c")
+                if command == "talk":
+                    if not self.mic_enabled.is_set():
+                        raise ValueError("麦克风已关闭，请先打开麦克风")
+                    if self.phase != "idle":
+                        raise ValueError("正在对话中，可先结束当前对话")
                     self.talk_requested.set()
-            elif command == "stop":
-                self.alarms.dismiss()
-                if self.phase != "idle":
-                    self.cancel_requested.set()
-            elif command == "alarm_stop":
-                self.alarms.dismiss()
-            elif command == "mic":
-                self.set_mic(bool(message.get("on")))
-            elif command == "hello":
-                self.announce()
-            elif command == "prefs":
-                if "rate" in message:
-                    self.speech_rate = self.clamp_rate(message.get("rate"))
-                if "think" in message:
-                    self.thinking = bool(message.get("think"))
-                if "night" in message:
-                    self.night = message["night"]
-                logging.info("语速 %.1f，思考模式%s", self.speech_rate, "开启" if self.thinking else "关闭")
-            elif command == "music":
-                self.music.ui_command(message.get("a"))
-            elif command == "login":
-                self.music.login_command(message.get("t"))
+                elif command == "stop":
+                    self.alarms.dismiss()
+                    if self.phase != "idle":
+                        self.cancel_requested.set()
+                elif command == "alarm_stop":
+                    self.alarms.dismiss()
+                elif command == "mic":
+                    self.set_mic(bool(message.get("on")))
+                elif command == "hardware_mic":
+                    self.refresh_hardware_mic()
+                elif command == "hello":
+                    self.announce()
+                elif command == "snapshot":
+                    self.ui.snapshot(sender)
+                elif command == 'preview':
+                    if not sender or not re.fullmatch('[a-f0-9]{24}', str(message.get('id', ''))):
+                        raise ValueError('试听请求无效')
+                    if not all(re.fullmatch('[A-Za-z0-9_.-]{1,128}', str(message.get(k, ''))) for k in ('model', 'voice')):
+                        raise ValueError('试听模型或音色无效')
+                    if not self.preview_lock.acquire(blocking=False):
+                        raise ValueError('上一段试听仍在生成，请稍后再试')
+                    threading.Thread(target=self.preview_voice, args=(sock, sender, message), daemon=True).start()
+                    continue
+                elif command == "ping":
+                    health = {"seq": message.get("seq"),
+                              "healthy": time.monotonic() - self.last_progress < 20 and self.audio_ready(),
+                              "control_healthy": time.monotonic() - self.last_progress < 20,
+                              "audio_ready": self.audio_ready(),
+                              "audio_recovery": {"status": self.recovery_status, "reason": self.recovery_reason,
+                                                 "attempts": len(self.recovery_attempts)},
+                              "phase": self.phase, "cloud": self.cloud_state,
+                              "mic": self.mic_enabled.is_set(), "hardware_mic": self.hardware_mic,
+                              "capture_age": round(time.monotonic() - self.capture_progress, 2),
+                              "queued_audio_ms": self.audio_frames.qsize() * 40,
+                              "capture_clock": self.capture_clock,
+                              "raw_age": round(time.monotonic() - self.raw_progress, 2) if self.raw_progress else None,
+                              "levels": dict(self.capture_levels), "dropped_frames": self.dropped_frames,
+                              "timing": dict(self.turn_timing),
+                              "wake_detection": {"count": self.wake_hits, "last": self.last_wake},
+                              "preferences": {"speech_rate": self.speech_rate, "thinking": self.thinking,
+                                              "night": self.night, "mic": self.mic_requested},
+                              "configuration": {
+                                  "kws_score": float(os.getenv("THINKSMART_KWS_SCORE", "1.0")),
+                                  "kws_threshold": float(os.getenv("THINKSMART_KWS_THRESHOLD", "0.25")),
+                                  "speech_wait_seconds": float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8")),
+                                  "max_speech_seconds": float(os.getenv("THINKSMART_MAX_SPEECH_SECONDS", "25")),
+                                  "followup_seconds": self.followup_seconds,
+                                  "question_followup_seconds": self.question_followup_seconds},
+                              "models": {"chat_model": self.chat_model, "chat_provider": self.chat_provider,
+                                         "wake_model": MODEL_NAME,
+                                         "expert_model": self.expert_model, "expert_provider": self.expert_provider,
+                                         "asr_model": self.asr_model, "tts_model": self.tts_model,
+                                         "tts_voice": self.tts_voice}, "turn_models": dict(self.turn_models)}
+                    if sender:
+                        try:
+                            sock.sendto(json.dumps(dict(health, e="pong")).encode(), socket.MSG_DONTWAIT, sender)
+                        except OSError:
+                            pass
+                    else:
+                        self.ui.emit("pong", **health)
+                elif command == "prefs":
+                    if "rate" in message:
+                        self.speech_rate = self.clamp_rate(message.get("rate"))
+                    if "think" in message:
+                        self.thinking = bool(message.get("think"))
+                    if "night" in message:
+                        self.night = message["night"]
+                    logging.info("语速 %.1f，思考模式%s", self.speech_rate, "开启" if self.thinking else "关闭")
+                elif command == "music":
+                    self.music.ui_command(message.get("a"))
+                elif command == "login":
+                    self.music.login_command(message.get("t"))
+                else:
+                    raise ValueError("不支持的设备操作")
+                if sender and command not in ("ping", "snapshot", "hello"):
+                    self.control_reply(sock, sender, message, True, "applied" if command in ("prefs", "mic") else "accepted")
+            except Exception as error:
+                logging.warning("控制请求失败：%s", type(error).__name__)
+                if sender:
+                    self.control_reply(sock, sender, message, False, str(error) if isinstance(error, ValueError) else "操作失败")
+
+    @staticmethod
+    def control_reply(sock, sender, request, ok, status):
+        try:
+            sock.sendto(json.dumps({"e": "ack", "id": request.get("id"), "ok": ok,
+                                   "status": status}).encode(), socket.MSG_DONTWAIT, sender)
+        except OSError:
+            pass
 
     def report_error(self, error):
         code = classify_error(error)
+        self.turn_models['error'] = code
         self.ui.emit("error", code=code)
         if code == "network":
             self.set_cloud("offline")
@@ -604,7 +912,7 @@ class ThinkSmartAssistant:
         if sys.byteorder == "big":
             samples.byteswap()
         peak = max(max(samples), -min(samples))
-        return min(100, peak * 100 // 32768)
+        return round(min(100.0, peak * 100 / 32768), 2)
 
     @staticmethod
     def load_chat_config(filename="chat.json"):
@@ -670,19 +978,7 @@ class ThinkSmartAssistant:
 
     def create_keyword_spotter(self):
         return sherpa_onnx.KeywordSpotter(
-            tokens=os.path.join(KWS_MODEL, "tokens.txt"),
-            encoder=os.path.join(
-                KWS_MODEL,
-                "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-            ),
-            decoder=os.path.join(
-                KWS_MODEL,
-                "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-            ),
-            joiner=os.path.join(
-                KWS_MODEL,
-                "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-            ),
+            **offline.model_paths(KWS_MODEL),
             keywords_file=KEYWORDS_FILE,
             num_threads=int(os.getenv("THINKSMART_KWS_THREADS", "1")),
             sample_rate=SAMPLE_RATE,
@@ -701,6 +997,11 @@ class ThinkSmartAssistant:
         self.close_capture()
         self.capture_stop.clear()
         self.capture = self.create_capture(ECHO_CANCEL_SOURCE)
+        self.capture_progress = time.monotonic()
+        self.capture_clock_start = self.capture_progress
+        self.capture_clock_bytes = 0
+        self.capture_clock = None
+        self.bad_capture_windows = 0
         self.capture_thread = threading.Thread(target=self.capture_loop, name="microphone", daemon=True)
         self.capture_thread.start()
 
@@ -726,20 +1027,126 @@ class ThinkSmartAssistant:
         self.stop_process(self.capture)
         if self.capture_thread is not None:
             self.capture_thread.join(timeout=5)
+            if self.capture_thread.is_alive():
+                raise AudioStalled("microphone shutdown stalled")
         self.capture_thread = None
         self.capture = None
         self.clear_audio()
 
     def clear_audio(self):
+        self.audio_overflow.clear()
         while not self.audio_frames.empty():
             try:
                 self.audio_frames.get_nowait()
             except queue.Empty:
                 break
 
+    def queue_audio(self, data):
+        try:
+            self.audio_frames.put_nowait(data)
+        except queue.Full:
+            self.audio_overflow.set()
+            self.dropped_frames += 1
+            try:
+                self.audio_frames.get_nowait()
+            except queue.Empty:
+                pass
+            self.audio_frames.put_nowait(data)
+
+    def audio_ready(self):
+        clock = self.capture_clock
+        return bool(self.capture_thread is not None and self.capture_thread.is_alive()
+                    and not self.capture_stop.is_set() and not self.recovery_in_progress
+                    and time.monotonic() - self.capture_progress < 1
+                    and clock is not None and .9 <= clock["ratio"] <= 1.15)
+
+    def request_audio_recovery(self, reason):
+        now = time.monotonic()
+        if self.recovery_requested.is_set() or self.recovery_in_progress or now < self.recovery_retry_at:
+            return
+        while self.recovery_attempts and now - self.recovery_attempts[0] >= 600:
+            self.recovery_attempts.popleft()
+        self.recovery_reason = reason
+        if len(self.recovery_attempts) >= 2:
+            self.recovery_status = "limited"
+            self.recovery_retry_at = now + 60
+            logging.error("音频恢复已达每十分钟两次上限：%s", reason)
+            return
+        self.recovery_status = "pending"
+        self.recovery_requested.set()
+        if not self.alarms.ringing:
+            self.cancel_requested.set()
+
+    def recover_audio(self):
+        if self.alarms.ringing:
+            return
+        self.recovery_in_progress = True
+        self.recovery_status = "recovering"
+        self.recovery_attempts.append(time.monotonic())
+        try:
+            temporary = self.recovery_state_file + ".new"
+            with open(temporary, "w", encoding="utf-8") as target:
+                json.dump({"boot": self.recovery_boot, "attempts": list(self.recovery_attempts)}, target)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, self.recovery_state_file)
+        except OSError:
+            logging.warning("未能保存音频恢复次数")
+        self.recovery_retry_at = time.monotonic() + 60
+        self.music.hold()
+        try:
+            logging.warning("正在重建音频链路：%s", self.recovery_reason)
+            self.close_capture()
+            subprocess.run(["/usr/bin/systemctl", "--user", "restart", "pipewire.service",
+                            "wireplumber.service", "pipewire-pulse.service"],
+                           check=True, capture_output=True, timeout=20)
+            self.open_capture()
+            deadline = time.monotonic() + 30
+            while not self.stop_requested and time.monotonic() < deadline:
+                self.last_progress = time.monotonic()
+                if self.capture_thread is None or not self.capture_thread.is_alive():
+                    self.open_capture()
+                clock = self.capture_clock
+                if (clock is not None and .9 <= clock["ratio"] <= 1.15
+                        and time.monotonic() - self.capture_progress < 1):
+                    self.capture_failures.clear()
+                    self.recovery_status = "recovered"
+                    logging.info("音频链路已恢复连续采集")
+                    return
+                time.sleep(.1)
+            self.recovery_status = "failed"
+            logging.error("音频链路恢复后仍未就绪")
+        except (OSError, subprocess.SubprocessError) as error:
+            self.recovery_status = "failed"
+            logging.error("音频链路恢复失败：%s", type(error).__name__)
+        finally:
+            self.recovery_requested.clear()
+            self.recovery_in_progress = False
+            self.cancel_requested.clear()
+            self.music.release()
+
+    def audio_watchdog(self):
+        while not self.stop_requested:
+            time.sleep(1)
+            if self.recovery_in_progress:
+                continue
+            player = self.speech_player
+            capture_stalled = (self.capture_thread is not None and self.capture_thread.is_alive()
+                               and not self.capture_stop.is_set()
+                               and time.monotonic() - self.capture_progress > 15)
+            if player is not None and player.stalled():
+                logging.critical("播放调用已停滞，退出并由systemd恢复服务")
+                os._exit(1)
+            if capture_stalled:
+                self.request_audio_recovery("采集流超过15秒未推进")
+            elif self.bad_capture_windows >= 3:
+                self.request_audio_recovery("连续三个观察窗口收音不足")
+
     def read_audio_bytes(self):
         while True:
             self.check_cancel()
+            if self.audio_overflow.is_set():
+                raise RuntimeError("microphone command buffer overflow")
             try:
                 return self.audio_frames.get(timeout=0.1)
             except queue.Empty:
@@ -771,20 +1178,38 @@ class ThinkSmartAssistant:
             with WakeDetector(self) as detector:
                 while not self.capture_stop.is_set() and not self.stop_requested:
                     data = self.read_capture(self.capture)
+                    self.capture_progress = time.monotonic()
+                    self.capture_clock_bytes += len(data)
+                    elapsed = self.capture_progress - self.capture_clock_start
+                    if elapsed >= 5:
+                        seconds = self.capture_clock_bytes / (SAMPLE_RATE * 2)
+                        self.capture_clock = {"audio_seconds": round(seconds, 2),
+                                              "wall_seconds": round(elapsed, 2),
+                                              "ratio": round(seconds / elapsed, 3)}
+                        self.bad_capture_windows = self.bad_capture_windows + 1 if seconds / elapsed < .9 else 0
+                        if seconds / elapsed < .9:
+                            logging.warning("收音数据不连续：经过%.2f秒，收到%.2f秒音频", elapsed, seconds)
+                        self.capture_clock_start = self.capture_progress
+                        self.capture_clock_bytes = 0
+                    self.capture_levels["aec"] = self.frame_level(data)
                     if not self.mic_enabled.is_set():
                         detector.close_raw()
                         tail.clear()
                         continue
                     tail.append(data)
                     is_playing = (
-                        self.music.player.state == "playing" or self.speech_player is not None
+                        self.music.player.state == "playing" or self.speech_player is not None or self.local_speaking
                     )
                     result, source = detector.feed(data, is_playing, self.raw_wake_allowed)
                     hit = result and self.phase != "wake" and not self.barge_in_requested.is_set()
                     if hit:
+                        self.wake_hits += 1
+                        self.last_wake = {"at": time.time(), "source": source}
+                        self.wake_started = time.monotonic()
+                        self.turn_timing = {"wake_at": time.time(), "source": source}
                         self.clear_audio()
                         for frame in list(tail)[:-1]:
-                            self.audio_frames.put_nowait(frame)
+                            self.queue_audio(frame)
                         self.screen_off_pending = False
                         if self.phase == "idle":
                             self.set_phase("wake")
@@ -794,10 +1219,16 @@ class ThinkSmartAssistant:
                             self.cancel_requested.set()
                         logging.info("%s检测到唤醒词：%s (%s)", self.phase, result, source)
                     if self.phase in ("wake", "listen") or self.barge_in_requested.is_set():
-                        self.audio_frames.put_nowait(data)
+                        self.queue_audio(data)
         except (OSError, RuntimeError, ValueError) as error:
             if not self.capture_stop.is_set() and not self.stop_requested:
                 logging.error("麦克风监听失败：%s", error)
+                now = time.monotonic()
+                self.capture_failures.append(now)
+                while self.capture_failures and now - self.capture_failures[0] > 60:
+                    self.capture_failures.popleft()
+                if len(self.capture_failures) >= 3:
+                    self.request_audio_recovery("一分钟内采集流连续三次失败")
 
     @staticmethod
     def pcm_to_floats(data):
@@ -812,8 +1243,14 @@ class ThinkSmartAssistant:
         while not self.stop_requested:
             if self.talk_requested.wait(0.1):
                 self.talk_requested.clear()
+                if not self.mic_enabled.is_set():
+                    continue
+                if self.phase != "wake":
+                    self.wake_started = time.monotonic()
+                    self.turn_timing = {"wake_at": time.time(), "source": "button"}
                 self.set_phase("wake")
                 return True
+            self.check_cancel()
             if not self.capture_thread.is_alive():
                 raise RuntimeError("microphone stream ended")
         return False
@@ -870,6 +1307,8 @@ class ThinkSmartAssistant:
                     state["text"] = text.strip()
                     if state["speech_at"] is None:
                         state["speech_at"] = time.monotonic()
+                        if self.wake_started is not None:
+                            self.turn_timing["first_text_ms"] = round((state["speech_at"] - self.wake_started) * 1000)
                     speech_seen.set()
                     if sentence.get("sentence_end"):
                         sentence_ended.set()
@@ -877,21 +1316,26 @@ class ThinkSmartAssistant:
         if wait_seconds is None:
             wait_seconds = float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8"))
         max_seconds = float(os.getenv("THINKSMART_MAX_SPEECH_SECONDS", "25"))
-        wait_deadline = time.monotonic() + wait_seconds
-
         with self.client.audio.asr.recognize(
             model=self.asr_model,
             format="pcm",
             sample_rate=SAMPLE_RATE,
+            timeout=max(10.0, wait_seconds + 5),
         ) as recognition:
+            wait_deadline = time.monotonic() + wait_seconds
+            if self.wake_started is not None:
+                self.turn_timing["asr_ready_ms"] = round((time.monotonic() - self.wake_started) * 1000)
             with ThreadPoolExecutor(max_workers=1) as pool:
                 receiver = pool.submit(receive_events, recognition)
                 stopped = False
                 try:
+                    self.check_cancel()
                     logging.info("开始接收语音")
                     while not self.stop_requested and not sentence_ended.is_set():
                         if self.cancel_requested.is_set():
                             raise TurnCancelled()
+                        if receiver.done():
+                            receiver.result()
                         frame = self.read_audio_bytes()
                         recognition.send_audio_frame(frame)
                         self.ui.emit("level", v=self.frame_level(frame))
@@ -916,6 +1360,9 @@ class ThinkSmartAssistant:
                             pass
                     recognition.close()
 
+        self.check_cancel()
+        if self.audio_overflow.is_set():
+            raise RuntimeError("microphone command buffer overflow")
         return state["text"].strip()
 
     def chat_context(self):
@@ -930,7 +1377,9 @@ class ThinkSmartAssistant:
         )
 
     def check_cancel(self):
-        if self.cancel_requested.is_set() or self.stop_requested:
+        self.last_progress = time.monotonic()
+        if (self.cancel_requested.is_set() or self.stop_requested
+                or (self.recovery_requested.is_set() and not self.recovery_in_progress and not self.alarms.ringing)):
             raise TurnCancelled()
 
     def run_tool(self, name, args, has_reply):
@@ -950,7 +1399,7 @@ class ThinkSmartAssistant:
         if name == "end_conversation":
             self.finish_conversation(bool(args.get("screen_off")), bool(args.get("stop_music")))
             return ("" if has_reply else "好的"), True, True
-        message, ok, started = self.music.call_tool(name, arguments)
+        message, ok, started = self.music.call_tool(name, arguments, self.check_cancel)
         self.turn_effects.append("action" if ok else "failed")
         self.music_started = self.music_started or started
         return message, ok, True
@@ -977,6 +1426,7 @@ class ThinkSmartAssistant:
                     for event in session.events():
                         self.check_cancel()
                         if isinstance(event, bytes):
+                            self.turn_models.update(speech='cloud', tts_model=self.tts_model, tts_voice=self.tts_voice)
                             progress.audio(event)
                             player.write(event)
                         else:
@@ -987,6 +1437,8 @@ class ThinkSmartAssistant:
                     try:
                         for fragment in fragments:
                             self.check_cancel()
+                            if receiver.done():
+                                receiver.result()
                             if fragment:
                                 reply_parts.append(fragment)
                                 if self.wake_phrase in re.sub(r"\s", "", "".join(reply_parts)):
@@ -1006,8 +1458,11 @@ class ThinkSmartAssistant:
             self.check_cancel()
             raise
         finally:
-            player.close()
-            self.speech_player = None
+            try:
+                player.close()
+            finally:
+                self.speech_player = None
+                self.raw_wake_allowed = True
             self.heard_reply = "".join(reply_parts).strip() if completed else progress.heard(player.played_seconds)
             if not completed:
                 logging.info("播报停止在 %.2f 秒，已听到：%s", player.played_seconds, self.heard_reply)
@@ -1025,6 +1480,7 @@ class ThinkSmartAssistant:
                     raise
 
     def handle_turn(self, user_text):
+        self.turn_models = {'started_at': time.time(), 'chat_model': None, 'speech': None}
         self.heard_reply = ""
         self.local_result = ""
         self.model_turn = False
@@ -1061,7 +1517,7 @@ class ThinkSmartAssistant:
             reply = information.current_time()
         elif command:
             logging.info("本地指令：%s %s", *command)
-            reply, ok, self.music_started = self.music.run_command(*command)
+            reply, ok, self.music_started = self.music.run_command(*command, check_cancel=self.check_cancel)
             self.turn_effects.append("action" if ok else "failed")
         elif self.offline_mode:
             reply = "离线时请说音量调大、音量调小、暂停播放、继续播放、上一首、下一首或现在几点。"
@@ -1104,17 +1560,32 @@ class ThinkSmartAssistant:
             try:
                 self.speak_stream(iter((reply,)))
                 return
-            except TurnCancelled:
+            except (TurnCancelled, AudioStalled):
                 raise
             except Exception as error:
                 logging.warning("云端播报失败，改用本地播报：%s", error)
-        self.set_phase("speak")
-        self.ui.emit("delta", text=reply)
-        self.raw_wake_allowed = self.wake_phrase not in re.sub(r"\s", "", reply)
-        offline.speak(reply, lambda: self.cancel_requested.is_set() or self.stop_requested,
-                      gain=0.5 if self.night_active() else 1.0)
-        self.heard_reply = "" if self.cancel_requested.is_set() else reply
+        self.speak_local(reply)
+
+    def speak_local(self, reply):
+        self.turn_models.update(speech='local', tts_model='espeak-ng', tts_voice='cmn')
         self.check_cancel()
+        heard = self.heard_reply
+        remaining = reply[len(heard):] if heard and reply.startswith(heard) else reply
+        self.set_phase("speak")
+        self.ui.emit("reply", text=reply)
+        self.raw_wake_allowed = self.wake_phrase not in re.sub(r"\s", "", reply)
+        self.local_speaking = True
+        try:
+            succeeded = not remaining or offline.speak(
+                remaining, lambda: self.cancel_requested.is_set() or self.stop_requested,
+                gain=0.5 if self.night_active() else 1.0)
+            self.check_cancel()
+            if not succeeded:
+                raise RuntimeError("speaker local playback failed")
+            self.heard_reply = reply
+        finally:
+            self.local_speaking = False
+            self.raw_wake_allowed = True
 
     def cloud_available(self):
         try:
@@ -1131,6 +1602,9 @@ class ThinkSmartAssistant:
         expert = bool(self.expert_model and (
             EXPERT_REQUEST.search(user_text) or (self.thinking and HARD_TASK_WORDS.search(user_text))
         ))
+        self.turn_models.update(chat_model=self.expert_model if expert else self.chat_model,
+                                chat_provider=self.expert_provider if expert else self.chat_provider,
+                                role='expert' if expert else 'chat')
         # Qwen rejects a forced tool choice while thinking.
         thinking = self.thinking and not weather and bool(THINK_WORDS.search(user_text))
         if expert:
@@ -1138,16 +1612,31 @@ class ThinkSmartAssistant:
         elif thinking:
             logging.info("本轮开启思考")
 
-        def fragments():
+        model_failed = False
+
+        def model_events():
+            nonlocal model_failed
             force_tool = "get_weather" if weather else None
-            for event in self.brain.chat(user_text, self.chat_context(), thinking, search, force_tool, self.check_cancel, expert=expert):
+            try:
+                yield from self.brain.chat(user_text, self.chat_context(), thinking, search, force_tool, self.check_cancel, expert=expert)
+            except Exception:
+                model_failed = True
+                raise
+
+        def fragments():
+            nonlocal model_failed
+            for event in model_events():
                 if event[0] == "delta":
                     spoken.append(event[1])
                     yield event[1]
                     continue
                 _, call, name, args = event
-                message, ok, final = self.run_tool(name, args, bool("".join(spoken).strip()))
-                self.brain.tool_result(call, message, ok, final)
+                try:
+                    message, ok, final = self.run_tool(name, args, bool("".join(spoken).strip()))
+                    self.brain.tool_result(call, message, ok, final)
+                except Exception:
+                    model_failed = True
+                    raise
                 if final and message:
                     spoken.append(message)
                     yield message
@@ -1157,7 +1646,18 @@ class ThinkSmartAssistant:
         try:
             first = next(stream, None)
             if first is not None:
-                reply = self.speak_stream(chain((first,), stream))
+                try:
+                    reply = self.speak_stream(chain((first,), stream))
+                except (TurnCancelled, AudioStalled):
+                    raise
+                except Exception:
+                    if model_failed:
+                        raise
+                    logging.warning("流式播报失败，完成当前回答后改用本地播报")
+                    for _ in stream:
+                        self.check_cancel()
+                    self.speak_local("".join(spoken).strip())
+                    reply = self.heard_reply
         finally:
             stream.close()
             self.brain.heard(self.heard_reply, interrupted=self.cancel_requested.is_set() or not reply)
@@ -1172,6 +1672,9 @@ class ThinkSmartAssistant:
             and not self.stop_requested
             and self.mic_enabled.is_set()
         ):
+            self.begin_turn()
+            self.wake_started = time.monotonic()
+            self.turn_timing = {"wake_at": time.time(), "source": "followup"}
             self.set_phase("listen")
             self.open_capture()
             text = self.transcribe_live(self.next_followup)
@@ -1183,6 +1686,7 @@ class ThinkSmartAssistant:
 
     def run(self):
         self.start_control()
+        threading.Thread(target=self.audio_watchdog, name="audio-watchdog", daemon=True).start()
         self.alarms.start()
         try:
             self.brain.start()
@@ -1191,6 +1695,8 @@ class ThinkSmartAssistant:
         self.announce()
         while not self.stop_requested:
             try:
+                if self.recovery_requested.is_set() and not self.alarms.ringing:
+                    self.recover_audio()
                 self.cancel_requested.clear()
                 if self.barge_in_requested.is_set():
                     self.set_phase("wake")
@@ -1204,6 +1710,7 @@ class ThinkSmartAssistant:
                     if not self.wait_for_wake():
                         break
                 self.duck()
+                self.begin_turn()
                 # Keep the wake stream running through the tone and network
                 # check, so an immediate follow-on command is still captured.
                 self.play_wake_tone()
@@ -1240,6 +1747,9 @@ class ThinkSmartAssistant:
             except TurnCancelled:
                 logging.info("本轮对话已取消")
                 self.set_cloud("ready")
+            except AudioStalled:
+                logging.exception("音频调用无法恢复，退出并由systemd重启")
+                os._exit(1)
             except Exception as error:
                 if classify_error(error) == "mic" or self.capture_thread is None or not self.capture_thread.is_alive():
                     self.close_capture()

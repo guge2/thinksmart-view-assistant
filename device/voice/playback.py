@@ -2,7 +2,13 @@
 import array
 import ctypes as C
 import queue
+import subprocess
 import threading
+import time
+
+
+class AudioStalled(RuntimeError):
+    pass
 
 
 class SampleSpec(C.Structure):
@@ -18,7 +24,8 @@ class PCMPlayer:
         self.rate = rate
         self.gain = gain
         self.played_seconds = 0.0
-        self.frames = queue.Queue()
+        self.frames = queue.Queue(maxsize=50)
+        self.io_started = None
         self.stopped = threading.Event()
         self.done = threading.Event()
         self.error = None
@@ -26,23 +33,57 @@ class PCMPlayer:
         self.thread.start()
 
     def write(self, pcm):
-        self.frames.put(pcm)
+        step = self.rate * 2 // 25
+        for offset in range(0, len(pcm), step):
+            self._put(pcm[offset:offset + step])
+
+    def stalled(self):
+        started = self.io_started
+        return started is not None and time.monotonic() - started > 10
+
+    def _put(self, pcm):
+        while not self.stopped.is_set():
+            if self.error:
+                raise self.error
+            if self.stalled():
+                raise AudioStalled("speaker operation stalled")
+            try:
+                self.frames.put(pcm, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+        raise RuntimeError("speaker playback closed")
 
     def finish(self, check_cancel):
-        self.frames.put(None)
+        self._put(None)
         while not self.done.wait(0.04):
             check_cancel()
+            if self.stalled():
+                raise AudioStalled("speaker operation stalled")
         check_cancel()
         if self.error:
             raise self.error
 
     def close(self):
         self.stopped.set()
-        self.thread.join()
+        self.thread.join(timeout=2)
+        if self.thread.is_alive():
+            raise AudioStalled("speaker shutdown stalled")
+
+    def _call(self, function, *args):
+        self.io_started = time.monotonic()
+        try:
+            return function(*args)
+        finally:
+            self.io_started = None
 
     def _run(self):
         stream = None
         try:
+            subprocess.run(
+                ["/usr/bin/systemctl", "--user", "start", "pipewire-pulse.socket", "pipewire-pulse.service"],
+                check=True, capture_output=True, timeout=8,
+            )
             lib = C.CDLL("libpulse-simple.so.0")
             lib.pa_simple_new.restype = C.c_void_p
             lib.pa_simple_new.argtypes = [C.c_char_p, C.c_char_p, C.c_int, C.c_char_p, C.c_char_p,
@@ -55,14 +96,14 @@ class PCMPlayer:
             lib.pa_simple_free.argtypes = [C.c_void_p]
             spec = SampleSpec(3, self.rate, 1)  # PA_SAMPLE_S16LE
             attrs = BufferAttr(0xffffffff, self.rate * 2 // 5, 0xffffffff, 0xffffffff, 0xffffffff)
-            stream = lib.pa_simple_new(None, b"ThinkSmart Assistant", 1, None, b"Assistant",
+            stream = self._call(lib.pa_simple_new, None, b"ThinkSmart Assistant", 1, None, b"Assistant",
                                        C.byref(spec), None, C.byref(attrs), None)
             if not stream:
                 raise RuntimeError("speaker stream could not open")
             written = 0
 
             def position():
-                latency = lib.pa_simple_get_latency(stream, None)
+                latency = self._call(lib.pa_simple_get_latency, stream, None)
                 if latency != 0xffffffffffffffff:
                     self.played_seconds = max(self.played_seconds, written / (self.rate * 2) - latency / 1e6)
 
@@ -76,7 +117,7 @@ class PCMPlayer:
                     if not self.stopped.is_set():
                         # The hardware latency can retain a nonzero floor after
                         # the last sample. Drain is the server's completion signal.
-                        if lib.pa_simple_drain(stream, None) < 0:
+                        if self._call(lib.pa_simple_drain, stream, None) < 0:
                             raise RuntimeError("speaker drain failed")
                         self.played_seconds = written / (self.rate * 2)
                     break
@@ -88,7 +129,7 @@ class PCMPlayer:
                     if self.stopped.is_set():
                         break
                     block = pcm[offset:offset + step]
-                    if lib.pa_simple_write(stream, block, len(block), None) < 0:
+                    if self._call(lib.pa_simple_write, stream, block, len(block), None) < 0:
                         raise RuntimeError("speaker write failed")
                     written += len(block)
                     position()
@@ -97,8 +138,8 @@ class PCMPlayer:
             self.error = error
         finally:
             if stream:
-                lib.pa_simple_flush(stream, None)
-                lib.pa_simple_free(stream)
+                self._call(lib.pa_simple_flush, stream, None)
+                self._call(lib.pa_simple_free, stream)
             self.done.set()
 
 

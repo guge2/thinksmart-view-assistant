@@ -11,7 +11,6 @@ table.insert(alsa_monitor.rules, {
     ["api.alsa.use-ucm"] = true,
     ["api.acp.auto-profile"] = true,
     ["api.acp.auto-port"] = true,
-    ["api.alsa.disable-mmap"] = true,
   },
 })
 
@@ -27,6 +26,8 @@ table.insert(alsa_monitor.rules, {
     ["audio.format"] = "S16LE",
     ["audio.rate"] = 48000,
     ["audio.channels"] = 2,
+    -- This is a PCM-node property; setting it on the card does not disable mmap.
+    ["api.alsa.disable-mmap"] = true,
     -- Playback and capture share the ADSP clock; distinct clock names make
     -- PipeWire rate-match the speaker, and that jitter defeats echo cancellation.
     ["clock.name"] = "api.alsa.cd18781y",

@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 
 MUSIC_ROOT = "/data/thinksmart/music"
@@ -25,6 +25,12 @@ MUSIC_ROLE = "Music"
 # Audio pw-cat has taken from the pipe but not yet played: the PipeWire quantum
 # plus the speaker's 4096-frame ALSA headroom at 48 kHz, with some margin.
 RESUME_REWIND = 0.15
+
+
+class CommandCancelled(Exception):
+    pass
+
+
 SINK = "@DEFAULT_AUDIO_SINK@"
 QQ_STREAM = "https://isure.stream.qqmusic.qq.com/"
 BROWSER_UA = (
@@ -954,6 +960,9 @@ class MusicService:
         self.lyric_key = None
         self.lyric = None
         self.held = False
+        self.request_lock = threading.RLock()
+        self.request_serial = 0
+        self.requests = ThreadPoolExecutor(max_workers=2, thread_name_prefix="music-request")
         self.qq = QQMusic(self.on_login)
         self.sources = [self.qq, Netease()]
         self.player = Player(self.resolve, self.extend, self.on_player, duck_level, self.load_mode())
@@ -1105,36 +1114,68 @@ class MusicService:
     def extend(self, last):
         played = {track_key(track) for track in self.player.queue}
         return [track for track in self.recommendations() if track_key(track) not in played]
-    def play_query(self, query):
+    def cancel_pending(self):
+        with self.request_lock:
+            self.request_serial += 1
+
+    def play_query(self, query, check_cancel=None, *, serial=None):
+        with self.request_lock:
+            if serial is None:
+                self.request_serial += 1
+                serial = self.request_serial
+
+        def check():
+            if check_cancel:
+                check_cancel()
+            if serial != self.request_serial:
+                raise CommandCancelled()
+
+        def fetch(function, *args):
+            check()
+            future = self.requests.submit(function, *args)
+            try:
+                while True:
+                    check()
+                    try:
+                        value = future.result(timeout=0.1)
+                        check()
+                        return value
+                    except FutureTimeout:
+                        if future.done():
+                            raise
+            finally:
+                future.cancel()
+
         query = (query or "").strip()
         if query == "我喜欢":
             try:
-                tracks = self.first_found("favorites")
+                tracks = fetch(self.first_found, "favorites")
             except RuntimeError:
                 tracks = []
             if not tracks:
                 return ("需要先在设置里登录QQ音乐，才能播放你的收藏" if not self.qq.logged_in()
                         else "没有获取到你收藏的歌曲"), False
         elif not query:
-            tracks = self.recommendations()
+            tracks = fetch(self.recommendations)
         else:
             try:
-                tracks = self.search(query)
+                tracks = fetch(self.search, query)
                 base = re.sub(r"的(?:歌曲?|音乐)$", "", query)
                 if base and base != query and not (tracks and plain(tracks[0]["title"]) == plain(query)):
-                    tracks = self.search(base)
+                    tracks = fetch(self.search, base)
+            except CommandCancelled:
+                raise
             except Exception as error:
                 logging.warning("歌曲搜索失败：%s", error)
                 return "音乐服务暂时连接不上，请稍后再试", False
         if not tracks:
             return "没有找到相关的歌曲", False
-        self.held = False
         candidates = list(range(len(tracks)))
         if query in ("", "我喜欢") and self.player.mode == "shuffle":
             random.shuffle(candidates)
         unplayable = set()
         for index in candidates[:5]:
-            if self.resolve(tracks[index])[0]:
+            if fetch(self.resolve, tracks[index])[0]:
                 break
             unplayable.add(index)
         else:
@@ -1142,24 +1183,28 @@ class MusicService:
                 return "这首歌需要会员权限，请先在设置里登录QQ音乐", False
             return "这首歌暂时没有播放权限", False
         track = tracks[index]
-        self.player.play([t for i, t in enumerate(tracks) if i not in unplayable], track)
+        with self.request_lock:
+            check()
+            self.player.play([t for i, t in enumerate(tracks) if i not in unplayable], track)
+            self.held = False
         artist = track["artist"].split("/")[0]
         return (f"好的，播放{artist}的{track['title']}" if artist else f"好的，播放{track['title']}"), True
 
-    def change_mode(self, mode):
+    def change_mode(self, mode, check_cancel=None):
         """Returns (reply, playback_started); also starts playback when idle unless repeating one."""
         self.set_mode(mode)
         reply = f"已切换为{MODE_NAMES[mode]}"
         if self.player.active() or mode == "repeat_one":
             return reply, self.player.active()
-        started_reply, started = self.play_query("")
+        started_reply, started = self.play_query("", check_cancel)
         if not started:
             return reply, False
         return f"{reply}，{started_reply.removeprefix('好的，')}", True
 
-    def control(self, action):
+    def control(self, action, check_cancel=None):
+        self.cancel_pending()
         if action in MODES:
-            return self.change_mode(action)
+            return self.change_mode(action, check_cancel)
         player = self.player
         held, self.held = self.held, False
         if action == "pause":
@@ -1167,7 +1212,7 @@ class MusicService:
         if action == "resume":
             if player.resume():
                 return "继续播放", True
-            return self.play_query("")
+            return self.play_query("", check_cancel)
         if action == "next":
             return ("好的，下一首" if player.skip(1) else "现在没有在播放音乐"), player.active()
         if action == "previous":
@@ -1185,18 +1230,18 @@ class MusicService:
             return "音量调节失败"
         return f"音量已调到百分之{value}" if value is not None else "音量已调整"
 
-    def run_command(self, name, argument):
+    def run_command(self, name, argument, check_cancel=None):
         """Returns (reply, ok, playback_started)."""
         if name == "play":
-            reply, started = self.play_query(argument)
+            reply, started = self.play_query(argument, check_cancel)
             return reply, started, started
         if name in ("louder", "quieter"):
             reply = self.volume(change=10 if name == "louder" else -10)
             return reply, reply != "音量调节失败", False
-        reply, started = self.control(name)
+        reply, started = self.control(name, check_cancel)
         return reply, not reply.startswith(("现在没有", "不支持")), started
 
-    def call_tool(self, name, arguments):
+    def call_tool(self, name, arguments, check_cancel=None):
         """Returns (reply, ok, playback_started)."""
         try:
             args = json.loads(arguments or "{}")
@@ -1205,11 +1250,11 @@ class MusicService:
         if not isinstance(args, dict):
             args = {}
         if name == "play_music":
-            reply, started = self.play_query(clean_query(_PUNCT.sub("", str(args.get("query") or ""))))
+            reply, started = self.play_query(clean_query(_PUNCT.sub("", str(args.get("query") or ""))), check_cancel)
             return reply, started, started
         if name == "control_music":
             action = str(args.get("action") or "")
-            reply, started = self.control(action)
+            reply, started = self.control(action, check_cancel)
             return reply, not reply.startswith(("现在没有", "不支持")), started
         if name == "set_volume":
             try:
@@ -1222,6 +1267,7 @@ class MusicService:
         return "不支持这个操作", False, False
 
     def ui_command(self, action):
+        self.cancel_pending()
         if action == "mode":
             self.set_mode(MODES[(MODES.index(self.player.mode) + 1) % len(MODES)])
             return
@@ -1231,7 +1277,15 @@ class MusicService:
                 self.player.pause()
                 return
             if not self.player.resume():
-                threading.Thread(target=self.play_query, args=("",), name="music-start", daemon=True).start()
+                serial = self.request_serial
+                def start():
+                    try:
+                        self.play_query("", serial=serial)
+                    except CommandCancelled:
+                        pass
+                    except Exception:
+                        logging.exception("音乐启动失败")
+                threading.Thread(target=start, name="music-start", daemon=True).start()
         elif action == "next":
             self.player.skip(1)
         elif action == "prev":
@@ -1249,4 +1303,6 @@ class MusicService:
             self.qq.logout()
 
     def shutdown(self):
+        self.cancel_pending()
+        self.requests.shutdown(wait=False, cancel_futures=True)
         self.player.shutdown()

@@ -27,7 +27,6 @@ from system import (  # noqa: E402
     credentials_configured,
     read_wake_phrase,
     request_wake_word,
-    voice_running,
 )
 from touch import Touchscreen  # noqa: E402
 
@@ -60,6 +59,7 @@ ERRORS = {
     "auth": "云端鉴权失败，请检查 API 密钥",
     "config": "语音助手尚未正确配置",
     "mic": "麦克风暂时不可用",
+    "speaker": "扬声器暂时不可用，请稍后再试",
     "llm": "模型没有返回内容，请再试一次",
     "service": "云端服务暂时不可用，请稍后再试",
     "nospeech": "没有听清，请再说一次",
@@ -371,6 +371,8 @@ class App:
         self.orb = Orb()
         self.ime = PinyinInput()
         self.settings = Settings()
+        self.applied_settings = dict(self.settings.data)
+        self.next_settings_check = 0.0
         self.status = SystemStatus(self.settings)
         self.link = VoiceLink()
         self.touch = Touchscreen(W, H)
@@ -403,6 +405,7 @@ class App:
         self.alarm_active = False
         self.cloud = "unknown"
         self.mic_on = self.settings["mic"]
+        self.hardware_mic = None
         self.wake_phrase = read_wake_phrase()
         self.wake_pending = None
         self.music = {"s": "stopped"}
@@ -416,7 +419,12 @@ class App:
         self.lyric_times = []
         self.lyric_index = -1
         self.next_lyric = 0.0
-        self.voice_online = voice_running()
+        self.voice_online = False
+        self.voice_seen = 0.0
+        self.voice_healthy = False
+        self.ping_seq = 0
+        self.voice_generation = None
+        self.voice_event_seq = -1
         self.configured = credentials_configured()
         self.level = 0.0
         self.level_target = 0.0
@@ -857,6 +865,8 @@ class App:
         if not self.voice_online:
             return "语音服务未运行，正在等待…", WARN
         if not self.mic_on:
+            if self.hardware_mic is False:
+                return "机身麦克风已关闭，请拨开侧面开关", WARN
             return "麦克风已关闭，轻触左下角开启", WARN
         return f"说“{self.wake_phrase}”，或轻触圆环", FAINT
 
@@ -1419,7 +1429,9 @@ class App:
     def toggle_mic(self, *_args):
         enabled = not self.settings["mic"]
         self.settings.update(mic=enabled)
-        self.mic_on = enabled
+        self.mic_on = enabled and self.hardware_mic is not False
+        if enabled and self.hardware_mic is False:
+            self.set_notice("请先拨开机身侧面的麦克风开关", WARN, 6)
         self.link.send("mic", on=int(enabled))
         self.dirty |= {"mic", "microw", "hint"}
 
@@ -1611,6 +1623,54 @@ class App:
 
     def on_voice(self, message, now):
         event = message["e"]
+        generation, sequence = message.get("generation"), message.get("event_seq")
+        if isinstance(generation, str) and isinstance(sequence, int):
+            if generation != self.voice_generation:
+                self.voice_generation, self.voice_event_seq = generation, -1
+                self.partial = self.user_text = self.answer = ""
+                self.alarm_active = False
+                self.phase, self.conv_until, self.error_code = "idle", 0.0, None
+                if event != "snapshot":
+                    self.link.send("hello")
+            if sequence <= self.voice_event_seq:
+                return
+            self.voice_event_seq = sequence
+        if event == "snapshot":
+            self.conv_until = 0.0
+            phase = message.get("phase", "idle")
+            self.phase = phase if phase in ACTIVE else "idle"
+            self.partial = str(message.get("partial") or "")[-2000:]
+            self.user_text = str(message.get("user_text") or "")[-2000:]
+            self.answer = str(message.get("answer") or "")[-4000:]
+            self.alarm_active = bool(message.get("alarm_active"))
+            if self.alarm_active and self.phase not in ACTIVE:
+                self.answer = str(message.get("alarm_text") or "")
+            self.mic_on = bool(message.get("mic"))
+            self.hardware_mic = message.get("hardware_mic")
+            if message.get("wake"):
+                self.wake_phrase = message["wake"][:16]
+            if message.get("cloud") in CLOUD_STATES:
+                self.cloud = message["cloud"]
+            if isinstance(message.get("music"), dict):
+                self.music = message["music"]
+                self.music_at = now
+            for key, kind in (("lyric", "lyric"), ("account", "mlogin"), ("login", "mlogin")):
+                if isinstance(message.get(key), dict):
+                    self.on_voice(dict(message[key], e=kind), now)
+            if message.get("error_code") in ERRORS and message.get("error_until", 0) > now:
+                self.show_error(message["error_code"], now, message["error_until"] - now)
+            if self.phase in ACTIVE or self.alarm_active:
+                self.activity(now)
+                self.conv_until = now + 120 if self.alarm_active else now
+            self.full_redraw = True
+            return
+        if event == "pong":
+            seq = message.get("seq")
+            if not isinstance(seq, int) or not self.ping_seq - 2 <= seq <= self.ping_seq:
+                return
+            self.voice_seen = now
+            self.voice_healthy = bool(message.get("healthy"))
+            return
         if event == "level":
             try:
                 value = float(message.get("v", 0))
@@ -1618,17 +1678,15 @@ class App:
                 value = 0.0
             self.level_target = max(self.level_target, min(1.0, max(0.0, value / 100) ** 0.5 * 1.3))
             return
-        if not self.voice_online:
-            self.voice_online = True
-            self.dirty |= {"status", "hint", "info"}
         if event == "ready":
             wake = message.get("wake")
             if isinstance(wake, str) and wake:
                 self.wake_phrase = wake[:16]
             wanted = self.settings["mic"]
-            if bool(message.get("mic", 1)) != wanted:
+            if bool(message.get("requested_mic", message.get("mic", 1))) != wanted:
                 self.link.send("mic", on=int(wanted))
-            self.mic_on = wanted
+            self.hardware_mic = message.get("hardware_mic")
+            self.mic_on = bool(message.get("mic", 1))
             self.send_prefs()
             phase = message.get("phase")
             if phase in ACTIVE:
@@ -1643,6 +1701,7 @@ class App:
             return
         if event == "mic":
             self.mic_on = bool(message.get("on"))
+            self.hardware_mic = message.get("hardware_mic")
             self.dirty |= {"mic", "microw", "hint"}
             return
         if event == "music":
@@ -1694,6 +1753,9 @@ class App:
             self.user_text = text_field(message)
             self.partial = self.answer = ""
             self.dirty |= {"user", "answer"}
+        elif event == "reply":
+            self.answer = text_field(message)
+            self.dirty.add("answer")
         elif event == "delta":
             if self.phase != "answer":
                 self.set_phase("answer", now)
@@ -1791,13 +1853,29 @@ class App:
             widget.tap(x, y)
 
     def tick(self, now):
+        if now >= self.next_settings_check:
+            self.next_settings_check = now + 2
+            saved = Settings().data
+            if saved != self.applied_settings:
+                previous = self.applied_settings
+                self.settings.data = saved
+                self.applied_settings = dict(saved)
+                self.brightness = saved["brightness"] or self.brightness
+                if saved["location"] != previous["location"]:
+                    self.status.refresh_weather()
+                if saved["mic"] != previous["mic"]:
+                    self.link.send("mic", on=int(saved["mic"]))
+                self.send_prefs()
+                self.full_redraw = True
         clock = time.strftime("%H:%M")
         if clock != self.clock_key:
             self.clock_key = clock
             self.dirty |= {"clock", "date"}
         if now >= self.next_voice_check:
             self.next_voice_check = now + 2
-            online = voice_running()
+            self.ping_seq += 1
+            self.link.send("ping", seq=self.ping_seq)
+            online = self.voice_healthy and now - self.voice_seen < 7
             if online != self.voice_online:
                 self.voice_online = online
                 if online:

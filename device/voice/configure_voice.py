@@ -67,9 +67,13 @@ def main():
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(
-        ["systemctl", "enable", "--now", "thinksmart-voice.service"],
+        ["systemctl", "enable", "thinksmart-voice.service"],
         check=True,
     )
+    subprocess.run(["systemctl", "restart", "thinksmart-voice.service"], check=True)
+    subprocess.run(["timeout", "20", "sh", "-c",
+                    "until [ -S /run/thinksmart-voice/control.sock ]; do sleep 1; done"], check=True)
+    subprocess.run(["systemctl", "is-active", "--quiet", "thinksmart-voice.service"], check=True)
     print(f"阿里云百炼已配置：{region} / {workspace_id}")
 
 
