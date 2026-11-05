@@ -1,12 +1,15 @@
 import asyncio
 import base64
 import ctypes
+import fcntl
 import json
 import logging
 import os
 import random
 import re
+import struct
 import subprocess
+import termios
 import threading
 import time
 import urllib.parse
@@ -19,6 +22,9 @@ CREDENTIAL_FILE = f"{MUSIC_ROOT}/qq-credential.json"
 DEVICE_FILE = f"{MUSIC_ROOT}/qq-device.json"
 SETTINGS_FILE = f"{MUSIC_ROOT}/settings.json"
 MUSIC_ROLE = "Music"
+# Audio pw-cat has taken from the pipe but not yet played: the PipeWire quantum
+# plus the speaker's 4096-frame ALSA headroom at 48 kHz, with some margin.
+RESUME_REWIND = 0.15
 SINK = "@DEFAULT_AUDIO_SINK@"
 QQ_STREAM = "https://isure.stream.qqmusic.qq.com/"
 BROWSER_UA = (
@@ -294,6 +300,7 @@ class Player:
         self.state = "stopped"
         self.paused = False
         self.output = None
+        self.history = bytearray()
         self.position = 0.0
         threading.Thread(target=self.run, name="music-player", daemon=True).start()
 
@@ -492,10 +499,13 @@ class Player:
         gain = None
         broken = 0
         written = False
+        pending = b""
         try:
             while alive():
                 if self.paused:
-                    self.close_output()
+                    replay = self.pause_output(rate, channels)
+                    frames -= len(replay) // (2 * channels)
+                    pending = replay + pending
                     with self.lock:
                         while self.paused and alive():
                             self.lock.wait()
@@ -504,13 +514,19 @@ class Player:
                 if wanted != gain:
                     decoder.volume(wanted)
                     gain = wanted
-                code, pcm = decoder.read()
+                if pending:
+                    code, pcm, pending = Mpg123.OK, pending, b""
+                else:
+                    code, pcm = decoder.read()
                 if code == Mpg123.NEW_FORMAT:
                     rate, channels = decoder.format()
                     self.close_output()
                     continue
                 if pcm:
                     if not self.write(pcm, rate, channels, generation):
+                        pending = pcm
+                        if self.paused:
+                            continue
                         broken += 1
                         if broken >= 3 and not written:
                             return "failed"
@@ -568,12 +584,34 @@ class Player:
                     stderr=subprocess.DEVNULL,
                     bufsize=0,
                 )
+                self.history.clear()
         try:
             output.stdin.write(pcm)
-            return True
         except (OSError, ValueError):
-            self.close_output()
+            # A pause kills pw-cat mid-write; pause_output still needs its pipe.
+            if not self.paused:
+                self.close_output()
             return False
+        self.history += pcm
+        del self.history[:-rate * channels * 2 * 2]
+        return True
+
+    def pause_output(self, rate, channels):
+        """Stops pw-cat and returns the written PCM it has not played yet."""
+        with self.lock:
+            output = self.output
+        if output is None:
+            return b""
+        try:
+            unread = struct.unpack("i", fcntl.ioctl(output.stdin.fileno(), termios.FIONREAD, b"\0" * 4))[0]
+        except (OSError, ValueError):
+            unread = 0
+        self.close_output()
+        frame = 2 * channels
+        keep = min(len(self.history), unread + int(RESUME_REWIND * rate) * frame) // frame * frame
+        replay = bytes(self.history[len(self.history) - keep:])
+        self.history.clear()
+        return replay
 
     def close_output(self):
         with self.lock:

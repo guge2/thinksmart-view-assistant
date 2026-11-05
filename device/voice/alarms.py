@@ -38,13 +38,15 @@ TOOLS = [{
 }]
 
 
-def _describe(item):
+def _describe(item, with_id=True):
+    """with_id only for listings the model reads; create/cancel results are spoken verbatim."""
     when = dt.datetime.fromtimestamp(item["due"]).strftime("%m月%d日 %H:%M")
     label = f"，{item['label']}" if item.get("label") else ""
     repeat = ""
     if item.get("weekdays"):
         repeat = "，每周" + "、".join("一二三四五六日"[day] for day in item["weekdays"])
-    return f"{NAMES[item['kind']]} {item['id']}，{when}{repeat}{label}"
+    ident = f"（编号{item['id']}）" if with_id else ""
+    return f"{NAMES[item['kind']]}{ident}，{when}{repeat}{label}"
 
 
 def _next_weekday(due, weekdays, after):
@@ -171,7 +173,7 @@ class AlarmService:
             self.monotonic_due.pop(item["id"], None)
             if self.ringing_id == item["id"]:
                 self.silence.set()
-            return f"已取消{_describe(item)}"
+            return f"已取消{_describe(item, with_id=False)}"
         if action != "create":
             raise ValueError("不支持这个操作")
         if len(self.items) >= MAX_ITEMS:
@@ -222,7 +224,7 @@ class AlarmService:
             raise
         if kind == "timer":
             self.monotonic_due[ident] = time.monotonic() + seconds
-        result = f"已设置{_describe(item)}"
+        result = f"已设置{_describe(item, with_id=False)}"
         if kind != "timer":
             try:
                 status = subprocess.run(
@@ -293,13 +295,19 @@ class AlarmService:
         command = ["/usr/bin/pw-cat", "--playback", "--media-role", "Notification",
                    "--rate", str(rate), "--channels", "1", "--format", "s16", "--latency", "100ms", "-"]
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        tone = samples.tobytes()
+        step = rate * 2 // 10
+        chunks = [tone[offset:offset + step] for offset in range(0, len(tone), step)]
         try:
-            for _ in range(100):
+            for chunk in chunks * 100:
                 if self.silence.is_set() or self.stopped.is_set():
                     break
-                process.stdin.write(samples.tobytes())
+                process.stdin.write(chunk)
                 process.stdin.flush()
         finally:
+            # The pipe holds over a second of tone; drain it only when not dismissed.
+            if (self.silence.is_set() or self.stopped.is_set()) and process.poll() is None:
+                process.terminate()
             try:
                 process.stdin.close()
             except (OSError, BrokenPipeError):

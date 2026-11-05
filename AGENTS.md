@@ -1,12 +1,7 @@
 # Project conventions
 
-- 本项目内与用户交流和变更说明默认使用简体中文；代码标识符、型号及原文名称保持准确。
-- Treat this project folder (`D:\thinksmart`) as the working root. Run project commands from here and prefer project-relative paths.
-- Keep downloaded third-party tools in their own `tools/<tool-name>/` folders. scrcpy and its bundled ADB belong in `tools/scrcpy/`.
-- Keep diagnostics, logs, downloads awaiting inspection, and temporary files in `work/`. Keep final deliverables in `outputs/` when needed.
-- Keep tool binaries, downloaded archives, runtime data, and machine-specific shortcuts out of Git. Update `.gitignore` when adding a new tool folder.
-- Track project source, launch scripts, documentation, and reusable configuration. Never commit credentials or device-private diagnostics.
-- Use `Start-ThinkSmart.cmd` to open the USB control window, and `tools/scrcpy/adb.exe` for device diagnostics.
-- 杜绝测试代码
-- 只做最少必要文档说明，最好是不留文档
-- 设备连接现状（用户确认，2026-10-31）：ThinkSmart 通电后会自动连接 Wi-Fi，无需插 USB 线；电脑可通过 `192.168.0.107` 使用 SSH 登录。
+- 与用户交流和变更说明使用简体中文；代码标识符、型号及原文名称保持原样。
+- 设备通电后自动连 Wi-Fi：`ssh thinksmart`（`192.168.0.107`）。部署即在设备上运行 `device/*/install.sh`，或把改动的文件装到对应安装位置后重启服务。
+- 第三方工具放 `tools/<name>/`，诊断、日志和临时文件放 `work/`，构建产物放 `outputs/`；这些都不进 Git，新增工具目录时同步更新 `.gitignore`。
+- 不提交凭据、密钥和设备私有诊断数据。
+- 杜绝测试代码；文档只写最少必要内容，能不写就不写。

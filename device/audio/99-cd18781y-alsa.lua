@@ -43,6 +43,10 @@ table.insert(alsa_monitor.rules, {
   },
   apply_properties = {
     ["priority.driver"] = 2000,
+    -- Wake on period IRQs. With timer scheduling the whole-period pointer made
+    -- the clock estimate run 6.5% fast; the capture follower then resynced
+    -- about twice a second, inserting silence or dropping 1024 frames.
+    ["api.alsa.disable-tsched"] = true,
     -- ADSP reports position in whole periods. Reserve explicit pointer-jitter
     -- headroom without PipeWire halving the eight-period playback buffer.
     -- At 2048 the fill dipped to one period, and a stream joining or leaving
