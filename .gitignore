@@ -41,3 +41,10 @@ qq-device*.json
 /tools/webrtc-audio-processing/
 /tools/pipewire/
 /outputs/audio/
+
+# Vendor kernel module and amplifier firmware (not redistributable)
+/device/audio/*.ko
+/device/audio/*.bin
+
+# macOS metadata
+.DS_Store
