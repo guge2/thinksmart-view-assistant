@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import socket
 import struct
 import subprocess
 import termios
@@ -70,14 +71,20 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "control_music",
-            "description": "控制当前的音乐播放。",
+            "description": "控制当前的音乐播放，或设置伴睡定时停播。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["pause", "resume", "next", "previous", "stop", *MODES],
-                        "description": "暂停、继续、下一首、上一首、停止、切换为随机播放、顺序播放、单曲循环",
+                        "enum": ["pause", "resume", "next", "previous", "stop", "sleep", "cancel_sleep", *MODES],
+                        "description": "暂停、继续、下一首、上一首、停止、伴睡定时停播(sleep)、取消定时停播(cancel_sleep)、切换为随机播放、顺序播放、单曲循环",
+                    },
+                    "minutes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 480,
+                        "description": "action为sleep时的定时分钟数，如30表示30分钟后停止播放",
                     },
                 },
                 "required": ["action"],
@@ -88,12 +95,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_volume",
-            "description": "调节设备的播放音量。",
+            "description": "调节设备的播放音量或静音状态。用户说声音太小、太大、太吵或指定音量百分比时直接调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "level": {"type": "integer", "description": "目标音量，0 到 100"},
-                    "change": {"type": "integer", "description": "相对调整量，如 10 或 -10"},
+                    "level": {"type": "integer", "description": "目标音量百分比（0 到 100）；使用相对调整或仅切换静音时传 -1"},
+                    "change": {"type": "integer", "description": "相对音量增减（如 10 或 -10）；指定了目标音量 level 时传 0"},
+                    "mute": {
+                        "type": "string",
+                        "enum": ["", "mute", "unmute"],
+                        "description": "静音传 mute，取消静音传 unmute；正常调节音量大小时传空字符串",
+                    },
                 },
             },
         },
@@ -103,19 +115,63 @@ TOOLS = [
 _PUNCT = re.compile(r"[\s，。！？、；：,.!?;:~～…“”\"'‘’]+")
 _POLITE = re.compile(r"^(?:请你?|麻烦你?|帮我|给我|你|再)+")
 _PLAY = re.compile(r"^(?:播放|我想听听?|我要听|想听|来一首|来首|放一首|放首|唱一首|唱首|搜索)(.*)$")
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_VOL_SET = re.compile(
+    r"^(?:把)?(?:设备)?(?:播放)?(?:声音|音量)(?:大小)?(?:调整?到|调整?至|调整?为|调到|调至|调为|设为|设置?为?|设置?到|调成|开到)?(?:百分之)?"
+    r"(\d{1,3}|一百|[一二两三四五六七八九]?十[一二三四五六七八九]?|[零一二两三四五六七八九])(?:%|格)?$"
+)
+_SLEEP_TIMER = re.compile(
+    r"^(?:定时)?(\d+|[一二两三四五六七八九十半]+)(?:个)?(分钟?|小时|钟头)后?"
+    r"(?:停止播放|关掉?音乐|关闭音乐|停播|停止音乐|别放了)$"
+)
 _COMMANDS = (
     ("stop", re.compile(r"^(?:停止|停止播放|停止音乐|关闭音乐|关掉音乐|关闭播放|别放了|不听了|不要放了)$")),
     ("pause", re.compile(r"^(?:暂停|暂停播放|暂停音乐|暂停一下|停一下|先停一下|停)$")),
     ("resume", re.compile(r"^(?:继续|继续播放|继续放|接着放|接着播放|恢复播放|继续音乐)$")),
     ("next", re.compile(r"^(?:下一首|下一曲|下一首歌|换一首|换首歌|换一首歌|切歌|换一个|下首)$")),
     ("previous", re.compile(r"^(?:上一首|上一曲|上一首歌|上首)$")),
-    ("louder", re.compile(r"^(?:把)?(?:声音|音量)(?:调|开)?(?:大|高)(?:一)?[点些]?$|^大声(?:一)?点$|^(?:声音|音量)?再?大(?:一)?点$")),
-    ("quieter", re.compile(r"^(?:把)?(?:声音|音量)(?:调|开)?(?:小|低)(?:一)?[点些]?$|^小声(?:一)?点$|^(?:声音|音量)?再?小(?:一)?点$")),
+    ("louder", re.compile(
+        r"^(?:把)?(?:声音|音量)(?:调|开)?(?:大|高|响)(?:一)?[点些]?$|"
+        r"^大声(?:一)?点$|^大[点些]声$|^(?:声音|音量)?再?大(?:一)?点$|"
+        r"^(?:你说话)?(?:声音|音量)(?:太|好|有点)(?:小|低|轻)了?[哦呀啊呢吧]*$|^太小声了?[哦呀啊呢吧]*$"
+    )),
+    ("quieter", re.compile(
+        r"^(?:把)?(?:声音|音量)(?:调|开)?(?:小|低|轻)(?:一)?[点些]?$|"
+        r"^小声(?:一)?点$|^小[点些]声$|^轻(?:一)?点声$|^(?:声音|音量)?再?小(?:一)?点$|"
+        r"^(?:你说话)?(?:声音|音量)(?:太|好|有点)(?:大|高|响|吵)了?[哦呀啊呢吧]*$|^太大声了?[哦呀啊呢吧]*$|^太吵了?[哦呀啊呢吧]*$"
+    )),
+    ("mute", re.compile(r"^(?:静音|开启静音|把声音关掉|关闭声音)$")),
+    ("unmute", re.compile(r"^(?:取消静音|解除静音|恢复声音|打开声音)$")),
+    ("what_volume", re.compile(r"^(?:现在|当前|目前)?(?:设备)?(?:的)?(?:声音|音量)(?:是)?(?:多少|多大|几格)[呀啊呢吗吧]*$")),
+    ("cancel_sleep", re.compile(r"^(?:取消|关闭)(?:伴睡|定时停播|定时关闭|睡眠定时|音乐定时)$")),
+    ("what_song", re.compile(r"^(?:这首歌?叫什么(?:名字)?|这是什么歌|现在(?:放|播|播放)的是什么歌|当前(?:放|播|播放)的是什么歌|什么歌|谁唱的|这首歌是谁唱的)$")),
     ("shuffle", re.compile(r"^(?:切换到?|切到|改成|换成|改为|设为|开启)?(?:随机播放|乱序播放|随机模式|乱序模式|打乱顺序|随机放歌?|随机听歌?)(?:模式)?$")),
     ("order", re.compile(r"^(?:切换到?|切到|改成|换成|改为|设为|开启)?(?:顺序播放|按顺序播放|顺序模式|列表循环|按顺序放|按顺序听)(?:模式)?$")),
     ("repeat_one", re.compile(r"^(?:切换到?|切到|改成|换成|改为|设为|开启)?(?:单曲循环|单曲重复|(?:循环|重复|一直)(?:播放|放)?这首歌?)(?:模式)?$")),
 )
-_ANYTIME = ("louder", "quieter", *MODES)
+_ANYTIME = ("louder", "quieter", "mute", "unmute", "what_volume", "cancel_sleep", *MODES)
+
+
+def parse_cn_number(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if text == "半":
+        return 0.5
+    if text == "十":
+        return 10
+    if text in ("一百", "百"):
+        return 100
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = 1 if not left else _CN_DIGITS.get(left)
+        ones = 0 if not right else _CN_DIGITS.get(right)
+        if tens is not None and ones is not None:
+            return tens * 10 + ones
+        return None
+    return _CN_DIGITS.get(text)
 
 
 def plain(text):
@@ -140,6 +196,18 @@ def match_command(text, music_active):
     normalized = _POLITE.sub("", _PUNCT.sub("", text or ""))
     if not normalized or len(normalized) > 30:
         return None
+    vol_match = _VOL_SET.match(normalized)
+    if vol_match:
+        level = parse_cn_number(vol_match.group(1))
+        if level is not None and 0 <= level <= 100:
+            return "volume_set", int(level)
+    sleep_match = _SLEEP_TIMER.match(normalized)
+    if sleep_match and music_active:
+        amount = parse_cn_number(sleep_match.group(1))
+        if amount is not None:
+            minutes = round(amount * (60 if sleep_match.group(2) in ("小时", "钟头") else 1))
+            if 1 <= minutes <= 480:
+                return "sleep_timer", minutes
     played = _PLAY.match(normalized)
     if played:
         return "play", clean_query(played.group(1))
@@ -161,13 +229,32 @@ def write_private(path, data):
     os.replace(temporary, path)
 
 
-def read_volume():
+def read_volume_status():
     result = subprocess.run(
         ["/usr/bin/wpctl", "get-volume", SINK],
         capture_output=True, text=True, timeout=3, check=False,
     )
     match = re.search(r"Volume:\s*([0-9.]+)", result.stdout)
-    return round(float(match.group(1)) * 100) if match else None
+    vol = round(float(match.group(1)) * 100) if match else None
+    return vol, "MUTED" in result.stdout
+
+
+def read_volume():
+    return read_volume_status()[0]
+
+
+def notify_ui_volume():
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(b'{"e":"hw_volume"}', "/run/thinksmart-ui/events.sock")
+    except OSError:
+        pass
+
+
+def set_mute(muted):
+    subprocess.run(["/usr/bin/wpctl", "set-mute", SINK, "1" if muted else "0"],
+                   capture_output=True, timeout=3, check=False)
+    notify_ui_volume()
 
 
 def set_volume(level=None, change=None):
@@ -182,6 +269,7 @@ def set_volume(level=None, change=None):
                    capture_output=True, timeout=3, check=False)
     subprocess.run(["/usr/bin/wpctl", "set-mute", SINK, "0"],
                    capture_output=True, timeout=3, check=False)
+    notify_ui_volume()
     return read_volume()
 
 
@@ -314,6 +402,8 @@ class Player:
         self.generation = 0
         self.state = "stopped"
         self.paused = False
+        self.sleep_until = None
+        self.sleep_mono = None
         self.output = None
         self.history = bytearray()
         self.position = 0.0
@@ -334,8 +424,9 @@ class Player:
             state = self.state
             position = self.position
             mode = self.mode
+            sleep_until = self.sleep_until if self.sleep_until and self.sleep_until > time.time() else None
         if track is None or state == "stopped":
-            return {"s": "stopped", "m": mode}
+            return {"s": "stopped", "m": mode, "sleep": None}
         return {
             "s": state,
             "m": mode,
@@ -345,6 +436,7 @@ class Player:
             "src": track.get("via") or track["src"],
             "pos": round(position, 1),
             "dur": track.get("dur") or 0,
+            "sleep": round(sleep_until, 1) if sleep_until else None,
         }
 
     def changed(self):
@@ -437,12 +529,24 @@ class Player:
 
     def stop(self):
         with self.lock:
+            self.sleep_until = self.sleep_mono = None
             if self.state == "stopped":
                 return False
             self.paused = False
             self.interrupt_locked("stopped")
         self.changed()
         return True
+
+    def set_sleep(self, minutes):
+        with self.lock:
+            if not minutes or minutes <= 0:
+                self.sleep_until = self.sleep_mono = None
+            else:
+                seconds = min(480, max(1, int(minutes))) * 60
+                self.sleep_until = time.time() + seconds
+                self.sleep_mono = time.monotonic() + seconds
+            self.lock.notify_all()
+        self.changed()
 
     def run(self):
         failures = 0
@@ -525,13 +629,26 @@ class Player:
         pending = b""
         try:
             while alive():
+                if self.sleep_mono is not None and time.monotonic() >= self.sleep_mono:
+                    logging.info("伴睡定时已到，停止音乐播放")
+                    self.stop()
+                    return "interrupted"
                 if self.paused:
                     replay = self.pause_output(rate, channels)
                     frames = max(0, frames - len(replay) // (2 * channels))
                     pending = replay + pending
                     with self.lock:
                         while self.paused and alive():
-                            self.lock.wait()
+                            if self.sleep_mono is not None and time.monotonic() >= self.sleep_mono:
+                                logging.info("伴睡定时已到，停止暂停中的音乐")
+                                self.sleep_until = self.sleep_mono = None
+                                self.paused = False
+                                self.interrupt_locked("stopped")
+                                break
+                            self.lock.wait(1.0)
+                    if not alive():
+                        self.changed()
+                        return "interrupted"
                     continue
                 wanted = self.duck_level if self.ducked else 1.0
                 if wanted != gain:
@@ -1100,15 +1217,31 @@ class MusicService:
             self.player.resume()
 
     def describe(self):
+        parts = []
+        account = self.account or {}
+        if account.get("s") == "ok":
+            vip = "（会员有效）" if account.get("vip") else "（普通账号）"
+            parts.append(f"QQ音乐已登录账号“{account.get('nick') or '已登录'}”{vip}。")
+        elif account.get("s") == "expired":
+            parts.append("QQ音乐登录已过期。")
+        else:
+            parts.append("QQ音乐未登录。")
         track = self.player.current()
         state = self.player.state
         if track is None or state == "stopped":
-            return ""
+            parts.append("当前没有播放音乐。")
+            return "".join(parts)
         name = f"{track['artist']}的《{track['title']}》"
         mode = f"播放模式为{MODE_NAMES[self.player.mode]}。"
+        sleep_info = ""
+        if self.player.sleep_until is not None:
+            rem = max(1, math.ceil((self.player.sleep_until - time.monotonic()) / 60))
+            sleep_info = f"已设置伴睡定时，剩余约{rem}分钟停止。"
         if self.held:
-            return f"当前正在播放{name}，对话期间已自动暂停，对话结束后会自动继续。{mode}"
-        return (f"当前音乐已暂停：{name}。" if state == "paused" else f"当前正在播放{name}。") + mode
+            parts.append(f"当前正在播放{name}，对话期间已自动暂停，对话结束后会自动继续。{mode}{sleep_info}")
+        else:
+            parts.append((f"当前音乐已暂停：{name}。" if state == "paused" else f"当前正在播放{name}。") + mode + sleep_info)
+        return "".join(parts)
 
     def resolve(self, track):
         """Falls back to other sources when the track's own source cannot stream it."""
@@ -1246,8 +1379,24 @@ class MusicService:
             return reply, False
         return f"{reply}，{started_reply.removeprefix('好的，')}", True
 
-    def control(self, action, check_cancel=None):
+    def set_sleep_timer(self, minutes):
+        if not minutes or minutes <= 0:
+            if self.player.sleep_until is None:
+                return "当前没有设置伴睡定时", False
+            self.player.set_sleep(0)
+            return "已取消伴睡定时", True
+        if not self.player.active() and not self.held:
+            return "现在没有在播放音乐", False
+        minutes = min(480, max(1, int(minutes)))
+        self.player.set_sleep(minutes)
+        return f"好的，将在{minutes}分钟后停止播放", True
+
+    def control(self, action, check_cancel=None, minutes=None):
         self.cancel_pending()
+        if action == "sleep":
+            return self.set_sleep_timer(minutes or 30)[0], False
+        if action == "cancel_sleep":
+            return self.set_sleep_timer(0)[0], False
         if action in MODES:
             return self.change_mode(action, check_cancel)
         player = self.player
@@ -1280,9 +1429,32 @@ class MusicService:
         if name == "play":
             reply, started = self.play_query(argument, check_cancel)
             return reply, started, started
+        if name == "volume_set":
+            reply = self.volume(level=argument)
+            return reply, reply != "音量调节失败", False
         if name in ("louder", "quieter"):
             reply = self.volume(change=10 if name == "louder" else -10)
             return reply, reply != "音量调节失败", False
+        if name in ("mute", "unmute"):
+            set_mute(name == "mute")
+            return ("已静音" if name == "mute" else f"已取消静音，当前音量百分之{read_volume() or 0}"), True, False
+        if name == "what_volume":
+            vol, muted = read_volume_status()
+            if vol is None:
+                return "暂时无法读取当前音量", False, False
+            return (f"当前已静音，音量设为百分之{vol}" if muted else f"当前音量是百分之{vol}"), True, False
+        if name == "sleep_timer":
+            reply, ok = self.set_sleep_timer(argument)
+            return reply, ok, False
+        if name == "cancel_sleep":
+            reply, ok = self.set_sleep_timer(0)
+            return reply, ok, False
+        if name == "what_song":
+            track = self.player.current()
+            if not track or self.player.state == "stopped":
+                return "现在没有在播放音乐", False, False
+            artist = track.get("artist") or ""
+            return (f"正在播放{artist}的《{track['title']}》" if artist else f"正在播放《{track['title']}》"), True, False
         reply, started = self.control(name, check_cancel)
         return reply, not reply.startswith(("现在没有", "不支持")), started
 
@@ -1299,20 +1471,38 @@ class MusicService:
             return reply, started, started
         if name == "control_music":
             action = str(args.get("action") or "")
-            reply, started = self.control(action, check_cancel)
-            return reply, not reply.startswith(("现在没有", "不支持")), started
+            minutes = args.get("minutes")
+            reply, started = self.control(action, check_cancel, minutes=minutes if type(minutes) is int and minutes > 0 else None)
+            return reply, not reply.startswith(("现在没有", "不支持", "当前没有")), started
         if name == "set_volume":
-            try:
-                level = int(args["level"]) if args.get("level") is not None else None
-                change = int(args["change"]) if args.get("change") is not None else None
-            except (TypeError, ValueError):
-                return "没有听懂要调到多大音量", False, False
-            reply = self.volume(level, change)
-            return reply, reply != "音量调节失败", False
+            mute_arg = args.get("mute")
+            raw_level = args.get("level")
+            raw_change = args.get("change")
+            level = int(raw_level) if isinstance(raw_level, (int, float)) and not isinstance(raw_level, bool) else None
+            change = int(raw_change) if isinstance(raw_change, (int, float)) and not isinstance(raw_change, bool) else None
+            if mute_arg in (True, "mute"):
+                set_mute(True)
+                return "已静音", True, False
+            if level is not None and level > 0:
+                reply = self.volume(level=level)
+                return reply, reply != "音量调节失败", False
+            if change is not None and change != 0:
+                reply = self.volume(change=change)
+                return reply, reply != "音量调节失败", False
+            if mute_arg in (False, "unmute"):
+                set_mute(False)
+                return f"已取消静音，当前音量百分之{read_volume() or 0}", True, False
+            if level == 0:
+                reply = self.volume(level=0)
+                return reply, reply != "音量调节失败", False
+            return "没有听懂要调到多大音量", False, False
         return "不支持这个操作", False, False
 
-    def ui_command(self, action):
+    def ui_command(self, action, **kwargs):
         self.cancel_pending()
+        if action == "sleep":
+            self.player.set_sleep(int(kwargs.get("minutes") or 0))
+            return
         if action == "mode":
             self.set_mode(MODES[(MODES.index(self.player.mode) + 1) % len(MODES)])
             return

@@ -21,11 +21,11 @@ TOOLS = [{
     "type": "function",
     "function": {
         "name": "manage_alarm",
-        "description": "设置、查看、取消闹钟、倒计时和提醒，或停止正在响的提示音。设置成功前必须调用此工具。",
+        "description": "设置、查看、取消闹钟、倒计时和提醒，或停止、延后正在响的提示音。设置成功前必须调用此工具。",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["create", "list", "cancel", "dismiss"]},
+                "action": {"type": "string", "enum": ["create", "list", "cancel", "dismiss", "snooze"]},
                 "kind": {"type": "string", "enum": ["alarm", "timer", "reminder"]},
                 "time": {"type": "string", "description": "当地钟点 HH:MM 或 HH:MM:SS，如早上七点传07:00。未指定日期时由设备选择下一次该钟点。"},
                 "days_from_today": {"type": "integer", "minimum": 0, "maximum": 366, "description": "今天0、明天1、后天2；由设备计算具体日期，不要自行换算。"},
@@ -33,7 +33,7 @@ TOOLS = [{
                 "hours": {"type": "integer", "minimum": 0, "description": "多久以后：小时部分，可与minutes和seconds相加。"},
                 "minutes": {"type": "integer", "minimum": 0, "description": "多久以后：分钟部分，可与hours和seconds相加。"},
                 "repeat": {"type": "string", "enum": ["once", "daily", "workdays", "weekly", "monthly"], "description": "闹钟重复规则；weekly同时传weekdays，monthly同时传month_day。"},
-                "month_day": {"type": "integer", "minimum": 1, "maximum": 31, "description": "每月几号；当月没有这一天则在月末响铃。"},
+                "month_day": {"type": "integer", "minimum": 0, "maximum": 31, "description": "仅当repeat为monthly时传1到31号；其他情况填0。"},
                 "seconds": {"type": "integer", "minimum": 0, "description": "多久以后：秒部分。相对时长总计1秒至7天；不能与钟点、日期或重复规则混用。"},
                 "label": {"type": "string", "description": "提醒内容或闹钟名称，最多60字。"},
                 "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}, "description": "重复星期，0代表周一，6代表周日；空或省略表示一次。仅闹钟可重复。"},
@@ -97,22 +97,27 @@ def plan_time(args, kind, now):
         weekdays = list(range(7 if rule == "daily" else 5))
     if rule == "weekly" and not weekdays:
         raise ValueError("请指定每周几")
-    month_day = args.get("month_day")
+    month_day = args.get("month_day") or None
     if rule == "monthly":
         if type(month_day) is not int or not 1 <= month_day <= 31 or weekdays:
             raise ValueError("每月闹钟需指定1到31号，不能同时指定星期")
+    elif args.get("repeat") in ("once", "daily", "workdays", "weekly"):
+        month_day = None
     elif month_day is not None:
         raise ValueError("只有每月闹钟可以指定几号")
     repeating = bool(weekdays or month_day)
     if repeating and kind != "alarm":
         raise ValueError("只有闹钟支持重复")
+    legacy = (args.get("when").strip() or None) if isinstance(args.get("when"), str) else args.get("when")
+    clock_str = (args.get("time").strip() or None) if isinstance(args.get("time"), str) else args.get("time")
+    date = (args.get("date").strip() or None) if isinstance(args.get("date"), str) else args.get("date")
     duration = [args.get(k) for k in ("hours", "minutes", "seconds")]
-    if any(v is not None for v in duration):
-        if repeating or any(args.get(k) is not None for k in ("when", "time", "date", "days_from_today")):
+    if any(v is not None and (type(v) is not int or v < 0) for v in duration):
+        raise ValueError("相对时长必须是非负整数")
+    seconds = sum((v or 0) * scale for v, scale in zip(duration, (3600, 60, 1)))
+    if seconds > 0 or (clock_str is None and legacy is None and any(v is not None for v in duration)):
+        if repeating or any(v is not None for v in (legacy, clock_str, date)) or (args.get("days_from_today") not in (None, 0)):
             raise ValueError("多久以后不能与钟点、日期或重复规则同时使用")
-        if any(v is not None and (type(v) is not int or v < 0) for v in duration):
-            raise ValueError("相对时长必须是非负整数")
-        seconds = sum((v or 0) * scale for v, scale in zip(duration, (3600, 60, 1)))
         if not 1 <= seconds <= 604800:
             raise ValueError("相对时长应为1秒至7天")
         return now + seconds, [], None, seconds
@@ -120,20 +125,23 @@ def plan_time(args, kind, now):
         raise ValueError("倒计时需要指定多久以后")
     if now < 1704067200:
         raise ValueError("设备时间尚未校准，请先联网同步时间")
-    legacy = args.get("when")
     if legacy is not None:
-        if any(args.get(k) is not None for k in ("time", "date", "days_from_today")):
+        if any(v is not None for v in (clock_str, date)) or (args.get("days_from_today") not in (None, 0)):
             raise ValueError("完整日期时间不能与其他日期参数混用")
         due = dt.datetime.strptime(legacy, "%Y-%m-%dT%H:%M:%S").timestamp()
     else:
-        clock = args.get("time")
+        clock = clock_str
         if not isinstance(clock, str):
             raise ValueError("请指定钟点")
         try:
             clock = dt.datetime.strptime(clock, "%H:%M:%S" if clock.count(":") == 2 else "%H:%M").time()
         except ValueError:
             raise ValueError("钟点应为HH:MM或HH:MM:SS") from None
-        date, offset = args.get("date"), args.get("days_from_today")
+        offset = args.get("days_from_today")
+        if date is not None and offset == 0:
+            offset = None
+        if repeating and offset == 0 and date is None:
+            offset = None
         if date is not None and offset is not None:
             raise ValueError("日期和相对天数不能同时指定")
         if repeating and (date is not None or offset is not None):
@@ -148,8 +156,8 @@ def plan_time(args, kind, now):
         else:
             day = today
         due = dt.datetime.combine(day, clock).timestamp()
-        if not repeating and date is None and offset is None and due <= now:
-            due = dt.datetime.combine(day + dt.timedelta(days=1), clock).timestamp()
+        if not repeating and date is None and offset in (None, 0) and due <= now:
+            due = dt.datetime.combine(today + dt.timedelta(days=1), clock).timestamp()
     after = max(now, due - 1) if legacy is not None else now
     if month_day:
         due = _next_monthday(due, month_day, after)
@@ -175,6 +183,7 @@ class AlarmService:
         self.thread = None
         self.ringing = False
         self.ringing_id = None
+        self.last_rang = None
         self.monotonic_due = {}
         self.retry_after = {}
         self.items = self._load()
@@ -189,9 +198,35 @@ class AlarmService:
             return {"kind": earliest["kind"], "due": round(earliest["due"], 1),
                     "time": when, "label": earliest.get("label") or ""}
 
+    def list_items(self):
+        with self.lock:
+            result = []
+            for item in sorted(self.items, key=lambda i: i["due"])[:16]:
+                when = dt.datetime.fromtimestamp(item["due"]).strftime("%H:%M")
+                repeat = ""
+                if item.get("weekdays"):
+                    days = item["weekdays"]
+                    if days == [0, 1, 2, 3, 4, 5, 6]:
+                        repeat = "每天"
+                    elif days == [0, 1, 2, 3, 4]:
+                        repeat = "工作日"
+                    else:
+                        repeat = "周" + "、".join("一二三四五六日"[d] for d in days)
+                elif item.get("month_day"):
+                    repeat = f"每月{item['month_day']}号"
+                result.append({
+                    "id": item["id"],
+                    "kind": item["kind"],
+                    "due": round(item["due"], 1),
+                    "time": when,
+                    "label": item.get("label") or "",
+                    "repeat": repeat,
+                })
+            return result
+
     def announce(self):
         if self.emit:
-            self.emit("alarms", next=self.next_summary())
+            self.emit("alarms", next=self.next_summary(), items=self.list_items())
 
     def _prune_stale(self, now):
         if now < 1704067200:
@@ -283,6 +318,52 @@ class AlarmService:
             self.silence.set()
             return True
 
+    def snooze(self, minutes=5):
+        minutes = max(1, min(60, int(minutes or 5)))
+        with self.lock:
+            now_mono = time.monotonic()
+            source = None
+            if self.ringing and self.ringing_id:
+                source = next((i for i in self.items if i["id"] == self.ringing_id), None)
+            if source is None and self.last_rang and now_mono - self.last_rang[1] < 60:
+                source = self.last_rang[0]
+            if source is None and not self.ringing:
+                return None
+            seconds = minutes * 60
+            now = time.time()
+            ident = uuid.uuid4().hex[:6]
+            while any(item["id"] == ident for item in self.items):
+                ident = uuid.uuid4().hex[:6]
+            kind = source["kind"] if source else "alarm"
+            label = (source.get("label") or "") if source else ""
+            item = {"id": ident, "kind": kind, "due": now + seconds, "label": label, "weekdays": []}
+            self.items.append(item)
+            self.monotonic_due[ident] = now_mono + seconds
+            self.last_rang = None
+            if self.ringing:
+                self.silence.set()
+            try:
+                self._save()
+            except OSError:
+                logging.warning("保存贪睡闹钟失败")
+        self.announce()
+        return f"好的，{minutes}分钟后再提醒"
+
+    def ui_command(self, action, **kwargs):
+        with self.lock:
+            if action == "snooze":
+                return self.snooze(kwargs.get("minutes") or 5)
+            if action == "cancel":
+                ident = kwargs.get("id")
+                if not ident:
+                    return None
+                return self._command({"action": "cancel", "id": str(ident)})
+            if action == "timer":
+                minutes = int(kwargs.get("minutes") or 5)
+                label = str(kwargs.get("label") or "").strip()[:60]
+                return self._command({"action": "create", "kind": "timer", "minutes": minutes, "label": label})
+        return None
+
     def call_tool(self, name, arguments):
         if name != "manage_alarm":
             return "不支持这个操作", False, False
@@ -301,6 +382,10 @@ class AlarmService:
         action = args.get("action")
         if action == "dismiss":
             return "已停止提示音" if self.dismiss() else "现在没有正在响的闹钟或提醒"
+        if action == "snooze":
+            minutes = args.get("minutes")
+            reply = self.snooze(minutes if type(minutes) is int and 1 <= minutes <= 60 else 5)
+            return reply or "现在没有正在响的闹钟或提醒"
         if action == "list":
             if not self.items:
                 return "目前没有待响的闹钟、计时器或提醒"
@@ -384,6 +469,7 @@ class AlarmService:
                     continue
                 self.ringing = True
                 self.ringing_id = due["id"]
+                self.last_rang = (dict(due), mono)
                 self.silence.clear()
             delivered = False
             if self.on_ring:

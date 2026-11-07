@@ -404,6 +404,7 @@ class App:
         self.notice = None
         self.alarm_active = False
         self.next_alarm = None
+        self.alarm_items = []
         self.cloud = "unknown"
         self.mic_on = self.settings["mic"]
         self.hardware_mic = None
@@ -419,6 +420,7 @@ class App:
         self.lyric_lines = []
         self.lyric_times = []
         self.lyric_index = -1
+        self.lyrics_hidden = False
         self.next_lyric = 0.0
         self.voice_online = False
         self.voice_seen = 0.0
@@ -448,6 +450,7 @@ class App:
             self.status.set_brightness(saved)
 
         self.kb_purpose = "wake"
+        self.kb_return = "settings"
         self.kb_text = ""
         self.kb_buffer = ""
         self.kb_latin = False
@@ -471,6 +474,10 @@ class App:
             return f"places:{self.status.places_state}:{len(self.status.places)}"
         if self.screen == "music":
             return "music:account" if self.account["s"] == "ok" else "music:login"
+        if self.screen == "alarms":
+            sleep_on = int(bool(self.music.get("sleep") and self.music.get("sleep") > time.time()))
+            music_on = int(self.music.get("s") in MUSIC_ACTIVE)
+            return f"alarms:{len(self.alarm_items[:5])}:{sleep_on}:{music_on}"
         if self.screen != "home":
             return self.screen
         if not self.music_visible(now):
@@ -478,14 +485,18 @@ class App:
         else:
             base = "idle:music:lyrics" if self.has_lyrics() else "idle:music"
         if self.phase in ACTIVE or now < self.conv_until:
-            return base + ":assist"
+            return base + (":assist:alarm" if self.alarm_active else ":assist")
         return base
 
     def layout_has(self, flag):
         return flag in (self.layout or "").split(":")
 
     def has_lyrics(self):
-        return bool(self.lyric_lines) and self.lyric_key == self.music.get("k")
+        return not self.lyrics_hidden and bool(self.lyric_lines) and self.lyric_key == self.music.get("k")
+
+    def toggle_lyrics(self, *_args):
+        if self.lyric_lines and self.lyric_key == self.music.get("k"):
+            self.lyrics_hidden = not self.lyrics_hidden
 
     def music_visible(self, now):
         return (
@@ -510,6 +521,8 @@ class App:
             "keyboard": self.build_keyboard,
             "places": self.build_places,
             "music": self.build_music,
+            "weather": self.build_weather,
+            "alarms": self.build_alarms,
         }[kind]
         self.widgets = builder()
         self.named = {widget.name: widget for widget in self.widgets}
@@ -529,9 +542,9 @@ class App:
     def build_idle(self):
         widgets = [
             self.status_widget(),
-            Widget("clock", (40, 64, 420, 190), self.paint_clock),
-            Widget("date", (40, 190, 420, 236), self.paint_date),
-            Widget("weather", (420, 64, 760, 236), self.paint_weather),
+            Widget("clock", (40, 64, 420, 190), self.paint_clock, tap=lambda x, y: self.set_screen("alarms")),
+            Widget("date", (40, 190, 420, 236), self.paint_date, tap=lambda x, y: self.set_screen("alarms")),
+            Widget("weather", (420, 64, 760, 236), self.paint_weather, tap=lambda x, y: self.set_screen("weather")),
         ]
         if self.layout_has("lyrics"):
             self.lyric_index = -2
@@ -539,12 +552,12 @@ class App:
             # The assistant card covers the bottom of the home screen; keep what is above it.
             bottom = CARD_RECT[1] - 12
             if self.layout_has("lyrics"):
-                widgets.append(Widget("lyrics", (24, 250, 776, bottom), self.paint_lyrics))
+                widgets.append(Widget("lyrics", (24, 250, 776, bottom), self.paint_lyrics, tap=self.toggle_lyrics))
             elif self.layout_has("music"):
                 widgets.append(Widget("player", (40, bottom - 110, 760, bottom), self.paint_player, tap=self.tap_player))
             return widgets + self.card_widgets()
         if self.layout_has("lyrics"):
-            widgets.append(Widget("lyrics", (24, 276, 776, 1016), self.paint_lyrics, tap=self.tap_orb))
+            widgets.append(Widget("lyrics", (24, 276, 776, 1016), self.paint_lyrics, tap=self.toggle_lyrics))
         else:
             self.orb_rect = (180, 400, 620, 840)
             widgets.append(Widget("orb", self.orb_rect, None, tap=self.tap_orb))
@@ -557,13 +570,18 @@ class App:
     def card_widgets(self):
         x0, y0, x1, y1 = CARD_RECT
         self.orb_rect = (x0 + 28, y0 + 24, x0 + 140, y0 + 136)
-        return [
+        phase_right = x1 - 244 if self.alarm_active else x1 - 112
+        widgets = [
             Widget("orb", self.orb_rect, None, tap=self.tap_orb),
-            Widget("phase", (x0 + 160, y0 + 24, x1 - 112, y0 + 136), self.paint_phase),
-            Widget("stop", (x1 - 100, y0 + 44, x1 - 28, y0 + 116), self.paint_stop, tap=self.tap_stop),
+            Widget("phase", (x0 + 160, y0 + 24, phase_right, y0 + 136), self.paint_phase),
+            Widget("stop", (x1 - 108, y0 + 44, x1 - 28, y0 + 116), self.paint_stop, tap=self.tap_stop),
             Widget("user", (x0 + 36, y0 + 150, x1 - 36, y0 + 254), self.paint_user),
             Widget("answer", (x0 + 36, y0 + 264, x1 - 36, y1 - 24), self.paint_answer),
         ]
+        if self.alarm_active:
+            widgets.insert(2, Widget("snooze", (x1 - 232, y0 + 44, x1 - 120, y0 + 116),
+                                     self.paint_snooze, tap=self.tap_snooze))
+        return widgets
 
     def header(self, title, button, action):
         return [
@@ -674,6 +692,58 @@ class App:
             ))
         return widgets
 
+    def build_weather(self):
+        return self.header(self.settings["location"]["name"], "返回", self.close_settings) + [
+            Widget("weather_now", (40, 190, 760, 440), self.paint_weather_now),
+            Widget("weather_days", (40, 460, 760, 1020), self.paint_weather_days),
+            Widget("weather_city", (220, 1072, 580, 1160),
+                   lambda d, r, p: self.paint_button(d, r, p, "切换天气城市"),
+                   tap=lambda x, y: self.open_keyboard("city", back="weather")),
+        ]
+
+    def build_alarms(self):
+        widgets = self.header("闹钟与计时", "返回", self.close_settings)
+        widgets.append(Widget("timers_label", (40, 184, 760, 232),
+                              lambda d, r, p: d.text((r[0] + 8, (r[1] + r[3]) // 2), "快捷倒计时",
+                                                     font=self.fonts.ui(30), fill=DIM, anchor="lm")))
+        for index, minutes in enumerate((3, 5, 10, 15, 30)):
+            left = 40 + index * 147
+            widgets.append(Widget(
+                f"qtimer:{minutes}",
+                (left, 240, left + 132, 320),
+                lambda d, r, p, m=minutes: self.paint_button(d, r, p, f"{m}分钟"),
+                tap=lambda x, y, m=minutes: self.start_quick_timer(m),
+            ))
+        sleep_until = self.music.get("sleep")
+        sleep_active = bool(sleep_until and sleep_until > time.time())
+        top = 344
+        if self.music.get("s") in MUSIC_ACTIVE or sleep_active:
+            widgets.append(Widget("sleep_row", (40, top, 760, top + 76), self.paint_sleep_row, tap=self.toggle_sleep_timer))
+            top += 96
+        widgets.append(Widget("alarms_label", (40, top, 760, top + 48),
+                              lambda d, r, p: d.text((r[0] + 8, (r[1] + r[3]) // 2), "待响列表",
+                                                     font=self.fonts.ui(30), fill=DIM, anchor="lm")))
+        top += 56
+        items = self.alarm_items[:5]
+        if not items:
+            widgets.append(Widget("alarms_empty", (40, top + 40, 760, top + 200), self.paint_alarms_empty))
+        else:
+            for index, item in enumerate(items):
+                row_top = top + index * 124
+                widgets.append(Widget(
+                    f"alarm_row:{index}",
+                    (40, row_top, 588, row_top + 108),
+                    lambda d, r, p, i=index: self.paint_alarm_item(d, r, p, i),
+                ))
+                widgets.append(Widget(
+                    f"alarm_del:{index}",
+                    (600, row_top + 18, 760, row_top + 90),
+                    lambda d, r, p: self.paint_button(d, r, p, "取消"),
+                    tap=lambda x, y, ident=item["id"]: self.cancel_alarm_item(ident),
+                ))
+        widgets.append(Widget("notice", (40, 1180, 760, 1236), self.paint_notice))
+        return widgets
+
     # ---- rendering ----------------------------------------------------
 
     def bg_crop(self, rect):
@@ -693,13 +763,13 @@ class App:
             if self.orb_rect:
                 self.paint_orb(now)
             self.fb.blit(self.frame, (0, 0, W, H))
-            self.next_frame = now + 0.04
+            self.next_frame = now + 0.025
             return
         if not self.dirty or now < self.next_flush:
             return
         names = self.dirty
         self.dirty = set()
-        self.next_flush = now + 0.04
+        self.next_flush = now + 0.016
         for widget in self.widgets:
             if widget.name in names and widget.paint:
                 self.frame.paste(self.bg_crop(widget.rect), widget.rect[:2])
@@ -904,14 +974,23 @@ class App:
     def paint_stop(self, d, rect, pressed):
         if self.phase not in ACTIVE and not self.alarm_active:
             return
-        d.ellipse(rect, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
-        cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         if self.alarm_active:
+            d.rounded_rectangle(rect, radius=36, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
+            cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
             d.text((cx, cy), "停止", font=self.fonts.ui(24), fill=TEXT, anchor="mm")
             return
+        d.ellipse(rect, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
+        cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         r = 12
         d.line((cx - r, cy - r, cx + r, cy + r), fill=TEXT, width=3)
         d.line((cx - r, cy + r, cx + r, cy - r), fill=TEXT, width=3)
+
+    def paint_snooze(self, d, rect, pressed):
+        if not self.alarm_active:
+            return
+        d.rounded_rectangle(rect, radius=36, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
+        cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+        d.text((cx, cy), "稍后", font=self.fonts.ui(24), fill=TEXT, anchor="mm")
     @staticmethod
     def clock_text(seconds):
         seconds = max(0, int(seconds))
@@ -940,6 +1019,9 @@ class App:
                 detail += f"  {self.clock_text(position)} / {self.clock_text(duration)}"
             if state == "paused":
                 detail += "  ·  已暂停"
+            sleep_until = self.music.get("sleep")
+            if sleep_until and sleep_until > time.time():
+                detail += f"  ·  伴睡{max(1, math.ceil((sleep_until - time.time()) / 60))}分"
         small = self.fonts.ui(26)
         d.text((x0 + 8, y0 + 78), self.fit(detail.strip(), small, controls - x0 - 24),
                font=small, fill=DIM, anchor="lm")
@@ -1347,6 +1429,97 @@ class App:
         d.text((rect[0] + 32, rect[1] + 80), self.fit(place["detail"] or "—", self.fonts.ui(24), 640),
                font=self.fonts.ui(24), fill=DIM, anchor="lm")
 
+    def paint_weather_now(self, d, rect, pressed):
+        x0, y0, x1, y1 = rect
+        weather = self.status.weather
+        if not weather:
+            d.text((W // 2, (y0 + y1) // 2), "暂无天气数据，请检查网络连接",
+                   font=self.fonts.ui(32), fill=DIM, anchor="mm")
+            return
+        description, kind = WEATHER_CODES.get(weather.get("code"), ("未知", "cloud"))
+        draw_weather_icon(d, kind, x0 + 96, y0 + 96, 108, weather.get("day", True), BG)
+        temp = f"{round(weather['temp'])}°"
+        d.text((x0 + 188, y0 + 136), temp, font=self.fonts.thin(96), fill=TEXT, anchor="ls")
+        d.text((x1 - 24, y0 + 78), description, font=self.fonts.ui(40), fill=TEXT, anchor="rm")
+        days = weather.get("days") or []
+        if days:
+            d.text((x1 - 24, y0 + 130), f"{round(days[0]['min'])}° / {round(days[0]['max'])}°",
+                   font=self.fonts.ui(30), fill=DIM, anchor="rm")
+        metrics = []
+        if weather.get("feels") is not None:
+            metrics.append(f"体感 {round(weather['feels'])}°")
+        if weather.get("humidity") is not None:
+            metrics.append(f"湿度 {round(weather['humidity'])}%")
+        if weather.get("wind") is not None:
+            metrics.append(f"风速 {round(weather['wind'])} km/h")
+        if metrics:
+            d.text((W // 2, y1 - 36), "   ·   ".join(metrics), font=self.fonts.ui(28), fill=DIM, anchor="mm")
+        d.line((x0 + 8, y1 - 1, x1 - 8, y1 - 1), fill=LINE, width=2)
+
+    def paint_weather_days(self, d, rect, pressed):
+        x0, y0, x1, _y1 = rect
+        weather = self.status.weather
+        days = (weather or {}).get("days") or []
+        labels = ("今天", "明天", "后天")
+        for index, day in enumerate(days[:3]):
+            top = y0 + index * 144
+            bottom = top + 132
+            cy = (top + bottom) // 2
+            d.line((x0 + 8, bottom, x1 - 8, bottom), fill=LINE, width=2)
+            date_str = str(day.get("date") or "")[-5:]
+            title = labels[index] if index < len(labels) else date_str
+            d.text((x0 + 24, cy - 18), title, font=self.fonts.ui(34), fill=TEXT, anchor="lm")
+            if date_str:
+                d.text((x0 + 24, cy + 24), date_str, font=self.fonts.ui(24), fill=FAINT, anchor="lm")
+            desc, kind = WEATHER_CODES.get(day.get("code"), ("未知", "cloud"))
+            draw_weather_icon(d, kind, x0 + 280, cy, 56, True, BG)
+            d.text((x0 + 340, cy), desc, font=self.fonts.ui(32), fill=DIM, anchor="lm")
+            temp_range = f"{round(day['min'])}° / {round(day['max'])}°"
+            d.text((x1 - 24, cy), temp_range, font=self.fonts.ui(34), fill=TEXT, anchor="rm")
+        if weather and weather.get("fetched"):
+            stamp = time.strftime("更新于 %H:%M", time.localtime(weather["fetched"]))
+            d.text((W // 2, y0 + 480), stamp, font=self.fonts.ui(24), fill=FAINT, anchor="mm")
+
+    def paint_sleep_row(self, d, rect, pressed):
+        sleep_until = self.music.get("sleep")
+        if sleep_until and sleep_until > time.time():
+            remain = max(1, math.ceil((sleep_until - time.time()) / 60))
+            value = f"{remain} 分钟后停播 · 点击取消"
+            color = ACCENT
+        else:
+            value = "点击开启 30 分钟伴睡"
+            color = DIM
+        self.paint_row(d, rect, pressed, "音乐伴睡定时", value, color)
+
+    def paint_alarms_empty(self, d, rect, pressed):
+        cy = (rect[1] + rect[3]) // 2
+        d.text((W // 2, cy - 22), "当前没有待响的闹钟、计时器或提醒",
+               font=self.fonts.ui(30), fill=DIM, anchor="mm")
+        d.text((W // 2, cy + 26), "可轻触上方快捷倒计时，或直接对助手说“定个明天早上7点的闹钟”",
+               font=self.fonts.ui(24), fill=FAINT, anchor="mm")
+
+    def paint_alarm_item(self, d, rect, pressed, index):
+        if index >= len(self.alarm_items):
+            return
+        item = self.alarm_items[index]
+        x0, y0, x1, y1 = rect
+        d.line((x0 + 8, y1 - 1, 752, y1 - 1), fill=LINE, width=2)
+        kind_name = {"alarm": "闹钟", "timer": "计时器", "reminder": "提醒"}.get(item.get("kind"), "提醒")
+        if item.get("kind") == "timer" and isinstance(item.get("due"), (int, float)):
+            remain = max(0, int(item["due"] - time.time()))
+            headline = f"{remain // 60:02d}:{remain % 60:02d}"
+        else:
+            headline = item.get("time") or "--:--"
+        d.text((x0 + 16, y0 + 38), headline, font=self.fonts.digits(42), fill=TEXT, anchor="lm")
+        meta = [kind_name]
+        if item.get("repeat"):
+            meta.append(item["repeat"])
+        if item.get("label"):
+            meta.append(item["label"])
+        sub = "  ·  ".join(meta)
+        small = self.fonts.ui(26)
+        d.text((x0 + 16, y0 + 82), self.fit(sub, small, x1 - x0 - 24), font=small, fill=DIM, anchor="lm")
+
     # ---- actions ------------------------------------------------------
 
     def set_screen(self, screen):
@@ -1371,9 +1544,30 @@ class App:
             self.link.send("talk")
 
     def tap_player(self, x, y):
-        zone = (x - (self.named["player"].rect[2] - 336)) // 84
+        controls = self.named["player"].rect[2] - 336
+        if x < controls:
+            self.toggle_lyrics()
+            return
+        zone = (x - controls) // 84
         if zone >= 0:
             self.link.send("music", a=("mode", "prev", "toggle", "next")[min(3, zone)])
+
+    def start_quick_timer(self, minutes):
+        self.link.send("alarm_cmd", a="timer", minutes=minutes)
+        self.set_notice(f"已开启 {minutes} 分钟倒计时", GOOD, 4)
+
+    def cancel_alarm_item(self, ident):
+        self.link.send("alarm_cmd", a="cancel", id=ident)
+        self.set_notice("已取消该项提醒", DIM, 3)
+
+    def toggle_sleep_timer(self, *_args):
+        sleep_until = self.music.get("sleep")
+        if sleep_until and sleep_until > time.time():
+            self.link.send("music", a="sleep", minutes=0)
+            self.set_notice("已取消音乐伴睡定时", DIM, 4)
+        else:
+            self.link.send("music", a="sleep", minutes=30)
+            self.set_notice("已开启 30 分钟伴睡定时", GOOD, 4)
 
     def open_music(self, *_args):
         self.screen = "music"
@@ -1436,6 +1630,10 @@ class App:
             self.link.send("alarm_stop")
         elif self.phase in ACTIVE:
             self.link.send("stop")
+
+    def tap_snooze(self, *_args):
+        if self.alarm_active:
+            self.link.send("alarm_snooze", minutes=5)
 
     def save_settings(self, **values):
         self.settings.update(**values)
@@ -1510,8 +1708,9 @@ class App:
             self.status.set_brightness(self.brightness)
         self.dirty.add("brightness")
 
-    def open_keyboard(self, purpose):
+    def open_keyboard(self, purpose, back="settings"):
         self.kb_purpose = purpose
+        self.kb_return = back
         self.kb_text = ""
         self.kb_buffer = ""
         available = self.ime.available()
@@ -1526,7 +1725,7 @@ class App:
         self.screen = "keyboard"
 
     def close_keyboard(self, *_args):
-        self.screen = "settings"
+        self.screen = self.kb_return
 
     def update_candidates(self):
         if self.kb_latin:
@@ -1626,7 +1825,7 @@ class App:
         self.save_settings(location={"name": place["name"], "lat": place["lat"], "lon": place["lon"]})
         self.status.refresh_weather()
         self.set_notice(f"天气城市已设为{place['name']}", GOOD, 6)
-        self.screen = "settings"
+        self.screen = self.kb_return
 
     # ---- events -------------------------------------------------------
 
@@ -1664,6 +1863,8 @@ class App:
             self.answer = str(message.get("answer") or "")[-4000:]
             self.alarm_active = bool(message.get("alarm_active"))
             self.next_alarm = message.get("alarms") if isinstance(message.get("alarms"), dict) else None
+            if isinstance(message.get("alarm_items"), list):
+                self.alarm_items = message["alarm_items"]
             if self.alarm_active and self.phase not in ACTIVE:
                 self.answer = str(message.get("alarm_text") or "")
             self.mic_on = bool(message.get("mic"))
@@ -1725,16 +1926,26 @@ class App:
             self.hardware_mic = message.get("hardware_mic")
             self.dirty |= {"mic", "microw", "hint"}
             return
+        if event == "hw_volume":
+            self.status.next_volume = 0.0
+            self.status.jobs.put(None)
+            self.next_tick = min(self.next_tick, now + 0.08)
+            self.activity(now)
+            return
         if event == "music":
+            if message.get("k") != self.music.get("k"):
+                self.lyrics_hidden = False
             self.music = message
             self.music_at = now
-            self.dirty.add("player")
+            self.dirty |= {"player", "sleep_row"}
             return
         if event == "mlogin":
             self.on_login(message)
             return
         if event == "lyric":
             lrc = message.get("lrc")
+            if message.get("k") != self.lyric_key:
+                self.lyrics_hidden = False
             self.lyric_key = message.get("k")
             self.lyric_lines = parse_lrc(lrc) if isinstance(lrc, str) else []
             self.lyric_times = [line[0] for line in self.lyric_lines]
@@ -1742,7 +1953,9 @@ class App:
             return
         if event == "alarms":
             self.next_alarm = message.get("next") if isinstance(message.get("next"), dict) else None
-            self.dirty.add("date")
+            if isinstance(message.get("items"), list):
+                self.alarm_items = message["items"]
+            self.dirty |= {"date"} | {f"alarm_row:{i}" for i in range(5)}
             return
         if event == "alarm":
             self.activity(now)
@@ -1765,8 +1978,21 @@ class App:
         if event == "sleep":
             self.sleep()
             return
+        if event == "ui_sync":
+            self.activity(now)
+            self.next_settings_check = 0.0
+            self.next_tick = min(self.next_tick, now + 0.05)
+            target = message.get("screen")
+            if target in ("home", "weather", "alarms", "settings", "music", "night"):
+                self.cancel_login()
+                self.screen = target
+                self.full_redraw = True
+            return
         self.activity(now)
         if event == "wake":
+            if self.screen != "home":
+                self.cancel_login()
+                self.screen = "home"
             self.partial = self.user_text = self.answer = ""
             self.error_code = None
             self.set_phase("wake", now)
@@ -1829,9 +2055,10 @@ class App:
             and backlight.writable()
         )
         self.dimmed = wanted
-        brightness = min(self.brightness, 20) if self.night_active() else self.brightness
+        night = self.night_active()
+        brightness = min(self.brightness, 20) if night else self.brightness
         if wanted:
-            brightness = max(1.0, brightness * 0.12)
+            brightness = 0 if night else max(1.0, brightness * 0.12)
         if brightness != self.applied_brightness:
             self.applied_brightness = brightness
             self.status.set_brightness(brightness)
@@ -1906,6 +2133,10 @@ class App:
               and isinstance(self.next_alarm.get("due"), (int, float))
               and self.next_alarm["due"] - time.time() < 3600):
             self.dirty.add("date")
+        if self.screen == "alarms" and any(i.get("kind") == "timer" for i in self.alarm_items[:5]):
+            self.dirty |= {f"alarm_row:{i}" for i in range(len(self.alarm_items[:5]))}
+        if self.screen == "weather" and self.status.version != self.status_version:
+            self.dirty |= {"weather_now", "weather_days"}
         if now >= self.next_voice_check:
             self.next_voice_check = now + 2
             self.ping_seq += 1
@@ -2010,7 +2241,7 @@ class App:
         self.render(now)
         if self.orb_rect is not None and not self.dimmed and now >= self.next_frame:
             fast = self.phase in ACTIVE or now < self.error_until
-            self.next_frame = now + (1 / 24 if fast else 1 / 12)
+            self.next_frame = now + (1 / 40 if fast else 1 / 20)
             self.animate(now)
 
     def run(self):

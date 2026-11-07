@@ -268,10 +268,21 @@ def make_app():
         if not isinstance(body, dict):
             raise ValueError('操作无效')
         name = body.get('action')
-        if name in ('talk', 'stop', 'alarm_stop'):
+        if name in ('talk', 'stop', 'alarm_stop', 'alarm_snooze'):
             await voice(name)
         elif name in ('toggle', 'next', 'prev', 'music_stop'):
             await voice('music', a='stop' if name == 'music_stop' else name)
+        elif name == 'sleep_timer':
+            minutes = round(number(body.get('minutes', 0), 0, 480))
+            await voice('music', a='sleep', minutes=minutes)
+        elif name == 'timer':
+            minutes = round(number(body.get('minutes', 5), 1, 480))
+            await voice('alarm_cmd', a='timer', minutes=minutes)
+        elif name == 'alarm_cancel':
+            ident = str(body.get('id') or '').strip()
+            if not re.fullmatch(r'[a-f0-9]{4,12}', ident):
+                raise ValueError('编号无效')
+            await voice('alarm_cmd', a='cancel', id=ident)
         elif name == 'volume':
             value = round(number(body.get('value'), 0, 100))
             await asyncio.to_thread(write_volume, value)

@@ -16,6 +16,7 @@ EVIOCGSW = 0x8008451B
 MIC_SWITCH = 4
 STATE = "/run/thinksmart-keys/mic-state"
 CONTROL = "/run/thinksmart-voice/control.sock"
+UI_EVENT = "/run/thinksmart-ui/events.sock"
 
 
 def mic_state(fd):
@@ -79,6 +80,10 @@ def main():
                     try:
                         subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", STEP[code]],
                                        timeout=3, check=True, stdout=subprocess.DEVNULL)
+                        try:
+                            sock.sendto(b'{"e":"hw_volume"}', UI_EVENT)
+                        except OSError:
+                            pass
                     except (OSError, subprocess.SubprocessError):
                         logging.warning("硬件音量调整失败")
 

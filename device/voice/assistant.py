@@ -25,7 +25,14 @@ import sherpa_onnx
 
 from brain import Brain
 from playback import PCMPlayer, SpeechProgress, AudioStalled
-from music import MUSIC_ROLE, MusicService, match_command, CommandCancelled as TurnCancelled
+from music import (
+    MUSIC_ROLE,
+    MusicService,
+    match_command,
+    parse_cn_number,
+    read_volume_status,
+    CommandCancelled as TurnCancelled,
+)
 import information
 import offline
 from alarms import AlarmService
@@ -63,6 +70,19 @@ WEATHER_WORDS = re.compile(
     r"|^(?:现在|今天|明天|外面)?(?:多少度|几度|冷不冷|热不热)[？?吗呢吧呀啊]*$"
 )
 TIME_WORDS = re.compile(r"几点|几号|星期几|礼拜几")
+PURE_TIME_QUERY = re.compile(
+    r"^(?:请?问|告诉我|帮我看一下)?(?:现在|今天|当前)?(?:是)?"
+    r"(?:几点(?:了|钟)?|什么时间|几月几[号日]|几号|星期几|礼拜几|周几|什么日子)+[呀啊呢吗吧么]*$"
+)
+SNOOZE_QUERY = re.compile(
+    r"^(?:贪睡|稍后提醒|等会儿?再响|过会儿?再响|"
+    r"再睡(?:(\d+|[一二两三四五六七八九十]+)(?:分钟?))?|"
+    r"(\d+|[一二两三四五六七八九十]+)(?:分钟?)后再(?:响|提醒|叫我))$"
+)
+QUICK_TIMER = re.compile(
+    r"^(?:请你?|帮我|给我)?(?:定个?|设个?|设置(?:一个)?|来个?|开启(?:一个)?)?"
+    r"(\d+|[一二两三四五六七八九十半]+)(?:个)?(秒钟?|分钟?|小时|钟头)(?:的)?(?:倒计时|计时器?)$"
+)
 # Thinking delays the first spoken word, so it is reserved for calculation, comparison and advice.
 THINK_WORDS = re.compile(
     r"计算|算一下|算算|算出|等于多少|换算|折合|平均|百分之|几倍|多少倍|乘以|除以|加上|减去|\d\s*[+\-*/×÷^]\s*\d"
@@ -89,13 +109,48 @@ END_TOOL = {
         },
     },
 }
+DEVICE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "control_device",
+        "description": (
+            "调节或切换设备本地设置与触屏界面：屏幕亮度、播报语速、夜间免打扰模式、深度思考模式、"
+            "默认天气城市、切换触屏页面（主页/天气/闹钟/设置/音乐/夜间设置）或息屏。"
+            "当用户要求修改这些设置，或抱怨屏幕太亮/太暗、说话太快/太慢时直接调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "brightness": {"type": "integer", "description": "目标屏幕亮度百分比1到100；不设具体数值时填-1"},
+                "brightness_change": {"type": "integer", "description": "相对调节屏幕亮度百分比，调亮为正（如20），调暗为负（如-20）；不用时填0"},
+                "speech_rate": {"type": "number", "description": "目标播报语速倍率0.5到2.0（默认1.5）；不用时填0"},
+                "speech_rate_change": {"type": "number", "description": "相对调节播报语速，加快为正（如0.2），放慢为负（如-0.2）；不用时填0"},
+                "night_mode": {"type": "string", "enum": ["", "on", "off"], "description": "开启夜间免打扰填on，关闭填off，不改填空字符串"},
+                "thinking_mode": {"type": "string", "enum": ["", "on", "off"], "description": "开启深度思考填on，关闭填off，不改填空字符串"},
+                "weather_city": {"type": "string", "description": "修改设备默认天气城市名称；不改填空字符串"},
+                "screen": {
+                    "type": "string",
+                    "enum": ["", "home", "weather", "alarms", "settings", "music", "night", "off"],
+                    "description": "切换触屏页面：home主页、weather天气页、alarms闹钟页、settings设置页、music音乐页、night夜间设置页、off息屏；不切换填空字符串",
+                },
+            },
+        },
+    },
+}
 TOOL_RULES = (
-    "你可以用工具播放QQ音乐、控制播放和调节音量，只在用户明确提出时调用。"
-    "询问当前时间、日期或天气时必须使用对应工具，不得猜测实时信息。"
-    "设置、查看、取消闹钟、计时器、提醒时必须调用manage_alarm。"
-    "设置闹钟时传钟点time和相对天数days_from_today（明天1、后天2），由设备计算日期。"
+    "你拥有完整的设备本地技能（Skills），包括："
+    "1.音乐与伴睡定时（play_music点歌/搜歌手/播收藏、control_music暂停/继续/切歌/单曲循环/随机播放/伴睡定时停止）；"
+    "2.音量与静音控制（set_volume设百分比、调大调小、静音/取消静音）；"
+    "3.设备设置与屏幕控制（control_device调节屏幕亮度、播报语速、开关夜间免打扰模式、开关深度思考模式、修改默认天气城市、切换触屏到天气/闹钟/设置/音乐页面或息屏）；"
+    "4.闹钟、倒计时与日程提醒管理（manage_alarm创建、查看、取消、贪睡稍后提醒、停止闹钟）；"
+    "5.实时天气与三天预报（get_weather）、当前时间日期（get_current_time）及联网搜索。"
+    "设备当前的实时状态（当前音量、是否静音、屏幕亮度、语速、夜间模式、深度思考开关、闹钟列表、正在播放的歌曲与伴睡定时、QQ音乐登录状态、默认城市）已实时注入在系统上下文中；"
+    "当用户询问现在音量多少、亮度多少、语速多少、在放什么歌、有哪些闹钟、你有哪些本地功能时，请直接根据上下文准确回答，绝不要说无法查询。"
+    "当用户表达不适或隐含调节意图（如“你说话声音好小”“太吵了”“屏幕太刺眼/太暗”“你说太快了”）时，不要反问“需要我调吗”，直接调用set_volume或control_device完成调节。"
+    "询问天气时必须调用get_weather，不得猜测。"
+    "设置闹钟时传钟点time和相对天数days_from_today（明天1、后天2），由设备计算日期；"
     "多久以后传hours/minutes/seconds；重复传repeat规则；不要自行计算完整日期，不得假装已设置。"
-    "取消时根据用户的描述匹配编号；不明确时先询问。编号仅供取消时传参，不要读给用户。"
+    "取消闹钟时根据描述匹配编号；不明确时先询问。编号仅供取消时传参，不要读给用户。"
     "使用工具时不要提前声称操作成功，以工具返回结果为准。"
     "用户想结束对话时调用end_conversation；说关机、关屏或睡觉时同时把screen_off设为true，说关机、睡觉或晚安时还要把stop_music设为true，你无法关闭设备电源。"
     "新闻、比赛、行情等需要最新信息的问题可以参考联网搜索结果，用一两句话概括，不要念出网址。"
@@ -336,7 +391,7 @@ class UiPublisher:
         self.state = {"phase": "idle", "cloud": "unknown", "mic": True,
                       "hardware_mic": None, "requested_mic": True,
                       "partial": "", "user_text": "", "answer": "",
-                      "alarm_active": False, "alarm_text": "", "alarms": None}
+                      "alarm_active": False, "alarm_text": "", "alarms": None, "alarm_items": []}
         try:
             self.sock = socket.socket(
                 socket.AF_UNIX,
@@ -386,6 +441,8 @@ class UiPublisher:
             state.update(alarm_active=False, alarm_text="")
         elif event == "alarms":
             state["alarms"] = fields.get("next")
+            if "items" in fields:
+                state["alarm_items"] = fields.get("items") or []
         elif event == "error":
             state.update(error_code=fields.get("code"), error_until=time.monotonic() + 10)
 
@@ -706,7 +763,7 @@ class ThinkSmartAssistant:
                 "你可以按需调用联网搜索工具。涉及新闻、近期事件、比分、行情等实时信息时先搜索核实，"
                 "不要把记忆当成实时信息；普通聊天不必搜索。搜索后用自然中文概括，通常两三句话。"
             ) + "回复会被直接朗读：不要输出网址、链接、来源标注、引用编号或Markdown标记。",
-            "tools": [END_TOOL] + self.music.tools + information.TOOLS + self.alarms.tools,
+            "tools": [END_TOOL, DEVICE_TOOL] + self.music.tools + information.TOOLS + self.alarms.tools,
         })
         self.brain.configure_models(self.chat_model, self.expert_model, self.chat_provider)
         logging.info("对话模型：%s / %s", self.chat_provider, self.chat_model)
@@ -919,6 +976,15 @@ class ThinkSmartAssistant:
                         self.cancel_requested.set()
                 elif command == "alarm_stop":
                     self.alarms.dismiss()
+                elif command == "alarm_snooze":
+                    self.alarms.snooze(message.get("minutes") or 5)
+                elif command == "alarm_cmd":
+                    self.alarms.ui_command(
+                        message.get("a"),
+                        id=message.get("id"),
+                        minutes=message.get("minutes"),
+                        label=message.get("label"),
+                    )
                 elif command == "mic":
                     self.set_mic(bool(message.get("on")))
                 elif command == "hardware_mic":
@@ -928,7 +994,7 @@ class ThinkSmartAssistant:
                 elif command == "snapshot":
                     with self.ui.lock:
                         self.ui._record("music", self.music.player.snapshot())
-                        self.ui._record("alarms", {"next": self.alarms.next_summary()})
+                        self.ui._record("alarms", {"next": self.alarms.next_summary(), "items": self.alarms.list_items()})
                     self.ui.snapshot(sender)
                 elif command == 'preview':
                     if not sender or not re.fullmatch('[a-f0-9]{24}', str(message.get('id', ''))):
@@ -985,7 +1051,7 @@ class ThinkSmartAssistant:
                         self.night = message["night"]
                     logging.info("语速 %.1f，思考模式%s", self.speech_rate, "开启" if self.thinking else "关闭")
                 elif command == "music":
-                    self.music.ui_command(message.get("a"))
+                    self.music.ui_command(message.get("a"), minutes=message.get("minutes"))
                 elif command == "login":
                     self.music.login_command(message.get("t"))
                 else:
@@ -1378,9 +1444,8 @@ class ThinkSmartAssistant:
         self.set_phase("listen")
         self.play_listen_tone()
 
-    def play_listen_tone(self):
-        # A soft bell: smooth 15 ms attack, then a natural decay instead of a flat beep.
-        level = 0.065 if self.night_active() else 0.13
+    @staticmethod
+    def _build_listen_tone(level):
         attack, decay, length = 0.015, 0.085, 0.32
         samples = array.array("h")
         for index in range(int(PLAYBACK_RATE * length)):
@@ -1393,7 +1458,14 @@ class ThinkSmartAssistant:
             samples.append(int(32767 * level * envelope * tone / 1.25))
         if sys.byteorder == "big":
             samples.byteswap()
+        return samples.tobytes()
 
+    _TONE_DAY = _build_listen_tone.__func__(0.13)
+    _TONE_NIGHT = _build_listen_tone.__func__(0.065)
+
+    def play_listen_tone(self):
+        # Pre-rendered soft bell: smooth 15 ms attack, natural decay, zero per-wake math overhead.
+        pcm = self._TONE_NIGHT if self.night_active() else self._TONE_DAY
         self.playback = subprocess.Popen(
             self.audio_command("--playback", PLAYBACK_RATE),
             stdin=subprocess.PIPE,
@@ -1402,7 +1474,7 @@ class ThinkSmartAssistant:
             bufsize=0,
         )
         try:
-            self.playback.communicate(samples.tobytes(), timeout=5)
+            self.playback.communicate(pcm, timeout=5)
             if self.playback.returncode != 0:
                 logging.warning("聆听提示音播放失败")
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -1485,14 +1557,124 @@ class ThinkSmartAssistant:
             raise RuntimeError("microphone command buffer overflow")
         return state["text"].strip()
 
+    def device_status_summary(self):
+        vol, muted = read_volume_status()
+        vol_text = f"{vol}%（{'已静音' if muted else '未静音'}）" if vol is not None else "未知"
+        try:
+            settings = information.ui_system.Settings()
+            actual_b = information.ui_system.Backlight().percent()
+            brightness = round(actual_b if actual_b is not None else (settings["brightness"] or 80))
+            night = settings["night"]
+        except Exception:
+            brightness = 80
+            night = self.night
+        sh, sm = divmod(int(night.get("start", 1320)), 60)
+        eh, em = divmod(int(night.get("end", 420)), 60)
+        night_text = (
+            f"开启（时段{sh:02d}:{sm:02d}至{eh:02d}:{em:02d}{'，当前生效中' if self.night_active() else ''}）"
+            if night.get("enabled")
+            else "关闭"
+        )
+        return (
+            f"设备状态：当前音量{vol_text}，屏幕亮度{brightness}%，"
+            f"播报语速{self.speech_rate:g}倍，深度思考{'开启' if self.thinking else '关闭'}，"
+            f"夜间免打扰模式{night_text}。"
+        )
+
+    def run_device_tool(self, args):
+        if not isinstance(args, dict):
+            return "参数格式不正确", False, True
+        settings = information.ui_system.Settings()
+        backlight = information.ui_system.Backlight()
+        results = []
+        changed = False
+        target_screen = ""
+
+        raw_b = args.get("brightness")
+        raw_bc = args.get("brightness_change")
+        b_val = int(raw_b) if isinstance(raw_b, (int, float)) and not isinstance(raw_b, bool) else -1
+        bc_val = int(raw_bc) if isinstance(raw_bc, (int, float)) and not isinstance(raw_bc, bool) else 0
+        if 1 <= b_val <= 100 or bc_val != 0:
+            current_b = round(backlight.percent() or settings["brightness"] or 80)
+            new_b = max(1, min(100, b_val if 1 <= b_val <= 100 else current_b + bc_val))
+            settings["brightness"] = new_b
+            backlight.set_percent(new_b)
+            changed = True
+            results.append(f"屏幕亮度已调到百分之{new_b}")
+
+        raw_sr = args.get("speech_rate")
+        raw_src = args.get("speech_rate_change")
+        sr_val = float(raw_sr) if isinstance(raw_sr, (int, float)) and not isinstance(raw_sr, bool) else 0.0
+        src_val = float(raw_src) if isinstance(raw_src, (int, float)) and not isinstance(raw_src, bool) else 0.0
+        if 0.5 <= sr_val <= 2.0 or abs(src_val) >= 0.05:
+            new_rate = self.clamp_rate(sr_val if 0.5 <= sr_val <= 2.0 else self.speech_rate + src_val)
+            self.speech_rate = new_rate
+            settings["speech_rate"] = new_rate
+            changed = True
+            results.append(f"播报语速已调到{new_rate:g}倍")
+
+        night_mode = str(args.get("night_mode") or "").strip()
+        if night_mode in ("on", "off"):
+            on = night_mode == "on"
+            self.night["enabled"] = on
+            night_cfg = dict(settings["night"])
+            night_cfg["enabled"] = on
+            settings["night"] = night_cfg
+            changed = True
+            results.append(f"夜间免打扰模式已{'开启' if on else '关闭'}")
+
+        thinking_mode = str(args.get("thinking_mode") or "").strip()
+        if thinking_mode in ("on", "off"):
+            on = thinking_mode == "on"
+            self.thinking = on
+            settings["thinking"] = on
+            changed = True
+            results.append(f"深度思考模式已{'开启' if on else '关闭'}")
+
+        city = str(args.get("weather_city") or "").strip()[:40]
+        if city:
+            places = information.ui_system.search_places(city)
+            if places:
+                place = places[0]
+                settings["location"] = place
+                changed = True
+                results.append(f"默认天气城市已设为{place['name']}")
+            else:
+                results.append(f"没有找到城市{city}")
+
+        screen = str(args.get("screen") or "").strip()
+        screen_names = {
+            "home": "主页",
+            "weather": "天气详情页",
+            "alarms": "闹钟与计时器页面",
+            "settings": "设置页面",
+            "music": "音乐设置页面",
+            "night": "夜间模式设置页面",
+        }
+        if screen == "off":
+            self.screen_off_pending = True
+            results.append("好的，即将关闭屏幕")
+        elif screen in screen_names:
+            target_screen = screen
+            results.append(f"已在屏幕上打开{screen_names[screen]}")
+
+        if changed:
+            settings.save()
+        if changed or target_screen:
+            self.ui.emit("ui_sync", screen=target_screen)
+        if not results:
+            return "没有听懂要调整哪项设备设置", False, True
+        return "，".join(results), True, True
+
     def chat_context(self):
         scheduled, _, _ = self.alarms.call_tool("manage_alarm", '{"action":"list"}')
         return (
             f"用户会用“{self.wake_phrase}”称呼你，这就是你的名字。"
             f"设备当前本地时间是{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}。"
             f"{information.current_time()}"
-            f"设备所在城市：{information.home_city()}。"
-            f"当前计划：{scheduled}。"
+            f"设备默认天气城市：{information.home_city()}。"
+            f"{self.device_status_summary()}"
+            f"当前闹钟与计时计划：{scheduled}。"
             + self.music.describe()
         )
 
@@ -1516,6 +1698,10 @@ class ThinkSmartAssistant:
             listing = args.get("action") == "list"
             self.turn_effects.append("info" if listing else "action" if ok else "failed")
             return message, ok, ok and not listing
+        if name == "control_device":
+            message, ok, final = self.run_device_tool(args)
+            self.turn_effects.append("action" if ok else "failed")
+            return message, ok, final
         if name == "end_conversation":
             self.finish_conversation(bool(args.get("screen_off")), bool(args.get("stop_music")))
             return ("" if has_reply else "好的"), True, True
@@ -1646,20 +1832,44 @@ class ThinkSmartAssistant:
         self.next_followup = 0.0
         command = match_command(stripped_text, self.music.active())
         farewell = match_farewell(stripped_text, self.wake_phrase)
-        if re.sub(r"[\s，。！？,.!?]", "", stripped_text) in ("停止闹钟", "关闭闹钟", "停止提醒", "关掉闹钟"):
+        clean_text = re.sub(r"[\s，。！？、,.!?~～…]+", "", stripped_text)
+        snooze_match = SNOOZE_QUERY.match(clean_text)
+        timer_match = None if command else QUICK_TIMER.match(clean_text)
+        if clean_text in ("停止闹钟", "关闭闹钟", "停止提醒", "关掉闹钟", "别响了"):
             dismissed = self.alarms.dismiss()
             self.turn_effects.append("action" if dismissed else "failed")
             reply = "已停止提示音" if dismissed else "现在没有正在响的闹钟或提醒"
+        elif snooze_match:
+            raw_min = snooze_match.group(1) or snooze_match.group(2)
+            minutes = int(parse_cn_number(raw_min) or 5) if raw_min else 5
+            snoozed = self.alarms.snooze(minutes)
+            self.turn_effects.append("action" if snoozed else "failed")
+            reply = snoozed or "现在没有正在响的闹钟或提醒"
         elif farewell:
             self.finish_conversation(farewell == "sleep",
                                      farewell == "sleep" and bool(POWER_OFF_WORDS.search(user_text)))
             reply = "好的"
-        elif self.offline_mode and any(word in user_text for word in ("几点", "几号", "星期")):
+        elif timer_match and parse_cn_number(timer_match.group(1)) is not None:
+            amount = parse_cn_number(timer_match.group(1))
+            unit = timer_match.group(2)
+            if unit.startswith("秒"):
+                args = {"action": "create", "kind": "timer", "seconds": max(1, round(amount))}
+            elif unit.startswith("分"):
+                args = {"action": "create", "kind": "timer", "minutes": int(amount),
+                        "seconds": round((amount - int(amount)) * 60)}
+            else:
+                total_min = max(1, round(amount * 60))
+                args = {"action": "create", "kind": "timer", "hours": total_min // 60, "minutes": total_min % 60}
+            reply, ok, _ = self.alarms.call_tool("manage_alarm", args)
+            self.turn_effects.append("action" if ok else "failed")
+        elif PURE_TIME_QUERY.match(clean_text) or (self.offline_mode and any(word in user_text for word in ("几点", "几号", "星期"))):
             reply = information.current_time()
+            self.turn_effects.append("info")
         elif command:
             logging.info("本地指令：%s %s", *command)
             reply, ok, self.music_started = self.music.run_command(*command, check_cancel=self.check_cancel)
-            self.turn_effects.append("action" if ok else "failed")
+            is_info = command[0] in ("what_song", "what_volume")
+            self.turn_effects.append("info" if (ok and is_info) else "action" if ok else "failed")
         elif self.offline_mode:
             reply = "离线时请说音量调大、音量调小、暂停播放、继续播放、上一首、下一首或现在几点。"
         else:

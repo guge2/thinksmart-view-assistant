@@ -18,13 +18,6 @@ CACHE_ROOT=/var/cache/thinksmart-voice
 MODEL_ARCHIVE="$CACHE_ROOT/$MODEL_NAME.tar.bz2"
 MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/$MODEL_NAME.tar.bz2"
 
-NODE_VERSION=22.23.4
-NODE_NAME="node-v$NODE_VERSION-linux-arm64"
-NODE_URL="${THINKSMART_NODE_MIRROR:-https://npmmirror.com/mirrors/node}/v$NODE_VERSION"
-NODE_ROOT=/opt/node
-AGENT_SRC="$BASE/../agent/dist/agent.mjs"
-AGENT_ROOT=/usr/local/lib/thinksmart-agent
-
 UI_SRC="$BASE/../ui"
 UI_ROOT=/usr/local/lib/thinksmart-ui
 UI_DATA=/data/thinksmart/ui
@@ -54,10 +47,6 @@ for module in $UI_MODULES; do
 		exit 1
 	fi
 done
-if [ ! -f "$AGENT_SRC" ]; then
-	echo "缺少智能体程序：$AGENT_SRC（先在 device/agent 运行 npm install && npm run build）" >&2
-	exit 1
-fi
 for file in thinksmart-clock.py thinksmart-clock-restore.service thinksmart-clock-save.service thinksmart-clock-save.timer; do
 	if [ ! -f "$CLOCK_SRC/$file" ]; then
 		echo "缺少时间服务源文件：$CLOCK_SRC/$file" >&2
@@ -82,8 +71,8 @@ systemctl is-active --quiet thinksmart-wake-request.path && WAKE_ACTIVE=1
 systemctl is-active --quiet thinksmart-volume-keys.service && KEYS_ACTIVE=1
 systemctl is-active --quiet thinksmart-gateway.service && GATEWAY_ACTIVE=1
 systemctl is-active --quiet thinksmart-gateway-maintenance.path && MAINTENANCE_ACTIVE=1
-TARGETS="$APP_ROOT $UI_ROOT $AGENT_ROOT /usr/local/lib/thinksmart-clock
-$NODE_ROOT /etc/thinksmart-voice.conf /etc/thinksmart-ui.conf
+TARGETS="$APP_ROOT $UI_ROOT /usr/local/lib/thinksmart-clock
+/etc/thinksmart-voice.conf /etc/thinksmart-ui.conf
 /etc/thinksmart-voice/wake-phrase $DATA_ROOT/keywords.txt $DATA_ROOT/offline-keywords.txt
 /usr/local/sbin/thinksmart-configure-voice /usr/local/sbin/thinksmart-configure-chat
 /usr/local/sbin/thinksmart-configure-expert /usr/local/sbin/thinksmart-set-wake-word
@@ -138,15 +127,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 runuser -u thinksmart -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable --now pipewire-pulse.socket
 
 # All network-dependent preparation finishes while the old services still run.
-if [ "$("$NODE_ROOT/bin/node" --version 2>/dev/null)" != "v$NODE_VERSION" ]; then
-	NODE_TMP="$STAGE/node-download"
-	rm -rf "$NODE_TMP"
-	install -d -m 0700 "$NODE_TMP"
-	curl -fL --retry 3 -o "$NODE_TMP/$NODE_NAME.tar.gz" "$NODE_URL/$NODE_NAME.tar.gz"
-	curl -fsSL --retry 3 -o "$NODE_TMP/SHASUMS256.txt" "$NODE_URL/SHASUMS256.txt"
-	(cd "$NODE_TMP" && grep " $NODE_NAME.tar.gz$" SHASUMS256.txt | sha256sum -c -)
-	tar -xzf "$NODE_TMP/$NODE_NAME.tar.gz" -C "$NODE_TMP" "$NODE_NAME/bin/node" "$NODE_NAME/LICENSE"
-fi
 python3 -m venv "$STAGE/venv"
 if [ -x "$VENV/bin/pip" ]; then
     "$VENV/bin/pip" freeze > "$STAGE/constraints.txt"
@@ -205,11 +185,6 @@ if [ -e "$VENV" ] || [ -L "$VENV" ]; then
 fi
 VENV_SWAPPED=1
 ln -s "$STAGE/venv" "$VENV"
-if [ -f "$STAGE/node-download/$NODE_NAME/bin/node" ]; then
-    install -d -m 0755 "$NODE_ROOT/bin"
-    install -m 0755 "$STAGE/node-download/$NODE_NAME/bin/node" "$NODE_ROOT/bin/node"
-    install -m 0644 "$STAGE/node-download/$NODE_NAME/LICENSE" "$NODE_ROOT/LICENSE"
-fi
 install -m 0644 "$STAGE/offline-keywords.txt" "$DATA_ROOT/offline-keywords.txt"
 
 install -d -m 0755 "$APP_ROOT" "$DATA_ROOT" "$MODEL_ROOT" "$CACHE_ROOT"
@@ -218,8 +193,6 @@ install -m 0755 "$BASE/assistant.py" "$APP_ROOT/assistant.py"
 install -m 0644 "$BASE/music.py" "$APP_ROOT/music.py"
 install -m 0644 "$BASE/alarms.py" "$APP_ROOT/alarms.py"
 install -m 0644 "$BASE/offline.py" "$BASE/information.py" "$BASE/brain.py" "$BASE/playback.py" "$APP_ROOT/"
-install -d -m 0755 "$AGENT_ROOT"
-install -m 0644 "$AGENT_SRC" "$AGENT_ROOT/agent.mjs"
 install -d -o thinksmart -g thinksmart -m 0700 /data/thinksmart/music
 install -m 0755 "$BASE/configure_voice.py" /usr/local/sbin/thinksmart-configure-voice
 install -m 0755 "$BASE/configure_chat.py" /usr/local/sbin/thinksmart-configure-chat

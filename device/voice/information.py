@@ -16,10 +16,10 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "get_weather",
-        "description": "查询实时天气或未来两天天气。用户询问天气时必须调用，不能自行编造。",
+        "description": "查询实时天气或未来两天天气（含气温、体感、最高最低温、湿度、风速）。用户询问天气、气温、穿衣、带伞时必须调用，不能自行编造。",
         "parameters": {"type": "object", "properties": {
-            "city": {"type": "string", "description": "用户明确指定的城市；未指定则留空，使用屏幕设置的城市"},
-            "day": {"type": "integer", "description": "今天为0，明天为1，后天为2"}}}}},
+            "city": {"type": "string", "description": "用户明确指定的城市；未指定则留空，使用屏幕设置的默认城市"},
+            "day": {"type": "integer", "description": "今天为0，明天为1，后天为2，未来三天全部预报为3"}}}}},
 ]
 
 
@@ -60,6 +60,16 @@ def weather(city="", day=0):
         day = int(day)
     except (TypeError, ValueError):
         day = 0
+    if day == 3:
+        parts = []
+        for idx, label in enumerate(("今天", "明天", "后天")):
+            if idx >= len(data["days"]):
+                break
+            fc = data["days"][idx]
+            code = data["code"] if idx == 0 else fc["code"]
+            desc = ui_system.WEATHER_CODES.get(code, ("天气状况未知",))[0]
+            parts.append(f"{label}{desc}，{fc['min']:.0f}到{fc['max']:.0f}度")
+        return f"{data['name']}未来三天天气：" + "；".join(parts) + "。", True
     if day not in (0, 1, 2) or day >= len(data["days"]):
         return "目前只能查询今天、明天和后天的天气。", False
     forecast = data["days"][day]
@@ -68,7 +78,7 @@ def weather(city="", day=0):
     label = ("现在", "明天", "后天")[day]
     result = f"{data['name']}{label}{description}"
     if day == 0:
-        result += f"，气温{data['temp']:.0f}度，体感{data['feels']:.0f}度"
+        result += f"，气温{data['temp']:.0f}度，体感{data['feels']:.0f}度，湿度{data['humidity']}%，风速{data['wind']:.0f}公里每小时"
     result += f"，{'今天' if day == 0 else '当天'}最高{forecast['max']:.0f}度，最低{forecast['min']:.0f}度。"
     return result, True
 

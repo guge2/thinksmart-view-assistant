@@ -99,10 +99,29 @@ function render(data){
  text('load',data.load?.[0]?.toFixed(2)||'—');
  const memory=Object.values(services).reduce((sum,item)=>sum+(item.memory||0),0);text('memory-note',`相关服务共使用 ${mb(memory)}`);
  const music=s.music||{};text('music-title',music.t||'当前没有播放音乐');text('music-artist',music.a||'通过语音点歌，或继续上次的播放。');pill('music-state',{playing:'播放中',paused:'已暂停',loading:'加载中',stopped:'已停止'}[music.s]||'未播放',music.s==='playing'?'green':'neutral');
+ const sleepRemain=music.sleep&&music.sleep>data.time?Math.max(1,Math.ceil((music.sleep-data.time)/60)):0;
+ text('sleep-button',sleepRemain?`伴睡剩余 ${sleepRemain} 分 · 取消`:'伴睡 30 分');
  if(document.activeElement!==$('volume')&&data.volume!==null){$('volume').value=data.volume;text('volume-output',`${data.volume}%`);}
  text('user-text',s.partial||s.user_text||'暂无对话内容');text('answer-text',s.answer||'唤醒设备后，对话会显示在这里。');
  $('alarm-box').hidden=!s.alarm_active;text('alarm-text',s.alarm_text||'');
+ renderAlarms(s.alarm_items||[],data.time);
  text('restart-count',services.voice?.restarts??'—');levels(h);renderServices(services);
+}
+function renderAlarms(items,nowSec){
+ const box=$('alarm-list');box.replaceChildren();
+ if(!items.length){box.textContent='暂无待响闹钟或计时';return;}
+ const names={alarm:'闹钟',timer:'计时器',reminder:'提醒'};
+ for(const item of items){
+  const row=document.createElement('div');row.className='alarm-item';
+  const info=document.createElement('span');
+  const remain=item.kind==='timer'&&item.due?Math.max(0,Math.round(item.due-nowSec)):null;
+  const when=remain!==null?`${Math.floor(remain/60).toString().padStart(2,'0')}:${(remain%60).toString().padStart(2,'0')}`:(item.time||'');
+  const parts=[names[item.kind]||'提醒',when,item.repeat,item.label].filter(Boolean);
+  info.textContent=parts.join(' · ');
+  const btn=document.createElement('button');btn.textContent='取消';
+  btn.addEventListener('click',()=>mutate('/api/action',{action:'alarm_cancel',id:item.id},btn));
+  row.append(info,btn);box.append(row);
+ }
 }
 async function poll(){
  if(polling||document.hidden)return;polling=true;
@@ -220,6 +239,8 @@ async function loadLogs(){
 }
 document.querySelectorAll('[data-page]').forEach(button=>button.addEventListener('click',()=>setPage(button.dataset.page)));
 document.querySelectorAll('[data-action]').forEach(button=>button.addEventListener('click',()=>mutate('/api/action',{action:button.dataset.action},button)));
+document.querySelectorAll('[data-timer]').forEach(button=>button.addEventListener('click',()=>mutate('/api/action',{action:'timer',minutes:Number(button.dataset.timer)},button)));
+$('sleep-button').addEventListener('click',()=>{const sleep=latest?.snapshot?.music?.sleep;const active=sleep&&sleep>(latest?.time||0);mutate('/api/action',{action:'sleep_timer',minutes:active?0:30},$('sleep-button'));});
 $('mic-button').addEventListener('click',async()=>{if(!latest)return;const result=await mutate('/api/preferences',{mic:!latest.preferences.mic},$('mic-button'));if(result)settingsLoaded=false;});
 $('volume').addEventListener('input',event=>text('volume-output',`${event.target.value}%`));
 $('volume').addEventListener('change',()=>mutate('/api/action',{action:'volume',value:Number($('volume').value)}));

@@ -156,7 +156,11 @@ input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; m
 .conversation p { color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; margin: 4px 0 16px; }
 .speaker { font-size: 12px; color: var(--faint); }
 .speaker.assistant { color: var(--accent); }
-.alarm { padding: 10px 12px; background: var(--amber-soft); border-radius: 8px; color: var(--amber); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.alarm { padding: 10px 12px; background: var(--amber-soft); border-radius: 8px; color: var(--amber); display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.alarm-manager { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 14px; }
+.alarm-list { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+.alarm-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 10px; background: var(--sunken); border-radius: 8px; color: var(--text); }
+.alarm-item button { padding: 4px 10px; font-size: 12px; }
 
 /* Forms */
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 28px; margin-top: 20px; }
