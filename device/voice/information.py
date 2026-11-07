@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -26,6 +27,8 @@ def current_time():
     now = datetime.datetime.now().astimezone()
     weekdays = "一二三四五六日"
     result = f"现在是{now.year}年{now.month}月{now.day}日，星期{weekdays[now.weekday()]}，{now.hour}点{now.minute:02d}分。"
+    if os.path.exists("/run/systemd/timesync/synchronized"):
+        return result
     try:
         result_code = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
                                      capture_output=True, text=True, timeout=3, check=True)

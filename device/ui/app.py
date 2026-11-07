@@ -403,6 +403,7 @@ class App:
         self.error_until = 0.0
         self.notice = None
         self.alarm_active = False
+        self.next_alarm = None
         self.cloud = "unknown"
         self.mic_on = self.settings["mic"]
         self.hardware_mic = None
@@ -820,9 +821,19 @@ class App:
 
     def paint_date(self, d, rect, pressed):
         now = time.localtime()
+        text = f"{now.tm_mon}月{now.tm_mday}日  星期{WEEKDAYS[now.tm_wday]}"
+        alarm = self.next_alarm
+        if isinstance(alarm, dict) and isinstance(alarm.get("due"), (int, float)):
+            remain = max(0, int(alarm["due"] - time.time()))
+            if alarm.get("kind") == "timer" and remain < 3600:
+                text += f"  ·  计时 {remain // 60:02d}:{remain % 60:02d}"
+            elif alarm.get("time"):
+                prefix = "闹钟" if alarm.get("kind") == "alarm" else "提醒"
+                text += f"  ·  {prefix} {alarm['time']}"
+        font = self.fonts.ui(28)
         d.text((rect[0] + 10, (rect[1] + rect[3]) // 2),
-               f"{now.tm_mon}月{now.tm_mday}日  星期{WEEKDAYS[now.tm_wday]}",
-               font=self.fonts.ui(28), fill=DIM, anchor="lm")
+               self.fit(text, font, rect[2] - rect[0] - 10),
+               font=font, fill=DIM, anchor="lm")
 
     def paint_weather(self, d, rect, pressed):
         x0, y0, x1, y1 = rect
@@ -1426,9 +1437,13 @@ class App:
         elif self.phase in ACTIVE:
             self.link.send("stop")
 
+    def save_settings(self, **values):
+        self.settings.update(**values)
+        self.applied_settings = dict(self.settings.data)
+
     def toggle_mic(self, *_args):
         enabled = not self.settings["mic"]
-        self.settings.update(mic=enabled)
+        self.save_settings(mic=enabled)
         self.mic_on = enabled and self.hardware_mic is not False
         if enabled and self.hardware_mic is False:
             self.set_notice("请先拨开机身侧面的麦克风开关", WARN, 6)
@@ -1442,19 +1457,19 @@ class App:
     def toggle_night(self, *_args):
         night = dict(self.settings["night"])
         night["enabled"] = not night["enabled"]
-        self.settings.update(night=night)
+        self.save_settings(night=night)
         self.send_prefs()
         self.dirty |= {"night_toggle", "night"}
 
     def change_night_time(self, field, delta):
         night = dict(self.settings["night"])
         night[field] = (night[field] + delta) % 1440
-        self.settings.update(night=night)
+        self.save_settings(night=night)
         self.send_prefs()
         self.dirty |= {field + "_time", "night_hint"}
 
     def toggle_thinking(self, *_args):
-        self.settings.update(thinking=not self.settings["thinking"])
+        self.save_settings(thinking=not self.settings["thinking"])
         self.send_prefs()
         self.dirty.add("think")
 
@@ -1463,7 +1478,7 @@ class App:
         if phase == "up":
             self.rate_drag = None
             if rate != self.settings["speech_rate"]:
-                self.settings.update(speech_rate=rate)
+                self.save_settings(speech_rate=rate)
                 self.send_prefs()
         else:
             self.rate_drag = rate
@@ -1472,7 +1487,7 @@ class App:
     def cycle_dim(self, *_args):
         current = self.settings["dim_after"]
         index = DIM_CHOICES.index(current) if current in DIM_CHOICES else 0
-        self.settings.update(dim_after=DIM_CHOICES[(index + 1) % len(DIM_CHOICES)])
+        self.save_settings(dim_after=DIM_CHOICES[(index + 1) % len(DIM_CHOICES)])
         self.dirty.add("dim")
 
     def drag_volume(self, x, y, phase):
@@ -1485,9 +1500,14 @@ class App:
         if not self.status.backlight.writable():
             return
         self.brightness = max(5, self.slider_value("brightness", x))
-        self.update_dim(time.monotonic())
         if phase == "up":
-            self.settings.update(brightness=self.brightness)
+            self.save_settings(brightness=self.brightness)
+            if self.night_active() and self.brightness > 20:
+                self.set_notice("日常亮度已保存，夜间模式中限制为 20%", DIM, 5)
+            self.update_dim(time.monotonic())
+        else:
+            self.applied_brightness = self.brightness
+            self.status.set_brightness(self.brightness)
         self.dirty.add("brightness")
 
     def open_keyboard(self, purpose):
@@ -1603,7 +1623,7 @@ class App:
         if index >= len(places):
             return
         place = places[index]
-        self.settings.update(location={"name": place["name"], "lat": place["lat"], "lon": place["lon"]})
+        self.save_settings(location={"name": place["name"], "lat": place["lat"], "lon": place["lon"]})
         self.status.refresh_weather()
         self.set_notice(f"天气城市已设为{place['name']}", GOOD, 6)
         self.screen = "settings"
@@ -1643,6 +1663,7 @@ class App:
             self.user_text = str(message.get("user_text") or "")[-2000:]
             self.answer = str(message.get("answer") or "")[-4000:]
             self.alarm_active = bool(message.get("alarm_active"))
+            self.next_alarm = message.get("alarms") if isinstance(message.get("alarms"), dict) else None
             if self.alarm_active and self.phase not in ACTIVE:
                 self.answer = str(message.get("alarm_text") or "")
             self.mic_on = bool(message.get("mic"))
@@ -1719,8 +1740,13 @@ class App:
             self.lyric_times = [line[0] for line in self.lyric_lines]
             self.lyric_index = -2
             return
+        if event == "alarms":
+            self.next_alarm = message.get("next") if isinstance(message.get("next"), dict) else None
+            self.dirty.add("date")
+            return
         if event == "alarm":
             self.activity(now)
+            self.cancel_login()
             self.screen = "home"
             self.user_text = ""
             self.partial = ""
@@ -1763,6 +1789,8 @@ class App:
             self.dirty.add("answer")
         elif event == "idle":
             if self.phase in ACTIVE:
+                if self.answer:
+                    self.conv_until = max(self.conv_until, now + 4.0)
                 self.set_phase("idle", now)
         elif event == "nospeech":
             self.show_error("nospeech", now, 3)
@@ -1861,9 +1889,12 @@ class App:
                 self.settings.data = saved
                 self.applied_settings = dict(saved)
                 self.brightness = saved["brightness"] or self.brightness
+                if saved["brightness"] != previous["brightness"]:
+                    self.activity(now)
                 if saved["location"] != previous["location"]:
                     self.status.refresh_weather()
                 if saved["mic"] != previous["mic"]:
+                    self.mic_on = saved["mic"] and self.hardware_mic is not False
                     self.link.send("mic", on=int(saved["mic"]))
                 self.send_prefs()
                 self.full_redraw = True
@@ -1871,6 +1902,10 @@ class App:
         if clock != self.clock_key:
             self.clock_key = clock
             self.dirty |= {"clock", "date"}
+        elif (isinstance(self.next_alarm, dict) and self.next_alarm.get("kind") == "timer"
+              and isinstance(self.next_alarm.get("due"), (int, float))
+              and self.next_alarm["due"] - time.time() < 3600):
+            self.dirty.add("date")
         if now >= self.next_voice_check:
             self.next_voice_check = now + 2
             self.ping_seq += 1

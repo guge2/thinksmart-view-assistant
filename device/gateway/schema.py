@@ -3,8 +3,8 @@ import re
 from pathlib import Path
 
 VOICE_FIELDS = {
-    "kws_score": ("THINKSMART_KWS_SCORE", 4.0, 1.0, 10.0),
-    "kws_threshold": ("THINKSMART_KWS_THRESHOLD", 0.05, 0.01, 0.9),
+    "kws_score": ("THINKSMART_KWS_SCORE", 1.0, 1.0, 10.0),
+    "kws_threshold": ("THINKSMART_KWS_THRESHOLD", 0.25, 0.01, 0.9),
     "speech_wait_seconds": ("THINKSMART_SPEECH_WAIT_SECONDS", 8.0, 3.0, 20.0),
     "max_speech_seconds": ("THINKSMART_MAX_SPEECH_SECONDS", 25.0, 5.0, 60.0),
     "followup_seconds": ("THINKSMART_FOLLOWUP_SECONDS", 4.0, 0.0, 15.0),

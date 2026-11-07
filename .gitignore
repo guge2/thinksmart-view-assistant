@@ -40,7 +40,9 @@ qq-device*.json
 /tools/aec-build/
 /tools/webrtc-audio-processing/
 /tools/pipewire/
-/outputs/audio/
+/tools/zig/
+/tools/extfs/
+/outputs/
 
 # Vendor kernel module and amplifier firmware (not redistributable)
 /device/audio/*.ko

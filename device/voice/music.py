@@ -123,12 +123,17 @@ def plain(text):
     return re.sub(r"[\W_]+", "", text).lower()
 
 
-def clean_query(text):
-    query = re.sub(r"^(?:一首|一下|首|点)", "", text)
-    query = re.sub(r"(?:吧|呗|好吗|可以吗|好不好)$", "", query)
-    if query in FAVORITE_WORDS or re.sub(r"的?(?:歌曲?|音乐)$", "", query) in FAVORITE_WORDS:
+def clean_query(text, from_tool=False):
+    if from_tool:
+        query = re.sub(r"\s+", " ", str(text or "")).strip()
+        query = re.sub(r"^[，。！？、；：,.!?;:~～…“”\"'‘’《》〈〉【】\[\]()（）]+|[，。！？、；：,.!?;:~～…“”\"'‘’《》〈〉【】\[\]()（）]+$", "", query).strip()
+    else:
+        query = re.sub(r"^(?:一首|一下|首|点)", "", text)
+        query = re.sub(r"(?:吧|呗|好吗|可以吗|好不好)$", "", query)
+    compact = _PUNCT.sub("", query)
+    if compact in FAVORITE_WORDS or re.sub(r"的?(?:歌曲?|音乐)$", "", compact) in FAVORITE_WORDS:
         return "我喜欢"
-    return "" if query in GENERIC_WORDS else query
+    return "" if compact in GENERIC_WORDS else query
 
 
 def match_command(text, music_active):
@@ -188,8 +193,9 @@ def unique_titles(tracks):
     seen = set()
     result = []
     for track in tracks:
-        key = plain(track["title"])
-        if key and key not in seen:
+        title = plain(track["title"])
+        key = (title, plain(track.get("artist") or ""))
+        if title and key not in seen:
             seen.add(key)
             result.append(track)
     return result
@@ -267,6 +273,9 @@ class Download:
         try:
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=15) as response:
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if response.url.rstrip("/").endswith("/404") or "text/html" in content_type:
+                    raise RuntimeError("stream redirected to non-audio page")
                 while not self.cancelled:
                     data = response.read(CHUNK)
                     if not data:
@@ -417,7 +426,10 @@ class Player:
         with self.lock:
             if not self.queue:
                 return False
-            self.index = max(0, min(len(self.queue), self.index + delta))
+            if delta < 0 and self.index == 0 and len(self.queue) > 1:
+                self.index = len(self.queue) - 1
+            else:
+                self.index = max(0, min(len(self.queue), self.index + delta))
             self.paused = False
             self.interrupt_locked("loading")
         self.changed()
@@ -455,6 +467,11 @@ class Player:
                         if self.mode == "shuffle":
                             random.shuffle(more)
                         self.queue.extend(more)
+                        continue
+                    if self.queue and failures == 0:
+                        self.index = 0
+                        if self.mode == "shuffle":
+                            random.shuffle(self.queue)
                         continue
                     self.state = "stopped"
                 self.changed()
@@ -510,7 +527,7 @@ class Player:
             while alive():
                 if self.paused:
                     replay = self.pause_output(rate, channels)
-                    frames -= len(replay) // (2 * channels)
+                    frames = max(0, frames - len(replay) // (2 * channels))
                     pending = replay + pending
                     with self.lock:
                         while self.paused and alive():
@@ -551,13 +568,15 @@ class Player:
                             break
                         if download.error is not None:
                             logging.warning("歌曲下载失败：%s", download.error)
-                            if not written:
-                                return "failed"
+                        if not written:
+                            return "failed"
                         self.finish_output()
                         return "ended"
                     fed += 1
                     decoder.feed(chunk)
                 elif code == Mpg123.DONE:
+                    if not written:
+                        return "failed"
                     self.finish_output()
                     return "ended"
                 elif code < 0 and code != Mpg123.OK:
@@ -685,8 +704,13 @@ class Source:
         """Returns this source's copy of a track from another source, or None."""
         artist = track["artist"].split("/")[0]
         wanted_title, wanted_artist = plain(track["title"]), plain(artist)
-        for candidate in self.search(f"{track['title']} {artist}", 10):
+        candidates = self.search(f"{track['title']} {artist}", 10)
+        for candidate in candidates:
             if plain(candidate["title"]) == wanted_title and wanted_artist in plain(candidate["artist"]):
+                return candidate
+        for candidate in candidates:
+            raw = re.sub(r"[\W_]+", "", f"{candidate['title']} {candidate['artist']}").lower()
+            if plain(candidate["title"]) == wanted_title and (not wanted_artist or wanted_artist in raw):
                 return candidate
         return None
 
@@ -694,6 +718,7 @@ class Source:
 class Netease(Source):
     name = "163"
     label = "网易云音乐"
+    FALLBACK_QUERIES = ("华语经典", "流行热歌", "周杰伦", "陈奕迅", "林俊杰", "孙燕姿", "邓紫棋", "轻音乐")
 
     def search(self, keyword, limit=20):
         data = urllib.parse.urlencode({"s": keyword, "type": 1, "limit": limit, "offset": 0}).encode()
@@ -718,8 +743,28 @@ class Netease(Source):
                 continue
         return tracks
 
+    def recommend(self):
+        return self.search(random.choice(self.FALLBACK_QUERIES), 20)
+
+    def lyric(self, track):
+        request = urllib.request.Request(
+            f"https://music.163.com/api/song/lyric?id={track['id']}&lv=1", headers=NETEASE_HEADERS,
+        )
+        with urllib.request.urlopen(request, timeout=6) as response:
+            payload = json.loads(response.read(262144).decode("utf-8"))
+        return str((payload.get("lrc") or {}).get("lyric") or "")
+
     def stream(self, track):
-        return f"https://music.163.com/song/media/outer/url?id={track['id']}.mp3", NETEASE_HEADERS
+        url = f"https://music.163.com/song/media/outer/url?id={track['id']}.mp3"
+        request = urllib.request.Request(url, headers=NETEASE_HEADERS)
+        try:
+            with urllib.request.urlopen(request, timeout=6) as response:
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if response.url.rstrip("/").endswith("/404") or "text/html" in content_type:
+                    return None, None
+                return response.url, NETEASE_HEADERS
+        except OSError:
+            return None, None
 
 
 class QQMusic(Source):
@@ -1250,7 +1295,7 @@ class MusicService:
         if not isinstance(args, dict):
             args = {}
         if name == "play_music":
-            reply, started = self.play_query(clean_query(_PUNCT.sub("", str(args.get("query") or ""))), check_cancel)
+            reply, started = self.play_query(clean_query(args.get("query"), from_tool=True), check_cancel)
             return reply, started, started
         if name == "control_music":
             action = str(args.get("action") or "")

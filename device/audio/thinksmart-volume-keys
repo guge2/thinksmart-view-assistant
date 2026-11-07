@@ -54,10 +54,10 @@ def main():
                         target.write("1\n" if enabled else "0\n")
                     os.replace(STATE + ".new", STATE)
                     last_mic = enabled
-                try:
-                    sock.sendto(b'{"c":"hardware_mic"}', CONTROL)
-                except OSError:
-                    pass
+                    try:
+                        sock.sendto(b'{"c":"hardware_mic"}', CONTROL)
+                    except OSError:
+                        pass
             except OSError:
                 os.close(fd)
                 devices.pop(fd, None)

@@ -47,9 +47,9 @@ class OfflineCommands:
             stream.accept_waveform(16000, assistant.pcm_to_floats(frame))
             while self.spotter.is_ready(stream):
                 self.spotter.decode_stream(stream)
-            result = self.spotter.get_result(stream)
-            if result:
-                return result
+                result = self.spotter.get_result(stream)
+                if result:
+                    return result
         return ""
 
 

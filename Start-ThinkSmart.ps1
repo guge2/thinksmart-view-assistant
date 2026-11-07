@@ -21,6 +21,6 @@ if (-not (Test-Path -LiteralPath $knownHosts -PathType Leaf)) {
     -o "UserKnownHostsFile=$knownHosts" `
     -o 'IdentitiesOnly=yes' `
     -i $sshKey `
-    'thinksmart@192.168.0.107'
+    'thinksmart@192.168.0.109'
 
 exit $LASTEXITCODE

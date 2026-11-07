@@ -53,7 +53,9 @@ table.insert(alsa_monitor.rules, {
     -- At 2048 the fill dipped to one period, and a stream joining or leaving
     -- the graph (music paused for a conversation) underran it several times in a row.
     ["api.alsa.disable-batch"] = true,
-    ["api.alsa.period-size"] = 1024,
+    -- Keep stream joins and departures from changing the AEC graph quantum.
+    ["node.force-quantum"] = 960,
+    ["api.alsa.period-size"] = 960,
     ["api.alsa.headroom"] = 4096,
   },
 })

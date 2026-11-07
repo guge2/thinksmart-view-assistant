@@ -8,8 +8,22 @@ fi
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KERNEL=$(uname -r)
 AEC_PLUGIN=${AEC_PLUGIN:-"$BASE/../../outputs/audio/libspa-aec-thinksmart.so"}
+AMP_MODULE=${AMP_MODULE:-}
+if [ -z "$AMP_MODULE" ]; then
+	for candidate in "$BASE/snd-soc-tas5782m.ko" "$BASE/snd-soc-tas5782m-dbg.ko"; do
+		[ -s "$candidate" ] || continue
+		case "$(modinfo -F vermagic "$candidate")" in
+			"$KERNEL "*) AMP_MODULE=$candidate; break ;;
+		esac
+	done
+fi
+[ -n "$AMP_MODULE" ] || { echo "缺少与运行内核 $KERNEL 匹配的 TAS5782M 模块" >&2; exit 1; }
+case "$(modinfo -F vermagic "$AMP_MODULE")" in
+	"$KERNEL "*) ;;
+	*) echo "TAS5782M 模块与运行内核 $KERNEL 不匹配" >&2; exit 1 ;;
+esac
 
-for required in "$AEC_PLUGIN" "$BASE/snd-soc-tas5782m.ko" "$BASE/tas5728m_dsp_lenovo_cd-18781y.bin"; do
+for required in "$AEC_PLUGIN" "$AMP_MODULE" "$BASE/tas5728m_dsp_lenovo_cd-18781y.bin"; do
 	[ -s "$required" ] || { echo "缺少音频安装文件：$required" >&2; exit 1; }
 done
 VOICE_ACTIVE=0
@@ -29,7 +43,7 @@ install -D -m 0644 "$AEC_PLUGIN" /usr/lib/aarch64-linux-gnu/spa-0.2/aec/libspa-a
 install -d /usr/local/share/thinksmart-aec/licenses
 install -m 0644 "$(dirname -- "$AEC_PLUGIN")"/licenses/*.txt /usr/local/share/thinksmart-aec/licenses/
 
-install -D -m 0644 "$BASE/snd-soc-tas5782m.ko" "/lib/modules/$KERNEL/extra/snd-soc-tas5782m.ko"
+install -D -m 0644 "$AMP_MODULE" "/lib/modules/$KERNEL/extra/$(basename -- "$AMP_MODULE")"
 install -D -m 0644 "$BASE/tas5728m_dsp_lenovo_cd-18781y.bin" /lib/firmware/tas5728m_dsp_lenovo_cd-18781y.bin
 ln -sfn tas5728m_dsp_lenovo_cd-18781y.bin /lib/firmware/tas5728m_dsp_default.bin
 
@@ -57,7 +71,7 @@ loginctl enable-linger thinksmart
 systemctl daemon-reload
 systemctl enable qup-i2c-pinctrl-fix.service
 systemctl start qup-i2c-pinctrl-fix.service
-modprobe snd_soc_tas5782m
+modprobe i2c:tas5782m
 systemctl start user@1000.service
 systemctl enable --now thinksmart-volume-keys.service
 

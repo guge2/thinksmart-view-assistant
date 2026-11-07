@@ -19,5 +19,5 @@ if [ -e "$QUP_PATH/power/control" ]; then
 	printf '%s' on > "$QUP_PATH/power/control"
 fi
 
-modprobe snd_soc_tas5782m
+modprobe i2c:tas5782m
 

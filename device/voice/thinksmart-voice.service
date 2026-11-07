@@ -10,6 +10,7 @@ User=thinksmart
 Group=thinksmart
 SupplementaryGroups=audio
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=HOME=/tmp
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/thinksmart-voice.conf

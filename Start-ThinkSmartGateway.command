@@ -5,7 +5,7 @@ umask 077
 mkdir -p work/gateway
 key="$PWD/.local/ssh/thinksmart-admin"
 hosts="$PWD/.local/ssh/known_hosts"
-device=thinksmart@192.168.0.107
+device=thinksmart@192.168.0.109
 port=${THINKSMART_GATEWAY_PORT:-18781}
 case "$port" in *[!0-9]*|'') echo '端口必须是数字。' >&2; exit 1;; esac
 control="$PWD/work/gateway/ssh-control-$port"
@@ -22,6 +22,7 @@ if ! ssh -S "$control" -O check "$device" >/dev/null 2>&1; then
         -o BatchMode=yes -o ConnectTimeout=8 -o ExitOnForwardFailure=yes \
         -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
         -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$hosts" -o IdentitiesOnly=yes \
+        -o HostKeyAlias=192.168.0.107 \
         -i "$key" -L "127.0.0.1:$port:127.0.0.1:8787" "$device"
 fi
 url="http://127.0.0.1:$port/"

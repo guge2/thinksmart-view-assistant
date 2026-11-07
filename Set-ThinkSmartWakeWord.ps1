@@ -22,7 +22,7 @@ $remoteCommand = "printf '%s' '$encoded' | base64 -d | sudo -n /usr/local/sbin/t
     -o "UserKnownHostsFile=$knownHosts" `
     -o 'IdentitiesOnly=yes' `
     -i $sshKey `
-    'thinksmart@192.168.0.107' `
+    'thinksmart@192.168.0.109' `
     $remoteCommand
 
 exit $LASTEXITCODE

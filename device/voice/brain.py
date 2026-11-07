@@ -17,6 +17,9 @@ class Brain:
         self.config = config
         profile_fields = ('apiKey', 'api', 'provider', 'baseUrl', 'maxTokens', 'contextWindow')
         self.profiles = {config['provider']: {key: config.get(key) for key in profile_fields}}
+        bailian = config.get('bailian', {})
+        if bailian.get('apiKey') and 'bailian' not in self.profiles:
+            self.profiles['bailian'] = {key: bailian.get(key) for key in profile_fields}
         expert = config.get('expert', {})
         if expert.get('provider') == 'openai' and expert.get('apiKey') and 'openai' not in self.profiles:
             self.profiles['openai'] = {key: expert.get(key) for key in profile_fields}

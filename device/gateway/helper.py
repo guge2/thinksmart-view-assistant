@@ -57,7 +57,8 @@ def safe_config():
             data[name + '_model'] = saved.get('model', '')
             data[name + '_provider'] = saved.get('provider', 'bailian' if name == 'chat' else 'openai')
             if name == 'chat':
-                data['chat_services'] = [data['chat_provider']]
+                if data['chat_provider'] not in data['chat_services']:
+                    data['chat_services'].append(data['chat_provider'])
             if name == 'expert':
                 data['expert_configured'] = bool(saved.get('api_key'))
     if data['expert_configured'] and data['expert_provider'] == 'openai' and 'openai' not in data['chat_services']:
@@ -160,6 +161,13 @@ def main():
             result = publish_config()
         elif action == 'configure':
             result = configure(request.get('values'))
+        elif action == 'wake_word':
+            phrase = request.get('phrase')
+            if not isinstance(phrase, str) or not re.fullmatch(r'[\u4e00-\u9fff]{2,8}', phrase):
+                raise ValueError('唤醒词需要2到8个汉字')
+            run('/usr/local/sbin/thinksmart-set-wake-word', phrase)
+            ready_voice()
+            result = {'phrase': phrase}
         elif action == 'restart' and request.get('target') in SERVICES:
             target = request['target']
             run('/usr/bin/systemctl', 'restart', SERVICES[target])

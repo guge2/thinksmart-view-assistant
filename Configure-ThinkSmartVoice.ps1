@@ -49,7 +49,7 @@ try {
         -o "UserKnownHostsFile=$knownHosts" `
         -o 'IdentitiesOnly=yes' `
         -i $sshKey `
-        'thinksmart@192.168.0.107' `
+        'thinksmart@192.168.0.109' `
         'base64 -d -i | sudo -n /usr/local/sbin/thinksmart-configure-voice'
 
     $result = $LASTEXITCODE

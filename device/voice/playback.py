@@ -20,6 +20,24 @@ class BufferAttr(C.Structure):
 
 
 class PCMPlayer:
+    _lib = None
+
+    @classmethod
+    def library(cls):
+        if cls._lib is None:
+            lib = C.CDLL("libpulse-simple.so.0")
+            lib.pa_simple_new.restype = C.c_void_p
+            lib.pa_simple_new.argtypes = [C.c_char_p, C.c_char_p, C.c_int, C.c_char_p, C.c_char_p,
+                                          C.POINTER(SampleSpec), C.c_void_p, C.POINTER(BufferAttr), C.c_void_p]
+            lib.pa_simple_write.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t, C.c_void_p]
+            lib.pa_simple_get_latency.argtypes = [C.c_void_p, C.c_void_p]
+            lib.pa_simple_get_latency.restype = C.c_uint64
+            lib.pa_simple_flush.argtypes = [C.c_void_p, C.c_void_p]
+            lib.pa_simple_drain.argtypes = [C.c_void_p, C.c_void_p]
+            lib.pa_simple_free.argtypes = [C.c_void_p]
+            cls._lib = lib
+        return cls._lib
+
     def __init__(self, rate, gain=1.0):
         self.rate = rate
         self.gain = gain
@@ -80,24 +98,18 @@ class PCMPlayer:
     def _run(self):
         stream = None
         try:
-            subprocess.run(
-                ["/usr/bin/systemctl", "--user", "start", "pipewire-pulse.socket", "pipewire-pulse.service"],
-                check=True, capture_output=True, timeout=8,
-            )
-            lib = C.CDLL("libpulse-simple.so.0")
-            lib.pa_simple_new.restype = C.c_void_p
-            lib.pa_simple_new.argtypes = [C.c_char_p, C.c_char_p, C.c_int, C.c_char_p, C.c_char_p,
-                                         C.POINTER(SampleSpec), C.c_void_p, C.POINTER(BufferAttr), C.c_void_p]
-            lib.pa_simple_write.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t, C.c_void_p]
-            lib.pa_simple_get_latency.argtypes = [C.c_void_p, C.c_void_p]
-            lib.pa_simple_get_latency.restype = C.c_uint64
-            lib.pa_simple_flush.argtypes = [C.c_void_p, C.c_void_p]
-            lib.pa_simple_drain.argtypes = [C.c_void_p, C.c_void_p]
-            lib.pa_simple_free.argtypes = [C.c_void_p]
+            lib = self.library()
             spec = SampleSpec(3, self.rate, 1)  # PA_SAMPLE_S16LE
             attrs = BufferAttr(0xffffffff, self.rate * 2 // 5, 0xffffffff, 0xffffffff, 0xffffffff)
             stream = self._call(lib.pa_simple_new, None, b"ThinkSmart Assistant", 1, None, b"Assistant",
-                                       C.byref(spec), None, C.byref(attrs), None)
+                                C.byref(spec), None, C.byref(attrs), None)
+            if not stream:
+                subprocess.run(
+                    ["/usr/bin/systemctl", "--user", "start", "pipewire-pulse.socket", "pipewire-pulse.service"],
+                    check=True, capture_output=True, timeout=8,
+                )
+                stream = self._call(lib.pa_simple_new, None, b"ThinkSmart Assistant", 1, None, b"Assistant",
+                                    C.byref(spec), None, C.byref(attrs), None)
             if not stream:
                 raise RuntimeError("speaker stream could not open")
             written = 0

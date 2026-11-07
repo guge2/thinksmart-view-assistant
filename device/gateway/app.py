@@ -16,7 +16,7 @@ from aiohttp import web
 from schema import SERVICES, MODEL_FIELDS, preferences, voice_values, tts_pair, number, config_revision
 
 sys.path.insert(0, '/usr/local/lib/thinksmart-ui')
-from system import Settings, read_volume, write_volume, request_wake_word, read_wake_phrase, WAKE_PATTERN
+from system import Backlight, Settings, read_volume, write_volume, read_wake_phrase, WAKE_PATTERN
 
 RUNTIME = Path('/run/thinksmart-gateway')
 WEB = Path(__file__).parent / 'web'
@@ -76,6 +76,13 @@ class Gateway:
         self.services_at = 0.0
         self.volume = None
         self.volume_at = 0.0
+        self.backlight = Backlight()
+
+    def current_preferences(self):
+        prefs = Settings().data
+        if prefs.get('brightness') is None:
+            prefs['brightness'] = self.backlight.read_percent() or 80
+        return prefs
 
     async def root_action(self, action, **fields):
         async with self.maintenance:
@@ -144,7 +151,7 @@ class Gateway:
                 self.volume_at = time.monotonic()
             self.cache = {'version': VERSION, 'time': time.time(), 'health': health, 'snapshot': snapshot,
                           'services': services, 'volume': self.volume, 'wake_word': read_wake_phrase(),
-                          'preferences': Settings().data, 'load': list(os.getloadavg()),
+                          'preferences': self.current_preferences(), 'load': list(os.getloadavg()),
                           'maintenance': self.busy}
             try:
                 saved = json.loads((RUNTIME / 'config-view.json').read_text())
@@ -214,7 +221,7 @@ def make_app():
                 saved = await gateway.root_action('read')
         except (OSError, ValueError):
             saved = await gateway.root_action('read')
-        return web.json_response({'preferences': Settings().data, 'voice': saved})
+        return web.json_response({'preferences': gateway.current_preferences(), 'voice': saved})
 
     async def save_preferences(request):
         values = preferences(await request.json())
@@ -282,20 +289,8 @@ def make_app():
         phrase = body.get('phrase') if isinstance(body, dict) else None
         if not isinstance(phrase, str) or not WAKE_PATTERN.fullmatch(phrase):
             raise ValueError('唤醒词需要2到8个汉字')
-        async with gateway.maintenance:
-            if not request_wake_word(phrase):
-                raise ValueError('无法提交唤醒词，请先确认屏幕服务运行正常')
-            deadline = time.monotonic() + 35
-            while time.monotonic() < deadline:
-                await asyncio.sleep(.5)
-                try:
-                    state = await voice('snapshot')
-                    if state.get('wake') == phrase and read_wake_phrase() == phrase:
-                        gateway.cache_at = 0
-                        return web.json_response({'ok': True, 'message': '新唤醒词已生效'})
-                except (OSError, RuntimeError, asyncio.TimeoutError):
-                    pass
-            raise ValueError('尚未确认新唤醒词生效，请查看语音服务状态')
+        await gateway.root_action('wake_word', phrase=phrase)
+        return web.json_response({'ok': True, 'message': '新唤醒词已生效'})
 
     async def logs(request):
         target = request.query.get('target', 'voice')

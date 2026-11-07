@@ -7,7 +7,7 @@ $sshExe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
 $scpExe = Join-Path $env:SystemRoot 'System32\OpenSSH\scp.exe'
 $sshOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=yes',
     '-o', 'UserKnownHostsFile=.local/ssh/known_hosts', '-i', '.local/ssh/thinksmart-admin')
-$device = 'thinksmart@192.168.0.107'
+$device = 'thinksmart@192.168.0.109'
 $stage = '/data/thinksmart/proxy-upload'
 
 function Check-Exit {

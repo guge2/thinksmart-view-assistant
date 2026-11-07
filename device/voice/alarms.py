@@ -165,9 +165,10 @@ def plan_time(args, kind, now):
 class AlarmService:
     tools = TOOLS
 
-    def __init__(self, emit=None, state_file=STATE_FILE):
+    def __init__(self, emit=None, state_file=STATE_FILE, on_ring=None):
         self.emit = emit
         self.state_file = state_file
+        self.on_ring = on_ring
         self.lock = threading.RLock()
         self.stopped = threading.Event()
         self.silence = threading.Event()
@@ -177,6 +178,43 @@ class AlarmService:
         self.monotonic_due = {}
         self.retry_after = {}
         self.items = self._load()
+        self._prune_stale(time.time())
+
+    def next_summary(self):
+        with self.lock:
+            if not self.items:
+                return None
+            earliest = min(self.items, key=lambda item: item["due"])
+            when = dt.datetime.fromtimestamp(earliest["due"]).strftime("%H:%M")
+            return {"kind": earliest["kind"], "due": round(earliest["due"], 1),
+                    "time": when, "label": earliest.get("label") or ""}
+
+    def announce(self):
+        if self.emit:
+            self.emit("alarms", next=self.next_summary())
+
+    def _prune_stale(self, now):
+        if now < 1704067200:
+            return
+        changed = False
+        for item in list(self.items):
+            if item["id"] in self.monotonic_due or item["due"] >= now - 600:
+                continue
+            if item.get("month_day"):
+                item["due"] = _next_monthday(item["due"], item["month_day"], now)
+                changed = True
+            elif item.get("weekdays"):
+                item["due"] = _next_weekday(item["due"], item["weekdays"], now)
+                changed = True
+            else:
+                logging.info("跳过断电期间过期的单次闹钟或提醒：%s", item["id"])
+                self.items.remove(item)
+                changed = True
+        if changed:
+            try:
+                self._save()
+            except OSError:
+                logging.warning("清理过期闹钟后保存失败")
 
     def _load(self):
         try:
@@ -285,6 +323,7 @@ class AlarmService:
             self.retry_after.pop(item["id"], None)
             if self.ringing_id == item["id"]:
                 self.silence.set()
+            self.announce()
             return f"已取消{_describe(item, with_id=False)}"
         if action != "create":
             raise ValueError("不支持这个操作")
@@ -314,16 +353,19 @@ class AlarmService:
             raise
         if seconds is not None:
             self.monotonic_due[ident] = time.monotonic() + seconds
+        self.announce()
         result = f"已设置{_describe(item, with_id=False)}"
         if seconds is None:
-            try:
-                status = subprocess.run(
-                    ["/usr/bin/timedatectl", "show", "-p", "NTPSynchronized", "--value"],
-                    capture_output=True, text=True, timeout=3, check=True,
-                )
-                synchronized = status.stdout.strip() == "yes"
-            except (OSError, subprocess.SubprocessError):
-                synchronized = False
+            synchronized = os.path.exists("/run/systemd/timesync/synchronized")
+            if not synchronized:
+                try:
+                    status = subprocess.run(
+                        ["/usr/bin/timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                        capture_output=True, text=True, timeout=3, check=True,
+                    )
+                    synchronized = status.stdout.strip() == "yes"
+                except (OSError, subprocess.SubprocessError):
+                    synchronized = False
             if not synchronized:
                 result += "。设备时间尚未与网络同步，到时可能不准确"
         return result
@@ -332,6 +374,7 @@ class AlarmService:
         while not self.stopped.wait(0.5):
             with self.lock:
                 now = time.time()
+                self._prune_stale(now)
                 mono = time.monotonic()
                 due = next((item for item in sorted(self.items, key=lambda item: item["due"]) if
                             mono >= self.retry_after.get(item["id"], 0) and
@@ -343,12 +386,22 @@ class AlarmService:
                 self.ringing_id = due["id"]
                 self.silence.clear()
             delivered = False
+            if self.on_ring:
+                try:
+                    self.on_ring(True)
+                except Exception:
+                    pass
             try:
                 if self.emit:
                     self.emit("alarm", text=(due.get("label") or NAMES[due["kind"]]) + "时间到了")
                 if due.get("label"):
-                    self._announce(due["label"] + "时间到了")
-                self._ring()
+                    for _ in range(3):
+                        if self.silence.is_set() or self.stopped.is_set():
+                            break
+                        self._announce(due["label"] + "时间到了")
+                        self._ring(cycles=30)
+                else:
+                    self._ring(cycles=100)
                 delivered = True
             except Exception:
                 logging.exception("闹钟提示失败")
@@ -379,10 +432,16 @@ class AlarmService:
                         else:
                             self.monotonic_due.pop(due["id"], None)
                             self.retry_after.pop(due["id"], None)
+                self.announce()
                 if self.emit:
                     self.emit("alarm_end")
+                if self.on_ring:
+                    try:
+                        self.on_ring(False)
+                    except Exception:
+                        pass
 
-    def _ring(self):
+    def _ring(self, cycles=100):
         if self.silence.is_set() or self.stopped.is_set():
             return
         rate = 24000
@@ -400,7 +459,7 @@ class AlarmService:
         step = rate * 2 // 10
         chunks = [tone[offset:offset + step] for offset in range(0, len(tone), step)]
         try:
-            for chunk in chunks * 100:
+            for chunk in chunks * cycles:
                 if self.silence.is_set() or self.stopped.is_set():
                     break
                 process.stdin.write(chunk)

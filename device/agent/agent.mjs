@@ -116,7 +116,7 @@ function setup(message) {
 			const selected = profile();
 			delete payload.thinking_budget;
 			if (selected.api === "openai-responses") {
-				payload.reasoning = { ...payload.reasoning, effort: current.expert ? (selected.reasoningEffort || "high") : "low" };
+				payload.reasoning = { ...payload.reasoning, effort: current.expert ? (selected.reasoningEffort || "high") : "medium" };
 				if (config.search && current.search) {
 					payload.tools = [...(payload.tools || []), { type: "web_search" }];
 				}
@@ -239,7 +239,7 @@ function note(message) {
 		{
 			role: "assistant",
 			content: [{ type: "text", text: message.reply }],
-			api: "openai-completions",
+			api: config.api || "openai-completions",
 			provider: config.provider || "bailian",
 			model: config.model,
 			usage: EMPTY_USAGE,
