@@ -1,0 +1,142 @@
+--- a/alsa-pcm.c
++++ b/alsa-pcm.c
+@@ -1018,16 +1018,14 @@
+ 			device_name,
+ 			state->stream == SND_PCM_STREAM_CAPTURE ? "capture" : "playback");
+ 
+-	if (!state->disable_tsched) {
+-		if ((err = spa_system_timerfd_create(state->data_system,
+-				CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK)) < 0)
+-			goto error_exit_close;
++	/* With IRQ scheduling the timer is the playback wakeup watchdog. */
++	if ((err = spa_system_timerfd_create(state->data_system,
++			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK)) < 0)
++		goto error_exit_close;
+ 
+-		state->timerfd = err;
+-	} else {
+-		/* ALSA pollfds may only be ready after setting swparams, so
+-		 * these are initialised in spa_alsa_start() */
+-	}
++	state->timerfd = err;
++	/* ALSA pollfds may only be ready after setting swparams, so with
++	 * IRQ scheduling they are initialised in spa_alsa_start() */
+ 
+ 	state->opened = true;
+ 	state->sample_count = 0;
+@@ -1080,9 +1078,8 @@
+ 		spa_log_warn(state->log, "%s: close failed: %s", state->name,
+ 				snd_strerror(err));
+ 
+-	if (!state->disable_tsched)
+-		spa_system_close(state->data_system, state->timerfd);
+-	else
++	spa_system_close(state->data_system, state->timerfd);
++	if (state->disable_tsched)
+ 		state->n_fds = 0;
+ 
+ 	if (state->have_format)
+@@ -2226,12 +2223,12 @@
+ 			"sw_params_set_tstamp_mode");
+ 	CHECK(snd_pcm_sw_params_set_tstamp_type(hndl, params, SND_PCM_TSTAMP_TYPE_MONOTONIC),
+ 			"sw_params_set_tstamp_type");
+-#if 0
++	/* Never stop on xrun: a q6asm stream stopped by an xrun can leave the
++	 * ADSP unanswering, and the prepare that follows blocks for 5 s. */
+ 	snd_pcm_uframes_t boundary;
+ 	CHECK(snd_pcm_sw_params_get_boundary(params, &boundary), "get_boundary");
+ 
+ 	CHECK(snd_pcm_sw_params_set_stop_threshold(hndl, params, boundary), "set_stop_threshold");
+-#endif
+ 
+ 	/* start the transfer */
+ 	CHECK(snd_pcm_sw_params_set_start_threshold(hndl, params, LONG_MAX), "set_start_threshold");
+@@ -2699,6 +2696,8 @@
+ 	return 0;
+ }
+ 
++static uint64_t get_time_ns(struct state *state);
++
+ static void update_sources(struct state *state, bool active)
+ {
+ 	if (state->disable_tsched && state->rt.sources_added) {
+@@ -2706,6 +2705,12 @@
+ 			state->source[i].mask = active ? state->pfds[i].events : 0;
+ 			spa_loop_update_source(state->data_loop, &state->source[i]);
+ 		}
++		/* An IRQ driver only wakes again after it writes. If the graph cycle
++		 * never completes (a client exits mid-cycle), nothing writes and the
++		 * graph stops for good; re-arm the wakeup after a few periods. */
++		if (state->stream == SND_PCM_STREAM_PLAYBACK)
++			set_timeout(state, active ? 0 : get_time_ns(state) +
++					4 * state->period_frames * SPA_NSEC_PER_SEC / state->rate);
+ 	}
+ }
+ 
+@@ -3337,12 +3342,34 @@
+ 	set_timeout(state, state->next_time);
+ }
+ 
++static void alsa_watchdog_event(struct spa_source *source)
++{
++	struct state *state = source->data;
++	uint64_t expire;
++
++	if (spa_system_timerfd_read(state->data_system, state->timerfd, &expire) < 0 ||
++	    !state->rt.sources_added)
++		return;
++	spa_log_warn(state->log, "%s: graph cycle did not complete, waking up again",
++			state->name);
++	update_sources(state, true);
++}
++
++static bool has_watchdog(struct state *state)
++{
++	return state->disable_tsched && state->stream == SND_PCM_STREAM_PLAYBACK;
++}
++
+ static void remove_sources(struct state *state)
+ {
+ 	int i;
+ 	if (state->rt.sources_added) {
+ 		for (i = 0; i < state->n_fds; i++)
+ 			spa_loop_remove_source(state->data_loop, &state->source[i]);
++		if (has_watchdog(state)) {
++			set_timeout(state, 0);
++			spa_loop_remove_source(state->data_loop, &state->watchdog);
++		}
+ 		state->rt.sources_added = false;
+ 	}
+ }
+@@ -3351,8 +3378,20 @@
+ {
+ 	int i;
+ 	if (!state->rt.sources_added) {
+-		for (i = 0; i < state->n_fds; i++)
++		for (i = 0; i < state->n_fds; i++) {
++			/* Sources removed mid-cycle must not come back disabled. */
++			if (state->disable_tsched)
++				state->source[i].mask = state->pfds[i].events;
+ 			spa_loop_add_source(state->data_loop, &state->source[i]);
++		}
++		if (has_watchdog(state)) {
++			state->watchdog.func = alsa_watchdog_event;
++			state->watchdog.data = state;
++			state->watchdog.fd = state->timerfd;
++			state->watchdog.mask = SPA_IO_IN;
++			state->watchdog.rmask = 0;
++			spa_loop_add_source(state->data_loop, &state->watchdog);
++		}
+ 		state->rt.sources_added = true;
+ 	}
+ }
+--- a/alsa-pcm.h
++++ b/alsa-pcm.h
+@@ -193,6 +193,7 @@
+ 	/* Either a single source for tsched, or a set of pollfds from ALSA */
+ 	struct spa_source source[MAX_POLL];
+ 	int timerfd;
++	struct spa_source watchdog;
+ 	struct pollfd pfds[MAX_POLL];
+ 	int n_fds;
+ 	uint32_t threshold;

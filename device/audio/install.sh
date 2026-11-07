@@ -8,6 +8,7 @@ fi
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 KERNEL=$(uname -r)
 AEC_PLUGIN=${AEC_PLUGIN:-"$BASE/../../outputs/audio/libspa-aec-thinksmart.so"}
+ALSA_PLUGIN=${ALSA_PLUGIN:-"$BASE/../../outputs/audio/libspa-alsa-thinksmart.so"}
 AMP_MODULE=${AMP_MODULE:-}
 if [ -z "$AMP_MODULE" ]; then
 	for candidate in "$BASE/snd-soc-tas5782m.ko" "$BASE/snd-soc-tas5782m-dbg.ko"; do
@@ -23,7 +24,7 @@ case "$(modinfo -F vermagic "$AMP_MODULE")" in
 	*) echo "TAS5782M 模块与运行内核 $KERNEL 不匹配" >&2; exit 1 ;;
 esac
 
-for required in "$AEC_PLUGIN" "$AMP_MODULE" "$BASE/tas5728m_dsp_lenovo_cd-18781y.bin"; do
+for required in "$AEC_PLUGIN" "$ALSA_PLUGIN" "$AMP_MODULE" "$BASE/tas5728m_dsp_lenovo_cd-18781y.bin"; do
 	[ -s "$required" ] || { echo "缺少音频安装文件：$required" >&2; exit 1; }
 done
 VOICE_ACTIVE=0
@@ -40,6 +41,7 @@ trap restore_voice EXIT
 if [ "$VOICE_ACTIVE" -eq 1 ]; then systemctl stop thinksmart-voice.service; fi
 
 install -D -m 0644 "$AEC_PLUGIN" /usr/lib/aarch64-linux-gnu/spa-0.2/aec/libspa-aec-thinksmart.so
+install -D -m 0644 "$ALSA_PLUGIN" /usr/lib/aarch64-linux-gnu/spa-0.2/alsa/libspa-alsa-thinksmart.so
 install -d /usr/local/share/thinksmart-aec/licenses
 install -m 0644 "$(dirname -- "$AEC_PLUGIN")"/licenses/*.txt /usr/local/share/thinksmart-aec/licenses/
 
@@ -58,6 +60,7 @@ install -D -m 0644 "$BASE/ucm/HiFi.conf" /usr/share/alsa/ucm2/Qualcomm/cd-18781y
 install -D -m 0644 "$BASE/ucm/qualcomm-card.conf" /usr/share/alsa/ucm2/Qualcomm/cd-18781y/cd-18781y.conf
 install -D -m 0644 "$BASE/99-cd18781y-alsa.lua" /etc/wireplumber/main.lua.d/99-cd18781y-alsa.lua
 install -D -m 0644 "$BASE/thinksmart-echo-cancel.conf" /etc/pipewire/pipewire.conf.d/thinksmart-echo-cancel.conf
+install -D -m 0644 "$BASE/thinksmart-alsa-pcm.conf" /etc/pipewire/pipewire.conf.d/thinksmart-alsa-pcm.conf
 install -D -m 0755 "$BASE/thinksmart-volume-keys" /usr/local/bin/thinksmart-volume-keys
 install -D -m 0644 "$BASE/thinksmart-volume-keys.service" /etc/systemd/system/thinksmart-volume-keys.service
 

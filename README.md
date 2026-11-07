@@ -19,7 +19,7 @@
 
 前提：设备已按 [rickx/ubuntu-thinksmart](https://github.com/rickx/ubuntu-thinksmart) 刷好 Ubuntu，有免密 sudo 的用户 `thinksmart`（uid 1000）。
 
-1. 电脑上运行 `device/audio/build-aec3.sh` 生成 `outputs/audio/`；把 `snd-soc-tas5782m.ko` 和原厂固件 `tas5728m_dsp_lenovo_cd-18781y.bin` 放进 `device/audio/`。
+1. 电脑上用 ARM64 工具链运行 `device/audio/build-aec3.sh` 和 `device/audio/build-alsa-pcm.sh` 生成 `outputs/audio/`；把 `snd-soc-tas5782m.ko` 和原厂固件 `tas5728m_dsp_lenovo_cd-18781y.bin` 放进 `device/audio/`。
 2. `cd device/agent && npm install && npm run build`
 3. 把仓库复制到设备，依次运行 `sudo device/audio/install.sh`、`sudo device/voice/install.sh`。
 4. 写入阿里云百炼密钥：`sudo thinksmart-configure-voice < aliyun.json`（`{"api_key", "workspace_id", "region"}`），之后删除该文件。可选的对话模型凭据用 `thinksmart-configure-chat`、`thinksmart-configure-expert`。

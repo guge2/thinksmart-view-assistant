@@ -44,6 +44,9 @@ table.insert(alsa_monitor.rules, {
   },
   apply_properties = {
     ["priority.driver"] = 2000,
+    -- Patched PCM plugin (alsa-pcm-watchdog.patch): with IRQ wakeups, a client
+    -- leaving mid-cycle otherwise stops the whole graph until PipeWire restarts.
+    ["factory.name"] = "thinksmart.alsa.pcm.sink",
     -- Wake on period IRQs. With timer scheduling the whole-period pointer made
     -- the clock estimate run 6.5% fast; the capture follower then resynced
     -- about twice a second, inserting silence or dropping 1024 frames.
@@ -66,6 +69,7 @@ table.insert(alsa_monitor.rules, {
   },
   apply_properties = {
     ["api.alsa.headroom"] = 768,
+    ["factory.name"] = "thinksmart.alsa.pcm.source",
   },
 })
 
