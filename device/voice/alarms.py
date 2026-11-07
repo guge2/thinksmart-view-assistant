@@ -13,40 +13,15 @@ import threading
 import time
 import uuid
 
+from skills import Result
+
 
 STATE_FILE = "/data/thinksmart/music/alarms.json"
 MAX_ITEMS = 64
 NAMES = {"alarm": "闹钟", "timer": "计时器", "reminder": "提醒"}
+NOTHING_RINGING = "现在没有正在响的闹钟或提醒"
 # Alarms wake with music, which plays this long unless stopped; timers and reminders beep.
 MUSIC_SECONDS = 300
-
-TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "manage_alarm",
-        "description": "设置、查看、取消闹钟、倒计时和提醒，或停止、延后正在响的提示音。设置成功前必须调用此工具。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["create", "list", "cancel", "dismiss", "snooze"]},
-                "kind": {"type": "string", "enum": ["alarm", "timer", "reminder"]},
-                "time": {"type": "string", "description": "当地钟点 HH:MM 或 HH:MM:SS，如早上七点传07:00。未指定日期时由设备选择下一次该钟点。"},
-                "days_from_today": {"type": "integer", "minimum": 0, "maximum": 366, "description": "今天0、明天1、后天2；由设备计算具体日期，不要自行换算。"},
-                "date": {"type": "string", "description": "仅当用户明确指定日历日期时传 YYYY-MM-DD；不能与days_from_today同时使用。"},
-                "hours": {"type": "integer", "minimum": 0, "description": "多久以后：小时部分，可与minutes和seconds相加。"},
-                "minutes": {"type": "integer", "minimum": 0, "description": "多久以后：分钟部分，可与hours和seconds相加。"},
-                "repeat": {"type": "string", "enum": ["once", "daily", "workdays", "weekly", "monthly"], "description": "闹钟重复规则；weekly同时传weekdays，monthly同时传month_day。"},
-                "month_day": {"type": "integer", "minimum": 0, "maximum": 31, "description": "仅当repeat为monthly时传1到31号；其他情况填0。"},
-                "seconds": {"type": "integer", "minimum": 0, "description": "多久以后：秒部分。相对时长总计1秒至7天；不能与钟点、日期或重复规则混用。"},
-                "label": {"type": "string", "description": "提醒内容或闹钟名称，最多60字。"},
-                "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}, "description": "重复星期，0代表周一，6代表周日；空或省略表示一次。仅闹钟可重复。"},
-                "id": {"type": "string", "description": "取消时指定列表中的编号；多项时不得猜测。"}
-            },
-            "required": ["action"]
-        }
-    }
-}]
-
 
 def _describe(item, with_id=True):
     """with_id only for listings the model reads; create/cancel results are spoken verbatim."""
@@ -174,8 +149,6 @@ def plan_time(args, kind, now):
 
 
 class AlarmService:
-    tools = TOOLS
-
     def __init__(self, emit=None, state_file=STATE_FILE, on_ring=None, music=None):
         self.emit = emit
         self.state_file = state_file
@@ -368,32 +341,26 @@ class AlarmService:
                 return self._command({"action": "create", "kind": "timer", "minutes": minutes, "label": label})
         return None
 
-    def call_tool(self, name, arguments):
-        if name != "manage_alarm":
-            return "不支持这个操作", False, False
+    def manage_alarm(self, args):
         try:
-            args = json.loads(arguments) if isinstance(arguments, str) else arguments
-            if not isinstance(args, dict):
-                raise ValueError("参数格式不正确")
             with self.lock:
-                message = self._command(args)
-            return message, True, False
+                return self._command(args)
         except (ValueError, TypeError, OverflowError, OSError) as error:
             logging.warning("闹钟操作失败：%s", error)
-            return f"操作失败：{error}", False, False
+            return Result(f"操作失败：{error}", False)
 
     def _command(self, args):
         action = args.get("action")
         if action == "dismiss":
-            return "已停止提示音" if self.dismiss() else "现在没有正在响的闹钟或提醒"
+            return Result("已停止提示音", True) if self.dismiss() else Result(NOTHING_RINGING, False)
         if action == "snooze":
             minutes = args.get("minutes")
             reply = self.snooze(minutes if type(minutes) is int and 1 <= minutes <= 60 else 5)
-            return reply or "现在没有正在响的闹钟或提醒"
+            return Result(reply, True) if reply else Result(NOTHING_RINGING, False)
         if action == "list":
             if not self.items:
-                return "目前没有待响的闹钟、计时器或提醒"
-            return "当前有：" + "；".join(_describe(i) for i in sorted(self.items, key=lambda i: i["due"]))
+                return Result("目前没有待响的闹钟、计时器或提醒", True)
+            return Result("当前有：" + "；".join(_describe(i) for i in sorted(self.items, key=lambda i: i["due"])), True)
         if action == "cancel":
             ident = args.get("id")
             matches = [item for item in self.items if item["id"] == ident]
@@ -413,7 +380,7 @@ class AlarmService:
             if self.ringing_id == item["id"]:
                 self.silence.set()
             self.announce()
-            return f"已取消{_describe(item, with_id=False)}"
+            return Result(f"已取消{_describe(item, with_id=False)}", True)
         if action != "create":
             raise ValueError("不支持这个操作")
         if len(self.items) >= MAX_ITEMS:
@@ -457,7 +424,7 @@ class AlarmService:
                     synchronized = False
             if not synchronized:
                 result += "。设备时间尚未与网络同步，到时可能不准确"
-        return result
+        return Result(result, True)
 
     def _run(self):
         while not self.stopped.wait(0.5):

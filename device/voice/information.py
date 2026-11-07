@@ -1,32 +1,24 @@
 import datetime
-import json
 import logging
 import os
 import subprocess
 import sys
 import time
 
+from skills import Result
+
 sys.path.insert(0, "/usr/local/lib/thinksmart-ui")
 import system as ui_system
 
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "get_current_time",
-        "description": "查询设备所在时区的当前日期、星期和时间。用户询问现在几点或今天日期时调用。",
-        "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {
-        "name": "get_weather",
-        "description": "查询实时天气或未来两天天气（含气温、体感、最高最低温、湿度、风速）。用户询问天气、气温、穿衣、带伞时必须调用，不能自行编造。",
-        "parameters": {"type": "object", "properties": {
-            "city": {"type": "string", "description": "用户明确指定的城市；未指定则留空，使用屏幕设置的默认城市"},
-            "day": {"type": "integer", "description": "今天为0，明天为1，后天为2，未来三天全部预报为3"}}}}},
-]
 
-
-def current_time():
+def current_time(*, clock_only=False):
     now = datetime.datetime.now().astimezone()
-    weekdays = "一二三四五六日"
-    result = f"现在是{now.year}年{now.month}月{now.day}日，星期{weekdays[now.weekday()]}，{now.hour}点{now.minute:02d}分。"
+    clock = f"{now.hour}点{now.minute:02d}分"
+    if clock_only:
+        result = f"现在是{clock}。"
+    else:
+        weekdays = "一二三四五六日"
+        result = f"现在是{now.year}年{now.month}月{now.day}日，星期{weekdays[now.weekday()]}，{clock}。"
     if os.path.exists("/run/systemd/timesync/synchronized"):
         return result
     try:
@@ -83,20 +75,13 @@ def weather(city="", day=0):
     return result, True
 
 
-def call_tool(name, arguments):
+def get_current_time(args):
+    return Result(current_time(clock_only=bool(args.get("clock_only"))), True)
+
+
+def get_weather(args):
     try:
-        args = json.loads(arguments or "{}")
-    except (TypeError, ValueError):
-        args = {}
-    if not isinstance(args, dict):
-        args = {}
-    if name == "get_current_time":
-        return current_time(), True, False
-    if name == "get_weather":
-        try:
-            result, ok = weather(args.get("city"), args.get("day", 0))
-        except Exception as error:
-            logging.warning("地点查询失败：%s", error)
-            return "天气服务暂时不可用，请联网后再试。", False, False
-        return result, ok, False
-    return "不支持这个操作", False, False
+        return Result(*weather(args.get("city"), args.get("day", 0)))
+    except Exception as error:
+        logging.warning("地点查询失败：%s", error)
+        return Result("天气服务暂时不可用，请联网后再试。", False)

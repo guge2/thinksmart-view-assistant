@@ -29,14 +29,14 @@ from playback import PCMPlayer, SpeechProgress, AudioStalled
 from music import (
     MUSIC_ROLE,
     MusicService,
-    match_command,
-    parse_cn_number,
     read_volume_status,
     CommandCancelled as TurnCancelled,
 )
 import information
 import offline
+import skills
 from alarms import AlarmService
+from skills import Result
 
 
 SAMPLE_RATE = 16000
@@ -62,10 +62,6 @@ LINK_IDLE_SECONDS = 60
 # A soft cue when a turn has been silent this long, so a slow answer does not sound like a hang.
 THINKING_CUE_SECONDS = float(os.getenv("THINKSMART_THINKING_CUE_SECONDS", "2"))
 ASSISTANT_ROLE = "Assistant"
-FAREWELL_WORDS = re.compile(r"退下|没事|不用|再见|拜拜|休息|去休息|别说|不聊|结束对话|就这样")
-SLEEP_WORDS = re.compile(r"关机|关屏|关闭屏幕|关掉屏幕|息屏|熄屏|睡觉|去睡觉|晚安")
-# Sleep words that also stop music; screen-only words leave playback running.
-POWER_OFF_WORDS = re.compile(r"关机|睡觉|晚安")
 # Recognition ends sentences at short pauses, sometimes before the pause. Listening stops once the
 # user has been quiet this long after a sentence that sounds finished, or after one ending in a
 # comma or connective.
@@ -78,27 +74,8 @@ UNFINISHED = re.compile(
 # Follow-up windows hear the room: a lone syllable or filler is noise unless the reply asked something.
 FILLER = re.compile(r"[嗯啊呃额哦噢喔唉哎诶欸哈呵]+")
 QUESTION_END = re.compile(r"(?:[？?]|[吗呢么][。！!～~]?)[\s”」』\"')）]*$")
-# Without thinking the model often answers weather from web search or memory, so weather turns force
-# the tool and skip search; time is already in the context, so time turns only skip search.
-WEATHER_WORDS = re.compile(
-    r"天气|气温|天气预报|下雪|降雨|带伞|刮风|穿什么"
-    r"|(?:今[天日]|明[天日]|后天|外面|室外|出门|[早晚]上|这[里边]|本地|当地).{0,6}(?:几度|多少度|温度|下雨|冷不冷|热不热)"
-    r"|^(?:现在|今天|明天|外面)?(?:多少度|几度|冷不冷|热不热)[？?吗呢吧呀啊]*$"
-)
+# Time is already in the context, so time turns skip web search.
 TIME_WORDS = re.compile(r"几点|几号|星期几|礼拜几")
-PURE_TIME_QUERY = re.compile(
-    r"^(?:请?问|告诉我|帮我看一下)?(?:现在|今天|当前)?(?:是)?"
-    r"(?:几点(?:了|钟)?|什么时间|几月几[号日]|几号|星期几|礼拜几|周几|什么日子)+[呀啊呢吗吧么]*$"
-)
-SNOOZE_QUERY = re.compile(
-    r"^(?:贪睡|稍后提醒|等会儿?再响|过会儿?再响|"
-    r"再睡(?:(\d+|[一二两三四五六七八九十]+)(?:分钟?))?|"
-    r"(\d+|[一二两三四五六七八九十]+)(?:分钟?)后再(?:响|提醒|叫我))$"
-)
-QUICK_TIMER = re.compile(
-    r"^(?:请你?|帮我|给我)?(?:定个?|设个?|设置(?:一个)?|来个?|开启(?:一个)?)?"
-    r"(\d+|[一二两三四五六七八九十半]+)(?:个)?(秒钟?|分钟?|小时|钟头)(?:的)?(?:倒计时|计时器?)$"
-)
 # Thinking delays the first spoken word, so it is reserved for calculation, comparison and advice.
 THINK_WORDS = re.compile(
     r"计算|算一下|算算|算出|等于多少|换算|折合|平均|百分之|几倍|多少倍|乘以|除以|加上|减去|\d\s*[+\-*/×÷^]\s*\d"
@@ -111,64 +88,13 @@ HARD_TASK_WORDS = re.compile(
     r"深入分析|详细分析|仔细分析|帮我分析|推导|证明|算法|调试|排查|代码|编程|架构"
     r"|数学题|逻辑题|复杂|多步骤|详细规划|可行性|成本收益"
 )
-END_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "end_conversation",
-        "description": "用户想结束对话时调用，例如让你退下、说没事了、不用了、你去忙吧。调用后不再继续聆听。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "screen_off": {"type": "boolean", "description": "用户要求关机、关屏或睡觉时为true"},
-                "stop_music": {"type": "boolean", "description": "用户要求关机、睡觉或说晚安时为true，同时停止播放音乐；只关屏时为false"},
-            },
-        },
-    },
-}
-DEVICE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "control_device",
-        "description": (
-            "调节或切换设备本地设置与触屏界面：屏幕亮度、播报语速、夜间免打扰模式、深度思考模式、"
-            "默认天气城市、切换触屏页面（主页/天气/闹钟/设置/音乐/夜间设置）或息屏。"
-            "当用户要求修改这些设置，或抱怨屏幕太亮/太暗、说话太快/太慢时直接调用。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "brightness": {"type": "integer", "description": "目标屏幕亮度百分比1到100；不设具体数值时填-1"},
-                "brightness_change": {"type": "integer", "description": "相对调节屏幕亮度百分比，调亮为正（如20），调暗为负（如-20）；不用时填0"},
-                "speech_rate": {"type": "number", "description": "目标播报语速倍率0.5到2.0（默认1.5）；不用时填0"},
-                "speech_rate_change": {"type": "number", "description": "相对调节播报语速，加快为正（如0.2），放慢为负（如-0.2）；不用时填0"},
-                "night_mode": {"type": "string", "enum": ["", "on", "off"], "description": "开启夜间免打扰填on，关闭填off，不改填空字符串"},
-                "thinking_mode": {"type": "string", "enum": ["", "on", "off"], "description": "开启深度思考填on，关闭填off，不改填空字符串"},
-                "weather_city": {"type": "string", "description": "修改设备默认天气城市名称；不改填空字符串"},
-                "screen": {
-                    "type": "string",
-                    "enum": ["", "home", "weather", "alarms", "settings", "music", "night", "off"],
-                    "description": "切换触屏页面：home主页、weather天气页、alarms闹钟页、settings设置页、music音乐页、night夜间设置页、off息屏；不切换填空字符串",
-                },
-            },
-        },
-    },
-}
 TOOL_RULES = (
-    "你拥有完整的设备本地技能（Skills），包括："
-    "1.音乐与伴睡定时（play_music点歌/搜歌手/播收藏、control_music暂停/继续/切歌/单曲循环/随机播放/伴睡定时停止）；"
-    "2.音量与静音控制（set_volume设百分比、调大调小、静音/取消静音）；"
-    "3.设备设置与屏幕控制（control_device调节屏幕亮度、播报语速、开关夜间免打扰模式、开关深度思考模式、修改默认天气城市、切换触屏到天气/闹钟/设置/音乐页面或息屏）；"
-    "4.闹钟、倒计时与日程提醒管理（manage_alarm创建、查看、取消、贪睡稍后提醒、停止闹钟）；"
-    "5.实时天气与三天预报（get_weather）、当前时间日期（get_current_time）及联网搜索。"
+    "你拥有以下设备本地技能（Skills）：" + skills.catalogue() + "；另外可以联网搜索。"
     "设备当前的实时状态（当前音量、是否静音、屏幕亮度、语速、夜间模式、深度思考开关、闹钟列表、正在播放的歌曲与伴睡定时、QQ音乐登录状态、默认城市）附在每轮用户消息前的【设备实时状态】中，是你的系统信息而不是用户说的话；"
     "当用户询问现在音量多少、亮度多少、语速多少、在放什么歌、有哪些闹钟、你有哪些本地功能时，请直接根据上下文准确回答，绝不要说无法查询。"
     "当用户表达不适或隐含调节意图（如“你说话声音好小”“太吵了”“屏幕太刺眼/太暗”“你说太快了”）时，不要反问“需要我调吗”，直接调用set_volume或control_device完成调节。"
-    "询问天气时必须调用get_weather，不得猜测。"
-    "设置闹钟时传钟点time和相对天数days_from_today（明天1、后天2），由设备计算日期；"
-    "多久以后传hours/minutes/seconds；重复传repeat规则；不要自行计算完整日期，不得假装已设置。"
-    "取消闹钟时根据描述匹配编号；不明确时先询问。编号仅供取消时传参，不要读给用户。"
+    "用户只问现在几点时，只回答几点几分。"
     "使用工具时不要提前声称操作成功，以工具返回结果为准。"
-    "用户想结束对话时调用end_conversation；说关机、关屏或睡觉时同时把screen_off设为true，说关机、睡觉或晚安时还要把stop_music设为true，你无法关闭设备电源。"
     "新闻、比赛、行情等需要最新信息的问题可以参考联网搜索结果，用一两句话概括，不要念出网址。"
     "回答结束时不要说“还有什么需要”之类的客套追问；只有确实需要用户补充信息时才用问句结尾。"
 )
@@ -403,20 +329,6 @@ class WakeDetector:
         if not is_playing:
             return (raw_result, "raw") if raw_result else (result, "AEC")
         return (result, "AEC") if result else (raw_result, "raw")
-
-
-def match_farewell(text, wake_phrase):
-    """Returns "sleep", "end" or None for short phrases that close the conversation."""
-    normalized = re.sub(r"[\s，。！？、,.!?~～…]+", "", text or "")
-    if wake_phrase:
-        normalized = normalized.replace(wake_phrase, "")
-    normalized = re.sub(r"^(?:好了|好的|行了|那|嗯|你|请)+", "", normalized)
-    normalized = re.sub(r"(?:吧|啦|了|呀|哦|啊)+$", "", re.sub(r"(?:谢谢你?|谢了)$", "", normalized))
-    if SLEEP_WORDS.fullmatch(normalized):
-        return "sleep"
-    if FAREWELL_WORDS.fullmatch(normalized):
-        return "end"
-    return None
 
 
 class UiPublisher:
@@ -701,9 +613,10 @@ class ThinkSmartAssistant:
         self.failed_tools = set()
         self.next_followup = 0.0
         self.ducker = Ducker(float(os.getenv("THINKSMART_DUCK_LEVEL", "0.45")))
-        self.music = MusicService(ui.emit, float(os.getenv("THINKSMART_MUSIC_DUCK_LEVEL", "0.2")))
+        self.music = MusicService(ui.emit, float(os.getenv("THINKSMART_MUSIC_DUCK_LEVEL", "0.2")), self.check_cancel)
         self.alarms = AlarmService(ui.emit, on_ring=self.on_alarm_ring, music=self.music)
         self.offline_commands = offline.OfflineCommands(KWS_MODEL, f"{VOICE_ROOT}/offline-keywords.txt")
+        self.skills = skills.Skills(self, self.music, self.alarms, information)
         self.offline_mode = False
         self.music_started = False
         self.conversation_over = False
@@ -812,7 +725,7 @@ class ThinkSmartAssistant:
                 "你可以按需调用联网搜索工具。涉及新闻、近期事件、比分、行情等实时信息时先搜索核实，"
                 "不要把记忆当成实时信息；普通聊天不必搜索。搜索后用自然中文概括，通常两三句话。"
             ) + "回复会被直接朗读：不要输出网址、链接、来源标注、引用编号或Markdown标记。",
-            "tools": [END_TOOL, DEVICE_TOOL] + self.music.tools + information.TOOLS + self.alarms.tools,
+            "tools": skills.tools(),
         })
         self.brain.configure_models(self.chat_model, self.expert_model, self.chat_provider)
         logging.info("对话模型：%s / %s", self.chat_provider, self.chat_model)
@@ -1683,14 +1596,12 @@ class ThinkSmartAssistant:
             f"夜间免打扰模式{night_text}。"
         )
 
-    def run_device_tool(self, args):
+    def control_device(self, args):
         """Works out the new values; the display process owns the settings file and backlight."""
         def number(key, default):
             value = args.get(key)
             return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
 
-        if not isinstance(args, dict):
-            return "参数格式不正确", False, True
         update, results = {}, []
         level, change = number("brightness", -1), number("brightness_change", 0)
         if 1 <= level <= 100 or change:
@@ -1737,11 +1648,15 @@ class ThinkSmartAssistant:
         if update:
             self.ui.emit("ui_set", **update)
         if not results:
-            return "没有听懂要调整哪项设备设置", False, True
-        return "，".join(results), bool(update) or screen == "off", True
+            return Result("没有听懂要调整哪项设备设置", False)
+        return Result("，".join(results), bool(update) or screen == "off")
+
+    def end_conversation(self, args):
+        self.finish_conversation(bool(args.get("screen_off")), bool(args.get("stop_music")))
+        return Result("好的", True)
 
     def chat_context(self):
-        scheduled, _, _ = self.alarms.call_tool("manage_alarm", '{"action":"list"}')
+        scheduled = self.alarms.manage_alarm({"action": "list"}).message
         return (
             f"用户会用“{self.wake_phrase}”称呼你，这就是你的名字。"
             f"设备当前本地时间是{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}。"
@@ -1762,6 +1677,7 @@ class ThinkSmartAssistant:
         """Returns (message, ok, final); final results are spoken as-is instead of going back to the model.
 
         A tool that fails twice in one turn ends it with its error rather than letting the model retry."""
+        logging.info("工具调用：%s %s", name, json.dumps(args, ensure_ascii=False))
         message, ok, final = self.call_tool(name, args, has_reply)
         if not ok:
             final = final or name in self.failed_tools
@@ -1770,28 +1686,11 @@ class ThinkSmartAssistant:
 
     def call_tool(self, name, args, has_reply):
         self.check_cancel()
-        arguments = json.dumps(args, ensure_ascii=False)
-        logging.info("工具调用：%s %s", name, arguments)
-        if name in ("get_current_time", "get_weather"):
-            message, ok, _ = information.call_tool(name, arguments)
-            self.turn_effects.append("info")
-            return message, ok, False
-        if name == "manage_alarm":
-            message, ok, _ = self.alarms.call_tool(name, arguments)
-            listing = args.get("action") == "list"
-            self.turn_effects.append("info" if listing else "action" if ok else "failed")
-            return message, ok, ok and not listing
-        if name == "control_device":
-            message, ok, final = self.run_device_tool(args)
-            self.turn_effects.append("action" if ok else "failed")
-            return message, ok, final
-        if name == "end_conversation":
-            self.finish_conversation(bool(args.get("screen_off")), bool(args.get("stop_music")))
-            return ("" if has_reply else "好的"), True, True
-        message, ok, started = self.music.call_tool(name, arguments, self.check_cancel)
-        self.turn_effects.append("action" if ok else "failed")
-        self.music_started = self.music_started or started
-        return message, ok, True
+        result, effect, final = self.skills.run(name, args, has_reply)
+        if effect:
+            self.turn_effects.append(effect)
+        self.music_started = self.music_started or result.started
+        return result.message, result.ok, final
 
     def speak_stream(self, fragments):
         player = PCMPlayer(PLAYBACK_RATE, 0.5 if self.night_active() else 1.0)
@@ -1918,48 +1817,12 @@ class ThinkSmartAssistant:
         self.turn_effects = []
         self.failed_tools = set()
         self.next_followup = 0.0
-        command = match_command(stripped_text, self.music.active())
-        farewell = match_farewell(stripped_text, self.wake_phrase)
-        clean_text = re.sub(r"[\s，。！？、,.!?~～…]+", "", stripped_text)
-        snooze_match = SNOOZE_QUERY.match(clean_text)
-        timer_match = None if command else QUICK_TIMER.match(clean_text)
-        if clean_text in ("停止闹钟", "关闭闹钟", "停止提醒", "关掉闹钟", "别响了"):
-            dismissed = self.alarms.dismiss()
-            self.turn_effects.append("action" if dismissed else "failed")
-            reply = "已停止提示音" if dismissed else "现在没有正在响的闹钟或提醒"
-        elif snooze_match:
-            raw_min = snooze_match.group(1) or snooze_match.group(2)
-            minutes = int(parse_cn_number(raw_min) or 5) if raw_min else 5
-            snoozed = self.alarms.snooze(minutes)
-            self.turn_effects.append("action" if snoozed else "failed")
-            reply = snoozed or "现在没有正在响的闹钟或提醒"
-        elif farewell:
-            self.finish_conversation(farewell == "sleep",
-                                     farewell == "sleep" and bool(POWER_OFF_WORDS.search(user_text)))
-            reply = "好的"
-        elif timer_match and parse_cn_number(timer_match.group(1)) is not None:
-            amount = parse_cn_number(timer_match.group(1))
-            unit = timer_match.group(2)
-            if unit.startswith("秒"):
-                args = {"action": "create", "kind": "timer", "seconds": max(1, round(amount))}
-            elif unit.startswith("分"):
-                args = {"action": "create", "kind": "timer", "minutes": int(amount),
-                        "seconds": round((amount - int(amount)) * 60)}
-            else:
-                total_min = max(1, round(amount * 60))
-                args = {"action": "create", "kind": "timer", "hours": total_min // 60, "minutes": total_min % 60}
-            reply, ok, _ = self.alarms.call_tool("manage_alarm", args)
-            self.turn_effects.append("action" if ok else "failed")
-        elif PURE_TIME_QUERY.match(clean_text) or (self.offline_mode and any(word in user_text for word in ("几点", "几号", "星期"))):
-            reply = information.current_time()
-            self.turn_effects.append("info")
-        elif command:
-            logging.info("本地指令：%s %s", *command)
-            reply, ok, self.music_started = self.music.run_command(*command, check_cancel=self.check_cancel)
-            is_info = command[0] in ("what_song", "what_volume")
-            self.turn_effects.append("info" if (ok and is_info) else "action" if ok else "failed")
+        local = skills.match(stripped_text, self.music.active(), self.wake_phrase, self.offline_mode)
+        if local:
+            logging.info("本地指令：%s %s", local[0], json.dumps(local[1], ensure_ascii=False))
+            reply = self.call_tool(*local, False)[0]
         elif self.offline_mode:
-            reply = "离线时请说音量调大、音量调小、暂停播放、继续播放、上一首、下一首或现在几点。"
+            reply = skills.OFFLINE_HINT
         else:
             self.model_turn = True
             reply = self.chat_turn(user_text)
@@ -2037,8 +1900,8 @@ class ThinkSmartAssistant:
     def chat_turn(self, user_text):
         self.heard_reply = ""
         spoken = []
-        weather = bool(WEATHER_WORDS.search(user_text))
-        search = not weather and not TIME_WORDS.search(user_text)
+        force_tool = skills.forced(user_text)
+        search = not force_tool and not TIME_WORDS.search(user_text)
         expert = bool(self.expert_model and (
             EXPERT_REQUEST.search(user_text) or (self.thinking and HARD_TASK_WORDS.search(user_text))
         ))
@@ -2046,7 +1909,7 @@ class ThinkSmartAssistant:
                                 chat_provider=self.expert_provider if expert else self.chat_provider,
                                 role='expert' if expert else 'chat')
         # Qwen rejects a forced tool choice while thinking.
-        thinking = self.thinking and not weather and bool(THINK_WORDS.search(user_text))
+        thinking = self.thinking and not force_tool and bool(THINK_WORDS.search(user_text))
         if expert:
             logging.info("本轮使用 %s，推理档位 high", self.expert_model)
         elif thinking:
@@ -2056,7 +1919,6 @@ class ThinkSmartAssistant:
 
         def model_events():
             nonlocal model_failed
-            force_tool = "get_weather" if weather else None
             try:
                 yield from self.brain.chat(user_text, self.chat_context(), thinking, search, force_tool, self.check_cancel, expert=expert)
             except Exception:

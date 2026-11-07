@@ -4,6 +4,7 @@ import ctypes
 import fcntl
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -16,6 +17,8 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+from skills import MODES, PUNCT, Result
 
 
 MUSIC_ROOT = "/data/thinksmart/music"
@@ -46,132 +49,7 @@ URL_LIFETIME = 600
 LYRIC_LIMIT = 15000
 FAVORITE_WORDS = ("我喜欢", "我喜欢的", "我的收藏", "收藏", "我收藏的", "红心", "我的红心", "我的歌单")
 GENERIC_WORDS = ("", "音乐", "歌", "歌曲", "首歌", "一首歌", "点音乐", "点歌", "些歌", "推荐", "推荐歌曲", "随便", "随机")
-MODES = ("shuffle", "order", "repeat_one")
 MODE_NAMES = {"shuffle": "随机播放", "order": "顺序播放", "repeat_one": "单曲循环"}
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "play_music",
-            "description": "搜索并播放歌曲。用户想听歌、点歌、听某位歌手或某种风格的音乐时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索关键词，如“周杰伦 晴天”“陈奕迅”“轻音乐”；想听推荐时留空，想听收藏时填“我喜欢”",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "control_music",
-            "description": "控制当前的音乐播放，或设置伴睡定时停播。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["pause", "resume", "next", "previous", "stop", "sleep", "cancel_sleep", *MODES],
-                        "description": "暂停、继续、下一首、上一首、停止、伴睡定时停播(sleep)、取消定时停播(cancel_sleep)、切换为随机播放、顺序播放、单曲循环",
-                    },
-                    "minutes": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 480,
-                        "description": "action为sleep时的定时分钟数，如30表示30分钟后停止播放",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "set_volume",
-            "description": "调节设备的播放音量或静音状态。用户说声音太小、太大、太吵或指定音量百分比时直接调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "level": {"type": "integer", "description": "目标音量百分比（0 到 100）；使用相对调整或仅切换静音时传 -1"},
-                    "change": {"type": "integer", "description": "相对音量增减（如 10 或 -10）；指定了目标音量 level 时传 0"},
-                    "mute": {
-                        "type": "string",
-                        "enum": ["", "mute", "unmute"],
-                        "description": "静音传 mute，取消静音传 unmute；正常调节音量大小时传空字符串",
-                    },
-                },
-            },
-        },
-    },
-]
-
-_PUNCT = re.compile(r"[\s，。！？、；：,.!?;:~～…“”\"'‘’]+")
-_POLITE = re.compile(r"^(?:请你?|麻烦你?|帮我|给我|你|再)+")
-_PLAY = re.compile(r"^(?:播放|我想听听?|我要听|想听|来一首|来首|放一首|放首|唱一首|唱首|搜索)(.*)$")
-_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-_VOL_SET = re.compile(
-    r"^(?:把)?(?:设备)?(?:播放)?(?:声音|音量)(?:大小)?(?:调整?到|调整?至|调整?为|调到|调至|调为|设为|设置?为?|设置?到|调成|开到)?(?:百分之)?"
-    r"(\d{1,3}|一百|[一二两三四五六七八九]?十[一二三四五六七八九]?|[零一二两三四五六七八九])(?:%|格)?$"
-)
-_SLEEP_TIMER = re.compile(
-    r"^(?:定时)?(\d+|[一二两三四五六七八九十半]+)(?:个)?(分钟?|小时|钟头)后?"
-    r"(?:停止播放|关掉?音乐|关闭音乐|停播|停止音乐|别放了)$"
-)
-_COMMANDS = (
-    ("stop", re.compile(r"^(?:停止|停止播放|停止音乐|关闭音乐|关掉音乐|关闭播放|别放了|不听了|不要放了)$")),
-    ("pause", re.compile(r"^(?:暂停|暂停播放|暂停音乐|暂停一下|停一下|先停一下|停)$")),
-    ("resume", re.compile(r"^(?:继续|继续播放|继续放|接着放|接着播放|恢复播放|继续音乐)$")),
-    ("next", re.compile(r"^(?:下一首|下一曲|下一首歌|换一首|换首歌|换一首歌|切歌|换一个|下首)$")),
-    ("previous", re.compile(r"^(?:上一首|上一曲|上一首歌|上首)$")),
-    ("louder", re.compile(
-        r"^(?:把)?(?:声音|音量)(?:调|开)?(?:大|高|响)(?:一)?[点些]?$|"
-        r"^大声(?:一)?点$|^大[点些]声$|^(?:声音|音量)?再?大(?:一)?点$|"
-        r"^(?:你说话)?(?:声音|音量)(?:太|好|有点)(?:小|低|轻)了?[哦呀啊呢吧]*$|^太小声了?[哦呀啊呢吧]*$"
-    )),
-    ("quieter", re.compile(
-        r"^(?:把)?(?:声音|音量)(?:调|开)?(?:小|低|轻)(?:一)?[点些]?$|"
-        r"^小声(?:一)?点$|^小[点些]声$|^轻(?:一)?点声$|^(?:声音|音量)?再?小(?:一)?点$|"
-        r"^(?:你说话)?(?:声音|音量)(?:太|好|有点)(?:大|高|响|吵)了?[哦呀啊呢吧]*$|^太大声了?[哦呀啊呢吧]*$|^太吵了?[哦呀啊呢吧]*$"
-    )),
-    ("mute", re.compile(r"^(?:静音|开启静音|把声音关掉|关闭声音)$")),
-    ("unmute", re.compile(r"^(?:取消静音|解除静音|恢复声音|打开声音)$")),
-    ("what_volume", re.compile(r"^(?:现在|当前|目前)?(?:设备)?(?:的)?(?:声音|音量)(?:是)?(?:多少|多大|几格)[呀啊呢吗吧]*$")),
-    ("cancel_sleep", re.compile(r"^(?:取消|关闭)(?:伴睡|定时停播|定时关闭|睡眠定时|音乐定时)$")),
-    ("what_song", re.compile(r"^(?:这首歌?叫什么(?:名字)?|这是什么歌|现在(?:放|播|播放)的是什么歌|当前(?:放|播|播放)的是什么歌|什么歌|谁唱的|这首歌是谁唱的)$")),
-    ("shuffle", re.compile(r"^(?:切换到?|切到|改成|换成|改为|设为|开启)?(?:随机播放|乱序播放|随机模式|乱序模式|打乱顺序|随机放歌?|随机听歌?)(?:模式)?$")),
-    ("order", re.compile(r"^(?:切换到?|切到|改成|换成|改为|设为|开启)?(?:顺序播放|按顺序播放|顺序模式|列表循环|按顺序放|按顺序听)(?:模式)?$")),
-    ("repeat_one", re.compile(r"^(?:切换到?|切到|改成|换成|改为|设为|开启)?(?:单曲循环|单曲重复|(?:循环|重复|一直)(?:播放|放)?这首歌?)(?:模式)?$")),
-)
-_ANYTIME = ("louder", "quieter", "mute", "unmute", "what_volume", "cancel_sleep", *MODES)
-
-
-def parse_cn_number(text):
-    text = (text or "").strip()
-    if not text:
-        return None
-    if text.isdigit():
-        return int(text)
-    if text == "半":
-        return 0.5
-    if text == "十":
-        return 10
-    if text in ("一百", "百"):
-        return 100
-    if "十" in text:
-        left, _, right = text.partition("十")
-        tens = 1 if not left else _CN_DIGITS.get(left)
-        ones = 0 if not right else _CN_DIGITS.get(right)
-        if tens is not None and ones is not None:
-            return tens * 10 + ones
-        return None
-    return _CN_DIGITS.get(text)
 
 
 def plain(text):
@@ -179,44 +57,13 @@ def plain(text):
     return re.sub(r"[\W_]+", "", text).lower()
 
 
-def clean_query(text, from_tool=False):
-    if from_tool:
-        query = re.sub(r"\s+", " ", str(text or "")).strip()
-        query = re.sub(r"^[，。！？、；：,.!?;:~～…“”\"'‘’《》〈〉【】\[\]()（）]+|[，。！？、；：,.!?;:~～…“”\"'‘’《》〈〉【】\[\]()（）]+$", "", query).strip()
-    else:
-        query = re.sub(r"^(?:一首|一下|首|点)", "", text)
-        query = re.sub(r"(?:吧|呗|好吗|可以吗|好不好)$", "", query)
-    compact = _PUNCT.sub("", query)
+def clean_query(text):
+    query = re.sub(r"\s+", " ", str(text or "")).strip()
+    query = re.sub(r"^[，。！？、；：,.!?;:~～…“”\"'‘’《》〈〉【】\[\]()（）]+|[，。！？、；：,.!?;:~～…“”\"'‘’《》〈〉【】\[\]()（）]+$", "", query).strip()
+    compact = PUNCT.sub("", query)
     if compact in FAVORITE_WORDS or re.sub(r"的?(?:歌曲?|音乐)$", "", compact) in FAVORITE_WORDS:
         return "我喜欢"
     return "" if compact in GENERIC_WORDS else query
-
-
-def match_command(text, music_active):
-    normalized = _POLITE.sub("", _PUNCT.sub("", text or ""))
-    if not normalized or len(normalized) > 30:
-        return None
-    vol_match = _VOL_SET.match(normalized)
-    if vol_match:
-        level = parse_cn_number(vol_match.group(1))
-        if level is not None and 0 <= level <= 100:
-            return "volume_set", int(level)
-    sleep_match = _SLEEP_TIMER.match(normalized)
-    if sleep_match and music_active:
-        amount = parse_cn_number(sleep_match.group(1))
-        if amount is not None:
-            minutes = round(amount * (60 if sleep_match.group(2) in ("小时", "钟头") else 1))
-            if 1 <= minutes <= 480:
-                return "sleep_timer", minutes
-    played = _PLAY.match(normalized)
-    if played:
-        return "play", clean_query(played.group(1))
-    for name, pattern in _COMMANDS:
-        if pattern.match(normalized):
-            if name in _ANYTIME or music_active:
-                return name, None
-            return None
-    return None
 
 
 def write_private(path, data):
@@ -257,7 +104,7 @@ def set_mute(muted):
     notify_ui_volume()
 
 
-def set_volume(level=None, change=None):
+def change_volume(level=None, change=None):
     if level is not None:
         value = f"{max(0, min(100, int(level))) / 100:.2f}"
     else:
@@ -1128,7 +975,7 @@ class QQMusic(Source):
 
 
 class MusicService:
-    def __init__(self, emit, duck_level):
+    def __init__(self, emit, duck_level, check_cancel=None):
         self.emit = emit
         self.account = None
         self.flow = None
@@ -1141,7 +988,7 @@ class MusicService:
         self.qq = QQMusic(self.on_login)
         self.sources = [self.qq, Netease()]
         self.player = Player(self.resolve, self.extend, self.on_player, duck_level, self.load_mode())
-        self.tools = TOOLS
+        self.check_turn = check_cancel
 
     @staticmethod
     def load_mode():
@@ -1462,85 +1309,55 @@ class MusicService:
     @staticmethod
     def volume(level=None, change=None):
         try:
-            value = set_volume(level, change)
+            value = change_volume(level, change)
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             logging.warning("音量调节失败：%s", error)
             return "音量调节失败"
         return f"音量已调到百分之{value}" if value is not None else "音量已调整"
 
-    def run_command(self, name, argument, check_cancel=None):
-        """Returns (reply, ok, playback_started)."""
-        if name == "play":
-            reply, started = self.play_query(argument, check_cancel)
-            return reply, started, started
-        if name == "volume_set":
-            reply = self.volume(level=argument)
-            return reply, reply != "音量调节失败", False
-        if name in ("louder", "quieter"):
-            reply = self.volume(change=10 if name == "louder" else -10)
-            return reply, reply != "音量调节失败", False
-        if name in ("mute", "unmute"):
-            set_mute(name == "mute")
-            return ("已静音" if name == "mute" else f"已取消静音，当前音量百分之{read_volume() or 0}"), True, False
-        if name == "what_volume":
+    def play_music(self, args):
+        reply, started = self.play_query(clean_query(args.get("query")), self.check_turn)
+        return Result(reply, started, started)
+
+    def control_music(self, args):
+        minutes = args.get("minutes")
+        reply, started = self.control(str(args.get("action") or ""), self.check_turn,
+                                      minutes=minutes if type(minutes) is int and minutes > 0 else None)
+        return Result(reply, not reply.startswith(("现在没有", "不支持", "当前没有")), started)
+
+    def set_volume(self, args):
+        def number(key):
+            value = args.get(key)
+            return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+        mute, level, change = args.get("mute"), number("level"), number("change")
+        if mute in (True, "mute"):
+            set_mute(True)
+            return Result("已静音", True)
+        if level is not None and level > 0:
+            reply = self.volume(level=level)
+        elif change:
+            reply = self.volume(change=change)
+        elif mute in (False, "unmute"):
+            set_mute(False)
+            return Result(f"已取消静音，当前音量百分之{read_volume() or 0}", True)
+        elif level == 0:
+            reply = self.volume(level=0)
+        else:
+            return Result("没有听懂要调到多大音量", False)
+        return Result(reply, reply != "音量调节失败")
+
+    def playback_status(self, args):
+        if args.get("item") == "volume":
             vol, muted = read_volume_status()
             if vol is None:
-                return "暂时无法读取当前音量", False, False
-            return (f"当前已静音，音量设为百分之{vol}" if muted else f"当前音量是百分之{vol}"), True, False
-        if name == "sleep_timer":
-            reply, ok = self.set_sleep_timer(argument)
-            return reply, ok, False
-        if name == "cancel_sleep":
-            reply, ok = self.set_sleep_timer(0)
-            return reply, ok, False
-        if name == "what_song":
-            track = self.player.current()
-            if not track or self.player.state == "stopped":
-                return "现在没有在播放音乐", False, False
-            artist = track.get("artist") or ""
-            return (f"正在播放{artist}的《{track['title']}》" if artist else f"正在播放《{track['title']}》"), True, False
-        reply, started = self.control(name, check_cancel)
-        return reply, not reply.startswith(("现在没有", "不支持")), started
-
-    def call_tool(self, name, arguments, check_cancel=None):
-        """Returns (reply, ok, playback_started)."""
-        try:
-            args = json.loads(arguments or "{}")
-        except ValueError:
-            args = {}
-        if not isinstance(args, dict):
-            args = {}
-        if name == "play_music":
-            reply, started = self.play_query(clean_query(args.get("query"), from_tool=True), check_cancel)
-            return reply, started, started
-        if name == "control_music":
-            action = str(args.get("action") or "")
-            minutes = args.get("minutes")
-            reply, started = self.control(action, check_cancel, minutes=minutes if type(minutes) is int and minutes > 0 else None)
-            return reply, not reply.startswith(("现在没有", "不支持", "当前没有")), started
-        if name == "set_volume":
-            mute_arg = args.get("mute")
-            raw_level = args.get("level")
-            raw_change = args.get("change")
-            level = int(raw_level) if isinstance(raw_level, (int, float)) and not isinstance(raw_level, bool) else None
-            change = int(raw_change) if isinstance(raw_change, (int, float)) and not isinstance(raw_change, bool) else None
-            if mute_arg in (True, "mute"):
-                set_mute(True)
-                return "已静音", True, False
-            if level is not None and level > 0:
-                reply = self.volume(level=level)
-                return reply, reply != "音量调节失败", False
-            if change is not None and change != 0:
-                reply = self.volume(change=change)
-                return reply, reply != "音量调节失败", False
-            if mute_arg in (False, "unmute"):
-                set_mute(False)
-                return f"已取消静音，当前音量百分之{read_volume() or 0}", True, False
-            if level == 0:
-                reply = self.volume(level=0)
-                return reply, reply != "音量调节失败", False
-            return "没有听懂要调到多大音量", False, False
-        return "不支持这个操作", False, False
+                return Result("暂时无法读取当前音量", False)
+            return Result(f"当前已静音，音量设为百分之{vol}" if muted else f"当前音量是百分之{vol}", True)
+        track = self.player.current()
+        if not track or self.player.state == "stopped":
+            return Result("现在没有在播放音乐", False)
+        artist = track.get("artist") or ""
+        return Result(f"正在播放{artist}的《{track['title']}》" if artist else f"正在播放《{track['title']}》", True)
 
     def ui_command(self, action, **kwargs):
         self.cancel_pending()
