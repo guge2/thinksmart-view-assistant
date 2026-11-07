@@ -27,32 +27,36 @@ from system import (  # noqa: E402
     credentials_configured,
     read_wake_phrase,
     request_wake_word,
+    valid_location,
 )
 from touch import Touchscreen  # noqa: E402
 
 W, H = 800, 1280
-BG = (0, 0, 0)
-CARD = (24, 24, 24)
-CARD_PRESSED = (48, 48, 48)
-LINE = (34, 34, 34)
-TEXT = (238, 238, 238)
-DIM = (150, 150, 150)
-FAINT = (92, 92, 92)
-ACCENT = TEXT
-ACCENT_PRESSED = (170, 170, 170)
+# Flat warm black, warm white type, and a single signal orange for what is live right now.
+BG = (12, 12, 13)
+CARD = (27, 27, 29)
+CARD_PRESSED = (48, 47, 50)
+LINE = (38, 38, 40)
+TEXT = (242, 240, 236)
+DIM = (146, 143, 138)
+FAINT = (86, 85, 82)
+ACCENT = (255, 110, 60)
+ACCENT_PRESSED = (214, 88, 46)
+ON_ACCENT = (24, 12, 6)
 GOOD = TEXT
-WARN = (200, 200, 200)
-BAD = TEXT
+WARN = (255, 170, 90)
+BAD = (255, 90, 80)
 WHITE = (255, 255, 255)
+ORB_COLORS = {"idle": (196, 193, 188), "muted": FAINT, "offline": FAINT, "error": BAD}
 ACTIVE = {"wake", "listen", "think", "answer", "speak"}
 CLOUD_STATES = {"ready", "busy", "offline", "auth", "error"}
 WEEKDAYS = "一二三四五六日"
 PHASE_TEXT = {
-    "wake": ("我在，请说", TEXT),
-    "listen": ("正在聆听…", TEXT),
-    "think": ("正在思考…", DIM),
-    "answer": ("正在回答", DIM),
-    "speak": ("正在播报", DIM),
+    "wake": ("我在，请说", ACCENT),
+    "listen": ("正在聆听…", ACCENT),
+    "think": ("正在思考…", TEXT),
+    "answer": ("正在回答", TEXT),
+    "speak": ("正在播报", TEXT),
 }
 ERRORS = {
     "network": "网络连接失败，请检查 Wi-Fi",
@@ -77,7 +81,6 @@ LYRIC_DELAY = 0.5
 LYRIC_LEAD = 0.5
 LYRIC_SPAN = 4
 CARD_RECT = (16, 700, 784, 1264)
-CARD_EDGE = (56, 56, 56)
 UI_FONTS = (
     ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
     ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
@@ -253,7 +256,8 @@ class Orb:
             d.ellipse((c - w * 1.2, c + core * 0.24, c + w * 1.2, c + core * 0.24 + w * 2.4), fill=240)
 
         mask = self.canvas.reduce(self.SCALE)
-        frame.paste(WHITE, (rect[0], rect[1], rect[0] + mask.width, rect[1] + mask.height), mask)
+        color = ORB_COLORS.get(state, ACCENT)
+        frame.paste(color, (rect[0], rect[1], rect[0] + mask.width, rect[1] + mask.height), mask)
 
 def draw_wifi(d, x, y, bars, on, off):
     for index, radius in enumerate((7, 13, 19)):
@@ -324,8 +328,8 @@ def draw_sun(d, cx, cy, s, day, background):
     for index in range(8):
         angle = index * math.pi / 4
         d.line((cx + math.cos(angle) * s * 0.36, cy + math.sin(angle) * s * 0.36,
-                cx + math.cos(angle) * s * 0.5, cy + math.sin(angle) * s * 0.5), fill=TEXT, width=max(3, int(s * 0.05)))
-    d.ellipse((cx - s * 0.24, cy - s * 0.24, cx + s * 0.24, cy + s * 0.24), fill=TEXT)
+                cx + math.cos(angle) * s * 0.5, cy + math.sin(angle) * s * 0.5), fill=ACCENT, width=max(3, int(s * 0.05)))
+    d.ellipse((cx - s * 0.24, cy - s * 0.24, cx + s * 0.24, cy + s * 0.24), fill=ACCENT)
 
 
 def draw_weather_icon(d, kind, cx, cy, s, day, background):
@@ -354,7 +358,7 @@ def draw_weather_icon(d, kind, cx, cy, s, day, background):
         elif kind == "storm":
             d.polygon([(cx + s * 0.05, base - s * 0.04), (cx - s * 0.12, base + s * 0.16), (cx, base + s * 0.16),
                        (cx - s * 0.08, base + s * 0.34), (cx + s * 0.16, base + s * 0.1), (cx + s * 0.03, base + s * 0.1)],
-                      fill=TEXT)
+                      fill=ACCENT)
 
 class App:
     def __init__(self):
@@ -464,7 +468,7 @@ class App:
     def make_background(assist):
         image = Image.new("RGB", (W, H), BG)
         if assist:
-            ImageDraw.Draw(image).rounded_rectangle(CARD_RECT, radius=44, fill=CARD, outline=CARD_EDGE, width=2)
+            ImageDraw.Draw(image).rounded_rectangle(CARD_RECT, radius=40, fill=CARD)
         return image
 
     # ---- layout -------------------------------------------------------
@@ -535,16 +539,17 @@ class App:
 
     def bottom_buttons(self):
         return [
-            Widget("mic", (40, 1168, 260, 1256), self.paint_mic_button, tap=self.toggle_mic),
-            Widget("settings", (540, 1168, 760, 1256), self.paint_settings_button, tap=self.open_settings),
+            Widget("mic", (32, 1180, 212, 1252), self.paint_mic_button, tap=self.toggle_mic),
+            Widget("settings", (588, 1180, 768, 1252), self.paint_settings_button, tap=self.open_settings),
         ]
 
     def build_idle(self):
+        # A centred stack: the clock leads, date and weather follow beneath it.
         widgets = [
             self.status_widget(),
-            Widget("clock", (40, 64, 420, 190), self.paint_clock, tap=lambda x, y: self.set_screen("alarms")),
-            Widget("date", (40, 190, 420, 236), self.paint_date, tap=lambda x, y: self.set_screen("alarms")),
-            Widget("weather", (420, 64, 760, 236), self.paint_weather, tap=lambda x, y: self.set_screen("weather")),
+            Widget("clock", (40, 60, 760, 268), self.paint_clock, tap=lambda x, y: self.set_screen("alarms")),
+            Widget("date", (40, 268, 760, 320), self.paint_date, tap=lambda x, y: self.set_screen("alarms")),
+            Widget("weather", (40, 320, 760, 400), self.paint_weather, tap=lambda x, y: self.set_screen("weather")),
         ]
         if self.layout_has("lyrics"):
             self.lyric_index = -2
@@ -552,19 +557,19 @@ class App:
             # The assistant card covers the bottom of the home screen; keep what is above it.
             bottom = CARD_RECT[1] - 12
             if self.layout_has("lyrics"):
-                widgets.append(Widget("lyrics", (24, 250, 776, bottom), self.paint_lyrics, tap=self.toggle_lyrics))
+                widgets.append(Widget("lyrics", (24, 412, 776, bottom), self.paint_lyrics, tap=self.toggle_lyrics))
             elif self.layout_has("music"):
                 widgets.append(Widget("player", (40, bottom - 110, 760, bottom), self.paint_player, tap=self.tap_player))
             return widgets + self.card_widgets()
         if self.layout_has("lyrics"):
-            widgets.append(Widget("lyrics", (24, 276, 776, 1016), self.paint_lyrics, tap=self.toggle_lyrics))
+            widgets.append(Widget("lyrics", (24, 424, 776, 1016), self.paint_lyrics, tap=self.toggle_lyrics))
         else:
-            self.orb_rect = (180, 400, 620, 840)
+            self.orb_rect = (220, 500, 580, 860)
             widgets.append(Widget("orb", self.orb_rect, None, tap=self.tap_orb))
         if self.layout_has("music"):
             widgets.append(Widget("player", (40, 1032, 760, 1142), self.paint_player, tap=self.tap_player))
         else:
-            widgets.append(Widget("hint", (40, 880, 760, 960), self.paint_hint))
+            widgets.append(Widget("hint", (40, 890, 760, 960), self.paint_hint))
         return widgets + self.bottom_buttons()
 
     def card_widgets(self):
@@ -588,7 +593,7 @@ class App:
             self.status_widget(),
             Widget("title", (0, 72, 560, 172), lambda d, r, p: self.paint_title(d, r, title)),
             Widget("header", (580, 88, 760, 156),
-                   lambda d, r, p: self.paint_button(d, r, p, button, primary=True), tap=action),
+                   lambda d, r, p: self.paint_button(d, r, p, button), tap=action),
         ]
 
     def build_settings(self):
@@ -886,30 +891,39 @@ class App:
         d.text((speaker_x - 22, cy), label, font=font, fill=color, anchor="rm")
 
     def paint_clock(self, d, rect, pressed):
-        d.text((rect[0] + 4, rect[3] - 14), time.strftime("%H:%M"),
-               font=self.fonts.thin(108), fill=TEXT, anchor="ls")
+        d.text((W // 2, rect[3] - 12), time.strftime("%H:%M"), font=self.fonts.thin(200), fill=TEXT, anchor="ms")
+
+    def paint_runs(self, d, cy, runs):
+        """Draws (text, font, colour) runs, or (None, radius, colour) dots, centred as one line."""
+        widths = [font.getlength(text) if text is not None else font * 2 for text, font, _ in runs]
+        x = (W - sum(widths)) / 2
+        for (text, font, color), width in zip(runs, widths):
+            if text is None:
+                d.ellipse((x, cy - font, x + width, cy + font), fill=color)
+            else:
+                d.text((x, cy), text, font=font, fill=color, anchor="lm")
+            x += width
 
     def paint_date(self, d, rect, pressed):
+        cy = (rect[1] + rect[3]) // 2
         now = time.localtime()
-        text = f"{now.tm_mon}月{now.tm_mday}日  星期{WEEKDAYS[now.tm_wday]}"
+        font = self.fonts.ui(30)
+        runs = [(f"{now.tm_mon}月{now.tm_mday}日  星期{WEEKDAYS[now.tm_wday]}", font, DIM)]
         alarm = self.next_alarm
         if isinstance(alarm, dict) and isinstance(alarm.get("due"), (int, float)):
             remain = max(0, int(alarm["due"] - time.time()))
             if alarm.get("kind") == "timer" and remain < 3600:
-                text += f"  ·  计时 {remain // 60:02d}:{remain % 60:02d}"
-            elif alarm.get("time"):
-                prefix = "闹钟" if alarm.get("kind") == "alarm" else "提醒"
-                text += f"  ·  {prefix} {alarm['time']}"
-        font = self.fonts.ui(28)
-        d.text((rect[0] + 10, (rect[1] + rect[3]) // 2),
-               self.fit(text, font, rect[2] - rect[0] - 10),
-               font=font, fill=DIM, anchor="lm")
+                label, value = "计时", f"{remain // 60:02d}:{remain % 60:02d}"
+            else:
+                label, value = ("闹钟" if alarm.get("kind") == "alarm" else "提醒"), alarm.get("time")
+            if value:
+                runs += [("      ", font, DIM), (None, 6, ACCENT), ("  " + label + " ", font, DIM), (value, font, TEXT)]
+        self.paint_runs(d, cy, runs)
 
     def paint_weather(self, d, rect, pressed):
-        x0, y0, x1, y1 = rect
-        right = x1 - 4
+        cy = (rect[1] + rect[3]) // 2
         weather = self.status.weather
-        small = self.fonts.ui(24)
+        small = self.fonts.ui(30)
         if not weather:
             if self.status.network["kind"] == "none":
                 detail = "等待网络连接…"
@@ -917,24 +931,27 @@ class App:
                 detail = "天气获取失败"
             else:
                 detail = "正在获取天气…"
-            d.text((right, y1 - 23), self.fit(detail, small, x1 - x0), font=small, fill=FAINT, anchor="rm")
+            d.text((W // 2, cy), detail, font=small, fill=FAINT, anchor="mm")
             return
         description, kind = WEATHER_CODES.get(weather.get("code"), ("未知", "cloud"))
-        temp_font = self.fonts.thin(64)
+        temp_font = self.fonts.digits(44)
         temp = f"{round(weather['temp'])}°"
-        icon = 60
-        baseline = y0 + 112
-        d.text((right, baseline), temp, font=temp_font, fill=TEXT, anchor="rs")
-        left = right - temp_font.getlength(temp) - 18 - icon
-        draw_weather_icon(d, kind, left + icon / 2, baseline - 24, icon, weather.get("day", True), BG)
-        parts = [self.settings["location"]["name"], description]
+        parts = [description]
         days = weather.get("days") or []
         if days:
-            parts.append(f"{round(days[0]['min'])}°/{round(days[0]['max'])}°")
+            parts.append(f"{round(days[0]['min'])}°–{round(days[0]['max'])}°")
+        parts.append(self.settings["location"]["name"])
         if self.status.weather_failed:
             parts.append("离线")
-        line = self.fit(" · ".join(parts), small, x1 - x0)
-        d.text((right, y1 - 23), line, font=small, fill=DIM, anchor="rm")
+        detail = self.fit("  ·  ".join(parts), small, 520)
+        icon = 50
+        width = icon + 16 + temp_font.getlength(temp) + 20 + small.getlength(detail)
+        x = (W - width) / 2
+        draw_weather_icon(d, kind, x + icon / 2, cy, icon, weather.get("day", True), BG)
+        x += icon + 16
+        d.text((x, cy), temp, font=temp_font, fill=TEXT, anchor="lm")
+        x += temp_font.getlength(temp) + 20
+        d.text((x, cy), detail, font=small, fill=DIM, anchor="lm")
 
     def hint(self, now):
         if self.error_code and now < self.error_until:
@@ -960,26 +977,26 @@ class App:
     def paint_mic_button(self, d, rect, pressed):
         self.panel(d, rect, pressed)
         cy = (rect[1] + rect[3]) // 2
-        color = DIM if self.mic_on else TEXT
-        draw_mic(d, rect[0] + 62, cy - 2, 24, color, not self.mic_on)
-        d.text((rect[0] + 104, cy), "麦克风" if self.mic_on else "已静音",
-               font=self.fonts.ui(30), fill=color, anchor="lm")
+        color = DIM if self.mic_on else BAD
+        draw_mic(d, rect[0] + 40, cy - 2, 17, color, not self.mic_on)
+        d.text((rect[0] + 70, cy), "麦克风" if self.mic_on else "已静音",
+               font=self.fonts.ui(24), fill=color, anchor="lm")
 
     def paint_settings_button(self, d, rect, pressed):
         self.panel(d, rect, pressed)
         cy = (rect[1] + rect[3]) // 2
-        draw_gear(d, rect[0] + 62, cy, 24, DIM, CARD_PRESSED if pressed else BG)
-        d.text((rect[0] + 104, cy), "设置", font=self.fonts.ui(30), fill=DIM, anchor="lm")
+        draw_gear(d, rect[2] - 40, cy, 17, DIM, CARD_PRESSED if pressed else BG)
+        d.text((rect[2] - 70, cy), "设置", font=self.fonts.ui(24), fill=DIM, anchor="rm")
 
     def paint_stop(self, d, rect, pressed):
         if self.phase not in ACTIVE and not self.alarm_active:
             return
         if self.alarm_active:
-            d.rounded_rectangle(rect, radius=36, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
+            d.rounded_rectangle(rect, radius=36, fill=ACCENT_PRESSED if pressed else ACCENT)
             cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
-            d.text((cx, cy), "停止", font=self.fonts.ui(24), fill=TEXT, anchor="mm")
+            d.text((cx, cy), "停止", font=self.fonts.ui(26), fill=ON_ACCENT, anchor="mm")
             return
-        d.ellipse(rect, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
+        d.ellipse(rect, fill=LINE if pressed else CARD_PRESSED)
         cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
         r = 12
         d.line((cx - r, cy - r, cx + r, cy + r), fill=TEXT, width=3)
@@ -988,9 +1005,9 @@ class App:
     def paint_snooze(self, d, rect, pressed):
         if not self.alarm_active:
             return
-        d.rounded_rectangle(rect, radius=36, fill=CARD_PRESSED if pressed else CARD, outline=FAINT, width=2)
+        d.rounded_rectangle(rect, radius=36, fill=LINE if pressed else CARD_PRESSED)
         cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
-        d.text((cx, cy), "稍后", font=self.fonts.ui(24), fill=TEXT, anchor="mm")
+        d.text((cx, cy), "稍后", font=self.fonts.ui(26), fill=TEXT, anchor="mm")
     @staticmethod
     def clock_text(seconds):
         seconds = max(0, int(seconds))
@@ -1026,9 +1043,10 @@ class App:
         d.text((x0 + 8, y0 + 78), self.fit(detail.strip(), small, controls - x0 - 24),
                font=small, fill=DIM, anchor="lm")
         left, right, y = x0 + 8, x1 - 8, y1 - 4
-        d.line((left, y, right, y), fill=LINE, width=2)
+        d.rounded_rectangle((left, y - 2, right, y + 2), radius=2, fill=LINE)
         if duration > 0:
-            d.line((left, y, left + (right - left) * min(1.0, position / duration), y), fill=DIM, width=2)
+            done = left + (right - left) * min(1.0, position / duration)
+            d.rounded_rectangle((left, y - 2, max(left + 4, done), y + 2), radius=2, fill=ACCENT)
         cy = y0 + 52
         cx = controls + 42
         d.rounded_rectangle((cx - 34, cy - 22, cx + 34, cy + 22), radius=22, outline=FAINT, width=2)
@@ -1038,12 +1056,12 @@ class App:
         d.rectangle((cx - 15, cy - 15, cx - 11, cy + 15), fill=DIM)
         d.polygon([(cx + 15, cy - 15), (cx - 9, cy), (cx + 15, cy + 15)], fill=DIM)
         cx = controls + 210
-        d.ellipse((cx - 36, cy - 36, cx + 36, cy + 36), outline=FAINT, width=2)
+        d.ellipse((cx - 36, cy - 36, cx + 36, cy + 36), fill=ACCENT)
         if state == "paused":
-            d.polygon([(cx - 10, cy - 17), (cx - 10, cy + 17), (cx + 18, cy)], fill=TEXT)
+            d.polygon([(cx - 10, cy - 17), (cx - 10, cy + 17), (cx + 18, cy)], fill=ON_ACCENT)
         else:
-            d.rectangle((cx - 12, cy - 16, cx - 5, cy + 16), fill=TEXT)
-            d.rectangle((cx + 5, cy - 16, cx + 12, cy + 16), fill=TEXT)
+            d.rectangle((cx - 12, cy - 16, cx - 5, cy + 16), fill=ON_ACCENT)
+            d.rectangle((cx + 5, cy - 16, cx + 12, cy + 16), fill=ON_ACCENT)
         cx = controls + 294
         d.rectangle((cx + 11, cy - 15, cx + 15, cy + 15), fill=DIM)
         d.polygon([(cx - 15, cy - 15), (cx + 9, cy), (cx - 15, cy + 15)], fill=DIM)
@@ -1162,7 +1180,7 @@ class App:
         x0, y0, x1, _y1 = rect
         text = self.partial or self.user_text
         if text:
-            color = DIM if self.partial else WARN
+            color = DIM
         elif self.phase in ("wake", "listen"):
             text, color = "请说出你的问题…", FAINT
         else:
@@ -1197,9 +1215,9 @@ class App:
         if primary:
             d.rounded_rectangle(rect, radius=34, fill=ACCENT_PRESSED if pressed else ACCENT)
         else:
-            d.rounded_rectangle(rect, radius=34, fill=CARD_PRESSED if pressed else BG, outline=FAINT, width=2)
+            d.rounded_rectangle(rect, radius=34, fill=CARD_PRESSED if pressed else CARD)
         d.text(((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2), label,
-               font=self.fonts.ui(32), fill=BG if primary else TEXT, anchor="mm")
+               font=self.fonts.ui(32), fill=ON_ACCENT if primary else TEXT, anchor="mm")
 
     def paint_slider(self, d, rect, label, value, enabled, shown=None):
         x0, y0, x1, y1 = rect
@@ -1292,9 +1310,9 @@ class App:
         self.row(d, rect, pressed)
         d.text((x0 + 32, cy), label, font=self.fonts.ui(34), fill=TEXT, anchor="lm")
         track = (x1 - 128, cy - 26, x1 - 32, cy + 26)
-        d.rounded_rectangle(track, radius=26, fill=TEXT if on else LINE)
+        d.rounded_rectangle(track, radius=26, fill=ACCENT if on else LINE)
         knob = track[2] - 26 if on else track[0] + 26
-        d.ellipse((knob - 20, cy - 20, knob + 20, cy + 20), fill=BG if on else DIM)
+        d.ellipse((knob - 20, cy - 20, knob + 20, cy + 20), fill=WHITE if on else DIM)
         d.text((track[0] - 20, cy), "开启" if on else "关闭", font=self.fonts.ui(30), fill=DIM, anchor="rm")
 
     def paint_notice(self, d, rect, pressed):
@@ -1409,7 +1427,7 @@ class App:
             d.line((cx - 2, cy + 8, cx + 14, cy - 8), fill=TEXT, width=3)
         else:
             d.text((cx, cy), label, font=self.fonts.ui(36 if len(label) == 1 else 32),
-                   fill=BG if primary else TEXT, anchor="mm")
+                   fill=ON_ACCENT if primary else TEXT, anchor="mm")
 
     def paint_places_message(self, d, rect, pressed):
         text = {
@@ -1650,7 +1668,36 @@ class App:
 
     def send_prefs(self):
         self.link.send("prefs", rate=self.settings["speech_rate"], think=int(self.settings["thinking"]),
-                       night=self.settings["night"])
+                       night=self.settings["night"], brightness=round(self.brightness))
+
+    def apply_voice_settings(self, message, now):
+        """Settings changed by voice; this process owns the settings file and the backlight."""
+        values = {}
+        brightness = message.get("brightness")
+        if type(brightness) is int and 1 <= brightness <= 100 and self.status.backlight.writable():
+            self.brightness = values["brightness"] = brightness
+        rate = message.get("speech_rate")
+        if isinstance(rate, (int, float)) and 0.5 <= rate <= 2.0:
+            values["speech_rate"] = round(float(rate), 1)
+        if isinstance(message.get("thinking"), bool):
+            values["thinking"] = message["thinking"]
+        if isinstance(message.get("night"), bool):
+            values["night"] = dict(self.settings["night"], enabled=message["night"])
+        location = valid_location(message.get("location"))
+        if location:
+            values["location"] = location
+        if values:
+            self.save_settings(**values)
+            self.send_prefs()
+            if location:
+                self.status.refresh_weather()
+        self.activity(now)
+        self.update_dim(now)
+        target = message.get("screen")
+        if target in ("home", "weather", "alarms", "settings", "music", "night"):
+            self.cancel_login()
+            self.screen = target
+        self.full_redraw = True
 
     def toggle_night(self, *_args):
         night = dict(self.settings["night"])
@@ -1700,6 +1747,7 @@ class App:
         self.brightness = max(5, self.slider_value("brightness", x))
         if phase == "up":
             self.save_settings(brightness=self.brightness)
+            self.send_prefs()
             if self.night_active() and self.brightness > 20:
                 self.set_notice("日常亮度已保存，夜间模式中限制为 20%", DIM, 5)
             self.update_dim(time.monotonic())
@@ -1978,15 +2026,8 @@ class App:
         if event == "sleep":
             self.sleep()
             return
-        if event == "ui_sync":
-            self.activity(now)
-            self.next_settings_check = 0.0
-            self.next_tick = min(self.next_tick, now + 0.05)
-            target = message.get("screen")
-            if target in ("home", "weather", "alarms", "settings", "music", "night"):
-                self.cancel_login()
-                self.screen = target
-                self.full_redraw = True
+        if event == "ui_set":
+            self.apply_voice_settings(message, now)
             return
         self.activity(now)
         if event == "wake":

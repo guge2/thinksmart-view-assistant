@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import select
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,8 @@ import uuid
 STATE_FILE = "/data/thinksmart/music/alarms.json"
 MAX_ITEMS = 64
 NAMES = {"alarm": "闹钟", "timer": "计时器", "reminder": "提醒"}
+# Alarms wake with music, which plays this long unless stopped; timers and reminders beep.
+MUSIC_SECONDS = 300
 
 TOOLS = [{
     "type": "function",
@@ -173,10 +176,11 @@ def plan_time(args, kind, now):
 class AlarmService:
     tools = TOOLS
 
-    def __init__(self, emit=None, state_file=STATE_FILE, on_ring=None):
+    def __init__(self, emit=None, state_file=STATE_FILE, on_ring=None, music=None):
         self.emit = emit
         self.state_file = state_file
         self.on_ring = on_ring
+        self.music = music
         self.lock = threading.RLock()
         self.stopped = threading.Event()
         self.silence = threading.Event()
@@ -472,6 +476,7 @@ class AlarmService:
                 self.last_rang = (dict(due), mono)
                 self.silence.clear()
             delivered = False
+            logging.info("%s响铃：%s", NAMES[due["kind"]], due.get("label") or due["id"])
             if self.on_ring:
                 try:
                     self.on_ring(True)
@@ -480,7 +485,12 @@ class AlarmService:
             try:
                 if self.emit:
                     self.emit("alarm", text=(due.get("label") or NAMES[due["kind"]]) + "时间到了")
-                if due.get("label"):
+                if due["kind"] == "alarm" and self.music is not None:
+                    if due.get("label"):
+                        self._announce(due["label"] + "时间到了")
+                    if not self._ring_music():
+                        self._ring(cycles=100)
+                elif due.get("label"):
                     for _ in range(3):
                         if self.silence.is_set() or self.stopped.is_set():
                             break
@@ -527,6 +537,30 @@ class AlarmService:
                     except Exception:
                         pass
 
+    def _ring_music(self):
+        """False when no music could start; the caller beeps instead."""
+        def cancelled():
+            return self.silence.is_set() or self.stopped.is_set()
+
+        if cancelled() or not self.music.play_alarm(cancelled):
+            return False
+        player = self.music.player
+        deadline = time.monotonic() + MUSIC_SECONDS
+        position, moved = player.position, time.monotonic()
+        try:
+            while not self.silence.wait(0.5) and not self.stopped.is_set() and time.monotonic() < deadline:
+                if player.state not in ("loading", "playing"):
+                    break
+                # Between songs the player loads the next one; its own retries bound that.
+                if player.state == "loading" or player.position != position:
+                    position, moved = player.position, time.monotonic()
+                elif time.monotonic() - moved > 5:
+                    # A stalled audio graph: give up, so audio can be rebuilt and the alarm retried.
+                    raise RuntimeError("alarm music stalled")
+        finally:
+            player.stop()
+        return True
+
     def _ring(self, cycles=100):
         if self.silence.is_set() or self.stopped.is_set():
             return
@@ -542,12 +576,17 @@ class AlarmService:
                    "--rate", str(rate), "--channels", "1", "--format", "s16", "--latency", "100ms", "-"]
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tone = samples.tobytes()
-        step = rate * 2 // 10
+        # Chunks under PIPE_BUF never block once select reports the pipe writable.
+        step = rate * 2 // 20
         chunks = [tone[offset:offset + step] for offset in range(0, len(tone), step)]
         try:
             for chunk in chunks * cycles:
                 if self.silence.is_set() or self.stopped.is_set():
                     break
+                # A stalled audio graph stops draining the pipe. Give up, so the assistant
+                # can rebuild the audio chain, and ring again on the retry.
+                if not select.select([], [process.stdin], [], 3)[1]:
+                    raise RuntimeError("alarm speaker stalled")
                 process.stdin.write(chunk)
                 process.stdin.flush()
         finally:

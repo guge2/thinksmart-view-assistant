@@ -8,6 +8,8 @@ import time
 import urllib.parse
 
 HISTORY_TURNS = 6
+# Model requests per turn; the last one may not call tools, so a failing tool cannot loop.
+MAX_STEPS = 4
 IDLE_TIMEOUT = 90
 USER_AGENT = "pi/0.60.0 (linux; python/3.12; arm64)"
 
@@ -172,18 +174,12 @@ class Brain:
             step = 0
             while True:
                 check_cancel()
-                first_step = step == 0
                 step += 1
+                tool_choice = force_tool if step == 1 else "none" if step >= MAX_STEPS else None
                 if is_responses:
-                    gen = self._stream_responses(
-                        selected, context, search, force_tool if first_step else None,
-                        expert, timeout, check_cancel,
-                    )
+                    gen = self._stream_responses(selected, context, search, tool_choice, expert, timeout, check_cancel)
                 else:
-                    gen = self._stream_completions(
-                        selected, context, thinking, search, force_tool if first_step else None,
-                        timeout, check_cancel,
-                    )
+                    gen = self._stream_completions(selected, context, thinking, search, tool_choice, timeout, check_cancel)
                 assistant_msg = None
                 for item in gen:
                     if item[0] == "delta":
@@ -226,15 +222,25 @@ class Brain:
             if self.last_turn is not None and self.last_turn["id"] == req_id:
                 self.last_turn["messages"] = self.messages[len(before):]
 
+    def _user_texts(self, context):
+        """User message texts; live device state goes before the newest one, so the system
+        prompt and history stay a stable prefix the provider can cache."""
+        texts = {i: str(m.get("content") or "") for i, m in enumerate(self.messages) if m.get("role") == "user"}
+        if texts and context:
+            last = max(texts)
+            texts[last] = f"【设备实时状态】{context}\n【用户说】{texts[last]}"
+        return texts
+
     def _build_responses_input(self, selected, context):
-        items = [{"role": "developer", "content": f"{self.config.get('system', '')}{context or ''}"}]
+        items = [{"role": "developer", "content": self.config.get("system", "")}]
+        users = self._user_texts(context)
         msg_idx = 0
-        for msg in self.messages:
+        for index, msg in enumerate(self.messages):
             role = msg.get("role")
             if role == "user":
                 items.append({
                     "role": "user",
-                    "content": [{"type": "input_text", "text": str(msg.get("content") or "")}],
+                    "content": [{"type": "input_text", "text": users[index]}],
                 })
                 msg_idx += 1
             elif role == "assistant":
@@ -313,7 +319,7 @@ class Brain:
         if tools:
             payload["tools"] = tools
         if force_tool:
-            payload["tool_choice"] = {"type": "function", "name": force_tool}
+            payload["tool_choice"] = "none" if force_tool == "none" else {"type": "function", "name": force_tool}
 
         slots = {}
         blocks = []
@@ -437,11 +443,12 @@ class Brain:
         }
 
     def _build_completions_messages(self, context):
-        msgs = [{"role": "system", "content": f"{self.config.get('system', '')}{context or ''}"}]
+        msgs = [{"role": "system", "content": self.config.get("system", "")}]
+        users = self._user_texts(context)
         for idx, msg in enumerate(self.messages):
             role = msg.get("role")
             if role == "user":
-                msgs.append({"role": "user", "content": str(msg.get("content") or "")})
+                msgs.append({"role": "user", "content": users[idx]})
             elif role == "assistant":
                 text_parts = []
                 tool_calls = []
@@ -498,7 +505,7 @@ class Brain:
         if tools:
             payload["tools"] = tools
         if force_tool:
-            payload["tool_choice"] = {"type": "function", "function": {"name": force_tool}}
+            payload["tool_choice"] = "none" if force_tool == "none" else {"type": "function", "function": {"name": force_tool}}
 
         text_parts = []
         tc_by_index = {}

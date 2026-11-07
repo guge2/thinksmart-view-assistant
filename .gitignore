@@ -8,10 +8,6 @@
 /.local/
 *.log
 
-# Agent dependencies and bundle (rebuilt with npm run build)
-/device/agent/node_modules/
-/device/agent/dist/
-
 # Machine-specific shortcuts
 *.lnk
 

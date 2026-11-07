@@ -17,6 +17,7 @@ import threading
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import closing
 from collections import deque
 from itertools import chain
 
@@ -56,11 +57,26 @@ MODEL_OVERRIDES = "/etc/thinksmart-voice/gateway.conf"
 MODEL_ENV = {"chat_model": "THINKSMART_CHAT_MODEL", "chat_provider": "THINKSMART_CHAT_PROVIDER", "expert_model": "THINKSMART_EXPERT_MODEL",
              "tts_model": "THINKSMART_TTS_MODEL", "tts_voice": "THINKSMART_TTS_VOICE"}
 UI_TEXT_LIMIT = 2000
+# A shared ASR/TTS socket idle longer than this is replaced at the next wake, in case it died silently.
+LINK_IDLE_SECONDS = 60
+# A soft cue when a turn has been silent this long, so a slow answer does not sound like a hang.
+THINKING_CUE_SECONDS = float(os.getenv("THINKSMART_THINKING_CUE_SECONDS", "2"))
 ASSISTANT_ROLE = "Assistant"
 FAREWELL_WORDS = re.compile(r"退下|没事|不用|再见|拜拜|休息|去休息|别说|不聊|结束对话|就这样")
 SLEEP_WORDS = re.compile(r"关机|关屏|关闭屏幕|关掉屏幕|息屏|熄屏|睡觉|去睡觉|晚安")
 # Sleep words that also stop music; screen-only words leave playback running.
 POWER_OFF_WORDS = re.compile(r"关机|睡觉|晚安")
+# Recognition ends sentences at short pauses, sometimes before the pause. Listening stops once the
+# user has been quiet this long after a sentence that sounds finished, or after one ending in a
+# comma or connective.
+SPEECH_PAUSE_SECONDS = 1.0
+UNFINISHED_PAUSE_SECONDS = 2.0
+UNFINISHED = re.compile(
+    r"(?:[，、,：:；;]|然后|还有|而且|并且|或者|以及|另外|接着|因为|所以|但是|不过|如果|要是|比如|就是|还是"
+    r"|那么|那个|这个|那|和|跟|与|把|给|让|帮我|我想|我要|嗯|呃|额)[。.！!]*$"
+)
+# Follow-up windows hear the room: a lone syllable or filler is noise unless the reply asked something.
+FILLER = re.compile(r"[嗯啊呃额哦噢喔唉哎诶欸哈呵]+")
 QUESTION_END = re.compile(r"(?:[？?]|[吗呢么][。！!～~]?)[\s”」』\"')）]*$")
 # Without thinking the model often answers weather from web search or memory, so weather turns force
 # the tool and skip search; time is already in the context, so time turns only skip search.
@@ -144,7 +160,7 @@ TOOL_RULES = (
     "3.设备设置与屏幕控制（control_device调节屏幕亮度、播报语速、开关夜间免打扰模式、开关深度思考模式、修改默认天气城市、切换触屏到天气/闹钟/设置/音乐页面或息屏）；"
     "4.闹钟、倒计时与日程提醒管理（manage_alarm创建、查看、取消、贪睡稍后提醒、停止闹钟）；"
     "5.实时天气与三天预报（get_weather）、当前时间日期（get_current_time）及联网搜索。"
-    "设备当前的实时状态（当前音量、是否静音、屏幕亮度、语速、夜间模式、深度思考开关、闹钟列表、正在播放的歌曲与伴睡定时、QQ音乐登录状态、默认城市）已实时注入在系统上下文中；"
+    "设备当前的实时状态（当前音量、是否静音、屏幕亮度、语速、夜间模式、深度思考开关、闹钟列表、正在播放的歌曲与伴睡定时、QQ音乐登录状态、默认城市）附在每轮用户消息前的【设备实时状态】中，是你的系统信息而不是用户说的话；"
     "当用户询问现在音量多少、亮度多少、语速多少、在放什么歌、有哪些闹钟、你有哪些本地功能时，请直接根据上下文准确回答，绝不要说无法查询。"
     "当用户表达不适或隐含调节意图（如“你说话声音好小”“太吵了”“屏幕太刺眼/太暗”“你说太快了”）时，不要反问“需要我调吗”，直接调用set_volume或control_device完成调节。"
     "询问天气时必须调用get_weather，不得猜测。"
@@ -258,6 +274,29 @@ class WakeStream:
                 self.spotter.reset_stream(self.stream)
                 return result
         return ""
+
+
+class VoiceActivity:
+    """Energy detector on the echo-cancelled microphone. Recognition reports only whole
+    sentences, so this is what tells that the user is still, or again, talking."""
+
+    def __init__(self):
+        self.levels = deque(maxlen=50)  # 2 s: the quietest frame is the room, even mid-speech
+        self.run = 0
+        self.speech_at = 0.0  # last frame of speech
+
+    def feed(self, data, now):
+        samples = array.array("h", data)
+        if sys.byteorder == "big":
+            samples.byteswap()
+        rms = math.sqrt(sum(v * v for v in samples) / max(1, len(samples)))
+        self.levels.append(rms)
+        if rms > max(3 * min(self.levels), 250):
+            self.run += 1
+            if self.run >= 3:  # 120 ms
+                self.speech_at = now
+        else:
+            self.run = 0
 
 
 class WakeDetector:
@@ -569,10 +608,14 @@ class Ducker:
             props = (item.get("info") or {}).get("props") or {}
             # Loopback, filter-chain and echo-cancel internals carry a link
             # group; ducking them would also duck the assistant's own voice.
+            # The assistant's own Pulse streams carry no role, and WirePlumber
+            # would remember a ducked volume for every later reply.
             if (
                 props.get("media.class") == "Stream/Output/Audio"
                 and props.get("media.role") not in (ASSISTANT_ROLE, MUSIC_ROLE)
                 and "node.link-group" not in props
+                and str(props.get("application.process.id")) != str(os.getpid())
+                and props.get("application.name") != "ThinkSmart Assistant"
             ):
                 found.append(item["id"])
         return found
@@ -649,15 +692,17 @@ class ThinkSmartAssistant:
         self.speech_rate = self.clamp_rate(os.getenv("THINKSMART_TTS_RATE", "1.5"))
         self.thinking = os.getenv("THINKSMART_THINKING", "1") != "0"
         self.night = {"enabled": False, "start": 1320, "end": 420}
+        self.brightness = None
         self.load_ui_prefs()
         self.thinking_budget = int(os.getenv("THINKSMART_THINKING_BUDGET", "1024"))
         self.followup_seconds = float(os.getenv("THINKSMART_FOLLOWUP_SECONDS", "4"))
         self.question_followup_seconds = float(os.getenv("THINKSMART_QUESTION_FOLLOWUP_SECONDS", "8"))
         self.turn_effects = []
+        self.failed_tools = set()
         self.next_followup = 0.0
         self.ducker = Ducker(float(os.getenv("THINKSMART_DUCK_LEVEL", "0.45")))
         self.music = MusicService(ui.emit, float(os.getenv("THINKSMART_MUSIC_DUCK_LEVEL", "0.2")))
-        self.alarms = AlarmService(ui.emit, on_ring=self.on_alarm_ring)
+        self.alarms = AlarmService(ui.emit, on_ring=self.on_alarm_ring, music=self.music)
         self.offline_commands = offline.OfflineCommands(KWS_MODEL, f"{VOICE_ROOT}/offline-keywords.txt")
         self.offline_mode = False
         self.music_started = False
@@ -701,13 +746,17 @@ class ThinkSmartAssistant:
         self.wake_started = None
         self.wake_hits = 0
         self.last_wake = None
-        self.playback = None
+        self.link = None
+        self.link_used = 0.0
+        self.link_lock = threading.Lock()
         self.speech_player = None
         self.local_speaking = False
         self.heard_reply = ""
         self.wake_phrase = self.read_wake_phrase()
         self.keyword_spotter = self.create_keyword_spotter()
         self.phase = "idle"
+        self.cue_timer = None
+        self.followup_question = False
         self.cloud_state = "ready"
         self.mic_enabled = threading.Event()
         self.mic_requested = True
@@ -829,7 +878,7 @@ class ThinkSmartAssistant:
             rate = float(value)
         except (TypeError, ValueError):
             return 1.5
-        return round(min(2.0, max(0.5, rate)), 2) if math.isfinite(rate) else 1.5
+        return round(min(2.0, max(0.5, rate)), 1) if math.isfinite(rate) else 1.5
 
     def load_ui_prefs(self):
         try:
@@ -858,7 +907,18 @@ class ThinkSmartAssistant:
         self.phase = phase
         if phase in ("idle", "think") and not self.barge_in_requested.is_set():
             self.clear_audio()
+        if self.cue_timer is not None:
+            self.cue_timer.cancel()
+            self.cue_timer = None
+        if phase == "think" and THINKING_CUE_SECONDS > 0:
+            self.cue_timer = threading.Timer(THINKING_CUE_SECONDS, self.thinking_cue)
+            self.cue_timer.daemon = True
+            self.cue_timer.start()
         self.ui.emit(phase)
+
+    def thinking_cue(self):
+        if self.phase == "think" and not self.cancel_requested.is_set():
+            self.play_cue(self._CUE_NIGHT if self.night_active() else self._CUE_DAY)
 
     def set_cloud(self, state):
         self.cloud_state = state
@@ -879,11 +939,10 @@ class ThinkSmartAssistant:
         self.ui.snapshot()
 
     def on_alarm_ring(self, ringing):
+        # Alarms replace what was playing with their own music; timers and reminders pause it.
         if ringing:
             self.music.hold()
-            self.music.duck(True)
         elif self.phase == "idle":
-            self.music.duck(False)
             self.music.release()
 
     def duck(self):
@@ -1047,8 +1106,10 @@ class ThinkSmartAssistant:
                         self.speech_rate = self.clamp_rate(message.get("rate"))
                     if "think" in message:
                         self.thinking = bool(message.get("think"))
-                    if "night" in message:
+                    if isinstance(message.get("night"), dict):
                         self.night = message["night"]
+                    if type(message.get("brightness")) is int:
+                        self.brightness = message["brightness"]
                     logging.info("语速 %.1f，思考模式%s", self.speech_rate, "开启" if self.thinking else "关闭")
                 elif command == "music":
                     self.music.ui_command(message.get("a"), minutes=message.get("minutes"))
@@ -1440,13 +1501,15 @@ class ThinkSmartAssistant:
         return False
 
     def start_listening(self):
-        """Every entry into listening: the cue means "you can speak now"; speech over it is kept."""
+        """Every entry into listening: the cue means "you can speak now"; speech over it is kept.
+
+        The cue plays while recognition connects; audio has been queued since the wake word."""
         self.set_phase("listen")
-        self.play_listen_tone()
+        threading.Thread(target=self.play_listen_tone, name="listen-tone", daemon=True).start()
 
     @staticmethod
-    def _build_listen_tone(level):
-        attack, decay, length = 0.015, 0.085, 0.32
+    def _build_listen_tone(level, pitch=660, length=0.32):
+        attack, decay = 0.015, 0.085
         samples = array.array("h")
         for index in range(int(PLAYBACK_RATE * length)):
             t = index / PLAYBACK_RATE
@@ -1454,7 +1517,7 @@ class ThinkSmartAssistant:
                 envelope = 0.5 - 0.5 * math.cos(math.pi * t / attack)
             else:
                 envelope = math.exp(-(t - attack) / decay) * min(1.0, (length - t) / 0.02)
-            tone = math.sin(2 * math.pi * 660 * t) + 0.25 * math.sin(2 * math.pi * 1320 * t)
+            tone = math.sin(2 * math.pi * pitch * t) + 0.25 * math.sin(2 * math.pi * 2 * pitch * t)
             samples.append(int(32767 * level * envelope * tone / 1.25))
         if sys.byteorder == "big":
             samples.byteswap()
@@ -1462,68 +1525,105 @@ class ThinkSmartAssistant:
 
     _TONE_DAY = _build_listen_tone.__func__(0.13)
     _TONE_NIGHT = _build_listen_tone.__func__(0.065)
+    _CUE_DAY = _build_listen_tone.__func__(0.06, 440, 0.22)
+    _CUE_NIGHT = _build_listen_tone.__func__(0.03, 440, 0.22)
 
     def play_listen_tone(self):
         # Pre-rendered soft bell: smooth 15 ms attack, natural decay, zero per-wake math overhead.
-        pcm = self._TONE_NIGHT if self.night_active() else self._TONE_DAY
-        self.playback = subprocess.Popen(
-            self.audio_command("--playback", PLAYBACK_RATE),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
+        self.play_cue(self._TONE_NIGHT if self.night_active() else self._TONE_DAY)
+
+    @staticmethod
+    def play_cue(pcm):
         try:
-            self.playback.communicate(pcm, timeout=5)
-            if self.playback.returncode != 0:
-                logging.warning("聆听提示音播放失败")
-        except (OSError, subprocess.TimeoutExpired) as error:
-            logging.warning("聆听提示音播放失败：%s", error)
-            self.stop_process(self.playback)
-        finally:
-            self.playback = None
+            player = PCMPlayer(PLAYBACK_RATE)
+            try:
+                player.write(pcm)
+                player.finish(lambda: None)
+            finally:
+                player.close()
+        except Exception as error:
+            logging.warning("提示音播放失败：%s", error)
+
+    def audio_link(self, refresh=False):
+        """The ASR/TTS websocket shared across turns, so a turn skips the TLS and websocket handshake."""
+        with self.link_lock:
+            link = self.link
+            if link is None or link.closed or (refresh and time.monotonic() - self.link_used > LINK_IDLE_SECONDS):
+                self.link = self.client.ws_connection(module="audio", timeout=8)
+                if link is not None:
+                    threading.Thread(target=link.close, name="link-close", daemon=True).start()
+            self.link_used = time.monotonic()
+            return self.link
+
+    def drop_link(self):
+        with self.link_lock:
+            link, self.link = self.link, None
+        if link is not None:
+            threading.Thread(target=link.close, name="link-close", daemon=True).start()
+
+    def prepare_link(self):
+        try:
+            self.audio_link(refresh=True)
+        except Exception as error:
+            logging.warning("语音连接预建失败：%s", error)
+
+    def open_audio_task(self, factory):
+        """Starts a recognition or synthesis task on the shared socket, else on a socket of its own."""
+        try:
+            return factory(self.audio_link()).start()
+        except TurnCancelled:
+            raise
+        except Exception as error:
+            logging.warning("共享语音连接不可用，改用独立连接：%s", error)
+            self.drop_link()
+        return factory(None).start()
 
     def transcribe_live(self, wait_seconds=None):
-        state = {"text": "", "speech_at": None}
-        speech_seen = threading.Event()
-        sentence_ended = threading.Event()
+        """Recognizes one utterance, which may span several sentences when the user pauses mid-thought."""
+        state = {"sentences": [], "partial": ""}
+
+        def heard():
+            # A sentence the user went on from ends in a comma, not a full stop.
+            parts = [text.rstrip("。.") + ("" if text[-1] in "？?！!，," else "，") for text in state["sentences"][:-1]]
+            return "".join(parts + state["sentences"][-1:]) + state["partial"]
 
         def receive_events(recognition):
             for event in recognition.events():
                 payload = event.get("payload") or {}
                 sentence = (payload.get("output") or {}).get("sentence") or {}
-                text = sentence.get("text")
+                text = (sentence.get("text") or "").strip()
                 if text and not sentence.get("heartbeat") and not self.cancel_requested.is_set():
-                    if text.strip() != state["text"]:
-                        self.ui.emit("partial", text=text.strip())
-                    state["text"] = text.strip()
-                    if state["speech_at"] is None:
-                        state["speech_at"] = time.monotonic()
-                        if self.wake_started is not None:
-                            self.turn_timing["first_text_ms"] = round((state["speech_at"] - self.wake_started) * 1000)
-                    speech_seen.set()
+                    if not state["sentences"] and self.wake_started is not None:
+                        self.turn_timing.setdefault("first_text_ms", round((time.monotonic() - self.wake_started) * 1000))
                     if sentence.get("sentence_end"):
-                        sentence_ended.set()
+                        state["sentences"].append(text)
+                        state["partial"] = ""
+                    else:
+                        state["partial"] = text
+                    self.ui.emit("partial", text=heard())
 
         if wait_seconds is None:
             wait_seconds = float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8"))
         max_seconds = float(os.getenv("THINKSMART_MAX_SPEECH_SECONDS", "25"))
-        with self.client.audio.asr.recognize(
+        with closing(self.open_audio_task(lambda link: self.client.audio.asr.recognize(
             model=self.asr_model,
             format="pcm",
             sample_rate=SAMPLE_RATE,
             timeout=max(10.0, wait_seconds + 5),
-        ) as recognition:
-            wait_deadline = time.monotonic() + wait_seconds
+            connection=link,
+        ))) as recognition:
+            started = time.monotonic()
             if self.wake_started is not None:
-                self.turn_timing["asr_ready_ms"] = round((time.monotonic() - self.wake_started) * 1000)
+                self.turn_timing["asr_ready_ms"] = round((started - self.wake_started) * 1000)
+            voice = VoiceActivity()
+            judged, pause, ended_at = 0, None, 0.0
             with ThreadPoolExecutor(max_workers=1) as pool:
                 receiver = pool.submit(receive_events, recognition)
                 stopped = False
                 try:
                     self.check_cancel()
                     logging.info("开始接收语音")
-                    while not self.stop_requested and not sentence_ended.is_set():
+                    while not self.stop_requested:
                         if self.cancel_requested.is_set():
                             raise TurnCancelled()
                         if receiver.done():
@@ -1532,12 +1632,21 @@ class ThinkSmartAssistant:
                         recognition.send_audio_frame(frame)
                         self.ui.emit("level", v=self.frame_level(frame))
                         now = time.monotonic()
-                        if not speech_seen.is_set() and now >= wait_deadline:
+                        voice.feed(frame, now)
+                        if len(state["sentences"]) > judged:
+                            judged, ended_at = len(state["sentences"]), now
+                            pause = UNFINISHED_PAUSE_SECONDS if UNFINISHED.search(heard()) else SPEECH_PAUSE_SECONDS
+                        # Talking on resets the pause; noise taken for speech brings no new sentence.
+                        if judged and (now - voice.speech_at >= pause or now - ended_at > 10):
                             break
-                        if (
-                            state["speech_at"] is not None
-                            and now - state["speech_at"] >= max_seconds
-                        ):
+                        # Text comes only with a finished sentence, so once the user has been heard
+                        # the wait for it lasts until they have been quiet long enough for it to arrive.
+                        # The first half second is the wake word's tail, queued before listening.
+                        talked = voice.speech_at > started + 0.5
+                        if (not judged and now - started >= wait_seconds
+                                and now - voice.speech_at > (UNFINISHED_PAUSE_SECONDS if talked else 0)):
+                            break
+                        if now - started >= wait_seconds + max_seconds:
                             break
                     recognition.stop()
                     stopped = True
@@ -1555,116 +1664,81 @@ class ThinkSmartAssistant:
         self.check_cancel()
         if self.audio_overflow.is_set():
             raise RuntimeError("microphone command buffer overflow")
-        return state["text"].strip()
+        if len(state["sentences"]) > 1:
+            logging.info("合并了%d句：%s", len(state["sentences"]), heard())
+        return heard().strip()
 
     def device_status_summary(self):
-        vol, muted = read_volume_status()
-        vol_text = f"{vol}%（{'已静音' if muted else '未静音'}）" if vol is not None else "未知"
-        try:
-            settings = information.ui_system.Settings()
-            actual_b = information.ui_system.Backlight().percent()
-            brightness = round(actual_b if actual_b is not None else (settings["brightness"] or 80))
-            night = settings["night"]
-        except Exception:
-            brightness = 80
-            night = self.night
-        sh, sm = divmod(int(night.get("start", 1320)), 60)
-        eh, em = divmod(int(night.get("end", 420)), 60)
-        night_text = (
-            f"开启（时段{sh:02d}:{sm:02d}至{eh:02d}:{em:02d}{'，当前生效中' if self.night_active() else ''}）"
-            if night.get("enabled")
-            else "关闭"
-        )
+        volume, muted = read_volume_status()
+        volume_text = f"{volume}%（{'已静音' if muted else '未静音'}）" if volume is not None else "未知"
+        night = self.night
+        night_text = "关闭"
+        if night.get("enabled"):
+            (sh, sm), (eh, em) = divmod(int(night.get("start", 1320)), 60), divmod(int(night.get("end", 420)), 60)
+            night_text = f"开启（时段{sh:02d}:{sm:02d}至{eh:02d}:{em:02d}{'，当前生效中' if self.night_active() else ''}）"
+        brightness = f"{self.brightness}%" if self.brightness else "未知"
         return (
-            f"设备状态：当前音量{vol_text}，屏幕亮度{brightness}%，"
+            f"设备状态：当前音量{volume_text}，屏幕亮度{brightness}，"
             f"播报语速{self.speech_rate:g}倍，深度思考{'开启' if self.thinking else '关闭'}，"
             f"夜间免打扰模式{night_text}。"
         )
 
     def run_device_tool(self, args):
+        """Works out the new values; the display process owns the settings file and backlight."""
+        def number(key, default):
+            value = args.get(key)
+            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
         if not isinstance(args, dict):
             return "参数格式不正确", False, True
-        settings = information.ui_system.Settings()
-        backlight = information.ui_system.Backlight()
-        results = []
-        changed = False
-        target_screen = ""
-
-        raw_b = args.get("brightness")
-        raw_bc = args.get("brightness_change")
-        b_val = int(raw_b) if isinstance(raw_b, (int, float)) and not isinstance(raw_b, bool) else -1
-        bc_val = int(raw_bc) if isinstance(raw_bc, (int, float)) and not isinstance(raw_bc, bool) else 0
-        if 1 <= b_val <= 100 or bc_val != 0:
-            current_b = round(backlight.percent() or settings["brightness"] or 80)
-            new_b = max(1, min(100, b_val if 1 <= b_val <= 100 else current_b + bc_val))
-            settings["brightness"] = new_b
-            backlight.set_percent(new_b)
-            changed = True
-            results.append(f"屏幕亮度已调到百分之{new_b}")
-
-        raw_sr = args.get("speech_rate")
-        raw_src = args.get("speech_rate_change")
-        sr_val = float(raw_sr) if isinstance(raw_sr, (int, float)) and not isinstance(raw_sr, bool) else 0.0
-        src_val = float(raw_src) if isinstance(raw_src, (int, float)) and not isinstance(raw_src, bool) else 0.0
-        if 0.5 <= sr_val <= 2.0 or abs(src_val) >= 0.05:
-            new_rate = self.clamp_rate(sr_val if 0.5 <= sr_val <= 2.0 else self.speech_rate + src_val)
-            self.speech_rate = new_rate
-            settings["speech_rate"] = new_rate
-            changed = True
-            results.append(f"播报语速已调到{new_rate:g}倍")
-
-        night_mode = str(args.get("night_mode") or "").strip()
-        if night_mode in ("on", "off"):
-            on = night_mode == "on"
-            self.night["enabled"] = on
-            night_cfg = dict(settings["night"])
-            night_cfg["enabled"] = on
-            settings["night"] = night_cfg
-            changed = True
-            results.append(f"夜间免打扰模式已{'开启' if on else '关闭'}")
-
-        thinking_mode = str(args.get("thinking_mode") or "").strip()
-        if thinking_mode in ("on", "off"):
-            on = thinking_mode == "on"
-            self.thinking = on
-            settings["thinking"] = on
-            changed = True
-            results.append(f"深度思考模式已{'开启' if on else '关闭'}")
-
+        update, results = {}, []
+        level, change = number("brightness", -1), number("brightness_change", 0)
+        if 1 <= level <= 100 or change:
+            value = round(max(1, min(100, level if 1 <= level <= 100 else (self.brightness or 80) + change)))
+            self.brightness = update["brightness"] = value
+            results.append(f"屏幕亮度已调到百分之{value}")
+        rate, rate_change = number("speech_rate", 0), number("speech_rate_change", 0)
+        if 0.5 <= rate <= 2.0 or abs(rate_change) >= 0.05:
+            self.speech_rate = update["speech_rate"] = self.clamp_rate(
+                rate if 0.5 <= rate <= 2.0 else self.speech_rate + rate_change)
+            results.append(f"播报语速已调到{self.speech_rate:g}倍")
+        for key, name in (("night_mode", "夜间免打扰模式"), ("thinking_mode", "深度思考模式")):
+            mode = str(args.get(key) or "").strip()
+            if mode in ("on", "off"):
+                on = mode == "on"
+                if key == "night_mode":
+                    self.night = dict(self.night, enabled=on)
+                    update["night"] = on
+                else:
+                    self.thinking = update["thinking"] = on
+                results.append(f"{name}已{'开启' if on else '关闭'}")
         city = str(args.get("weather_city") or "").strip()[:40]
         if city:
-            places = information.ui_system.search_places(city)
+            try:
+                places = information.ui_system.search_places(city)
+            except Exception as error:
+                logging.warning("城市查询失败：%s", error)
+                places = None
             if places:
                 place = places[0]
-                settings["location"] = place
-                changed = True
+                update["location"] = {key: place[key] for key in ("name", "lat", "lon")}
                 results.append(f"默认天气城市已设为{place['name']}")
             else:
-                results.append(f"没有找到城市{city}")
-
+                results.append(f"没有找到城市{city}" if places == [] else "城市查询暂时不可用")
         screen = str(args.get("screen") or "").strip()
-        screen_names = {
-            "home": "主页",
-            "weather": "天气详情页",
-            "alarms": "闹钟与计时器页面",
-            "settings": "设置页面",
-            "music": "音乐设置页面",
-            "night": "夜间模式设置页面",
-        }
+        screens = {"home": "主页", "weather": "天气详情页", "alarms": "闹钟与计时器页面",
+                   "settings": "设置页面", "music": "音乐设置页面", "night": "夜间模式设置页面"}
         if screen == "off":
             self.screen_off_pending = True
             results.append("好的，即将关闭屏幕")
-        elif screen in screen_names:
-            target_screen = screen
-            results.append(f"已在屏幕上打开{screen_names[screen]}")
-
-        if changed:
-            settings.save()
-        if changed or target_screen:
-            self.ui.emit("ui_sync", screen=target_screen)
+        elif screen in screens:
+            update["screen"] = screen
+            results.append(f"已在屏幕上打开{screens[screen]}")
+        if update:
+            self.ui.emit("ui_set", **update)
         if not results:
             return "没有听懂要调整哪项设备设置", False, True
-        return "，".join(results), True, True
+        return "，".join(results), bool(update) or screen == "off", True
 
     def chat_context(self):
         scheduled, _, _ = self.alarms.call_tool("manage_alarm", '{"action":"list"}')
@@ -1685,7 +1759,16 @@ class ThinkSmartAssistant:
             raise TurnCancelled()
 
     def run_tool(self, name, args, has_reply):
-        """Returns (message, ok, final); final results are spoken as-is instead of going back to the model."""
+        """Returns (message, ok, final); final results are spoken as-is instead of going back to the model.
+
+        A tool that fails twice in one turn ends it with its error rather than letting the model retry."""
+        message, ok, final = self.call_tool(name, args, has_reply)
+        if not ok:
+            final = final or name in self.failed_tools
+            self.failed_tools.add(name)
+        return message, ok, final
+
+    def call_tool(self, name, args, has_reply):
         self.check_cancel()
         arguments = json.dumps(args, ensure_ascii=False)
         logging.info("工具调用：%s %s", name, arguments)
@@ -1719,14 +1802,15 @@ class ThinkSmartAssistant:
         completed = False
         self.raw_wake_allowed = True
         try:
-            with self.client.audio.tts.connect(
+            with closing(self.open_audio_task(lambda link: self.client.audio.tts.connect(
                 model=self.tts_model,
                 voice=self.tts_voice,
                 format="pcm",
                 sample_rate=PLAYBACK_RATE,
                 rate=self.speech_rate,
                 parameters={"word_timestamp_enabled": True},
-            ) as session:
+                connection=link,
+            ))) as session:
 
                 speaking_set = False
 
@@ -1778,6 +1862,8 @@ class ThinkSmartAssistant:
                 self.raw_wake_allowed = True
             self.heard_reply = "".join(reply_parts).strip() if completed else progress.heard(player.played_seconds)
             if not completed:
+                # Binary audio has no task id: late audio of this synthesis must not reach the next one.
+                self.drop_link()
                 logging.info("播报停止在 %.2f 秒，已听到：%s", player.played_seconds, self.heard_reply)
         self.check_cancel()
         return self.heard_reply
@@ -1815,6 +1901,7 @@ class ThinkSmartAssistant:
             if self.alarms.ringing:
                 self.alarms.dismiss()
             self.play_listen_tone()
+            self.followup_question = False
             self.next_followup = float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8"))
             return
         stripped_text = user_text
@@ -1829,6 +1916,7 @@ class ThinkSmartAssistant:
         self.music_started = False
         self.conversation_over = False
         self.turn_effects = []
+        self.failed_tools = set()
         self.next_followup = 0.0
         command = match_command(stripped_text, self.music.active())
         farewell = match_farewell(stripped_text, self.wake_phrase)
@@ -1891,7 +1979,8 @@ class ThinkSmartAssistant:
         silently if the user does not speak."""
         if self.conversation_over or self.music_started or self.offline_mode:
             return 0.0
-        if QUESTION_END.search(reply or ""):
+        self.followup_question = bool(QUESTION_END.search(reply or ""))
+        if self.followup_question:
             return self.question_followup_seconds
         if self.turn_effects and all(effect == "action" for effect in self.turn_effects):
             logging.info("指令已完成，结束对话")
@@ -2048,8 +2137,9 @@ class ThinkSmartAssistant:
                     raise
                 logging.warning("追问识别不可用，结束追问窗口：%s", error)
                 return
-            if not text:
-                logging.info("追问窗口结束")
+            compact = re.sub(r"[\s，。！？、,.!?~～…]+", "", text)
+            if not text or not self.followup_question and (len(compact) < 2 or FILLER.fullmatch(compact)):
+                logging.info("追问窗口结束%s", f"，忽略：{text}" if text else "")
                 return
             self.duck()
             self.handle_turn(text)
@@ -2079,6 +2169,7 @@ class ThinkSmartAssistant:
                         self.ui.emit("sleep")
                     if not self.wait_for_wake():
                         break
+                threading.Thread(target=self.prepare_link, name="link-prepare", daemon=True).start()
                 self.duck()
                 self.begin_turn()
                 # Keep the wake stream running through the tone so an immediate
@@ -2130,7 +2221,7 @@ class ThinkSmartAssistant:
     def stop(self, *_args):
         self.stop_requested = True
         self.close_capture()
-        self.stop_process(self.playback)
+        self.drop_link()
         if self.speech_player is not None:
             self.speech_player.close()
         self.alarms.shutdown()

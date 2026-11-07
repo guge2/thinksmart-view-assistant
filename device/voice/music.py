@@ -407,7 +407,12 @@ class Player:
         self.output = None
         self.history = bytearray()
         self.position = 0.0
+        self.fade = None  # [start, seconds, floor] while the volume ramps up
         threading.Thread(target=self.run, name="music-player", daemon=True).start()
+
+    def fade_in(self, seconds, floor):
+        """Starts the next audio at floor of full volume, reaching full volume after seconds."""
+        self.fade = [None, seconds, floor]
 
     def current(self):
         with self.lock:
@@ -651,7 +656,15 @@ class Player:
                         return "interrupted"
                     continue
                 wanted = self.duck_level if self.ducked else 1.0
-                if wanted != gain:
+                fade = self.fade
+                if fade is not None:
+                    fade[0] = fade[0] or time.monotonic()
+                    progress = (time.monotonic() - fade[0]) / fade[1]
+                    if progress >= 1:
+                        self.fade = None
+                    else:
+                        wanted *= fade[2] + (1 - fade[2]) * progress
+                if gain is None or abs(wanted - gain) > 0.01:
                     decoder.volume(wanted)
                     gain = wanted
                 if pending:
@@ -1296,7 +1309,38 @@ class MusicService:
         with self.request_lock:
             self.request_serial += 1
 
-    def play_query(self, query, check_cancel=None, *, serial=None):
+    def play_alarm(self, cancelled, seconds=12):
+        """Wake-up music: the favourites, else recommendations, rising from quiet.
+        True once audible within seconds; otherwise nothing keeps playing."""
+        deadline = time.monotonic() + seconds
+
+        def check():
+            if cancelled() or time.monotonic() > deadline:
+                raise CommandCancelled()
+
+        self.player.fade_in(30, 0.15)
+        try:
+            for query in ("我喜欢", ""):
+                if self.play_query(query, check, shuffle=True)[1]:
+                    break
+            else:
+                return False
+            while self.player.state != "playing":
+                check()
+                time.sleep(0.1)
+            return True
+        except CommandCancelled:
+            self.player.stop()
+            return False
+        except Exception as error:
+            logging.warning("闹钟音乐播放失败：%s", error)
+            self.player.stop()
+            return False
+        finally:
+            if self.player.state != "playing":
+                self.player.fade = None
+
+    def play_query(self, query, check_cancel=None, *, serial=None, shuffle=False):
         with self.request_lock:
             if serial is None:
                 self.request_serial += 1
@@ -1349,7 +1393,7 @@ class MusicService:
         if not tracks:
             return "没有找到相关的歌曲", False
         candidates = list(range(len(tracks)))
-        if query in ("", "我喜欢") and self.player.mode == "shuffle":
+        if query in ("", "我喜欢") and (shuffle or self.player.mode == "shuffle"):
             random.shuffle(candidates)
         unplayable = set()
         for index in candidates[:5]:
