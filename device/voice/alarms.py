@@ -161,6 +161,7 @@ class AlarmService:
         self.ringing = False
         self.ringing_id = None
         self.last_rang = None
+        self.briefing_at = None
         self.monotonic_due = {}
         self.retry_after = {}
         self.items = self._load()
@@ -292,8 +293,25 @@ class AlarmService:
         with self.lock:
             if not self.ringing:
                 return False
+            if self.last_rang and self.last_rang[0]["kind"] == "alarm":
+                self.briefing_at = time.monotonic()
             self.silence.set()
             return True
+
+    def take_briefing(self):
+        """True once after a morning alarm was dismissed rather than snoozed."""
+        if self.briefing_at is None:
+            return False
+        with self.lock:
+            at, self.briefing_at = self.briefing_at, None
+        return at is not None and time.monotonic() - at < 180 and 4 <= dt.datetime.now().hour < 11
+
+    def today_plan(self):
+        end = dt.datetime.combine(dt.date.today() + dt.timedelta(days=1), dt.time()).timestamp()
+        with self.lock:
+            items = sorted((i for i in self.items if i["due"] < end), key=lambda i: i["due"])
+            return "；".join(f"{dt.datetime.fromtimestamp(i['due']).strftime('%H:%M')}{NAMES[i['kind']]}"
+                            + (f"：{i['label']}" if i.get("label") else "") for i in items)
 
     def snooze(self, minutes=5):
         minutes = max(1, min(60, int(minutes or 5)))
@@ -306,6 +324,7 @@ class AlarmService:
                 source = self.last_rang[0]
             if source is None and not self.ringing:
                 return None
+            self.briefing_at = None
             seconds = minutes * 60
             now = time.time()
             ident = uuid.uuid4().hex[:6]
@@ -352,7 +371,12 @@ class AlarmService:
     def _command(self, args):
         action = args.get("action")
         if action == "dismiss":
-            return Result("已停止提示音", True) if self.dismiss() else Result(NOTHING_RINGING, False)
+            if self.dismiss():
+                return Result("已停止提示音", True)
+            # The wake word already silenced it; "关闭闹钟" right after is a confirmation, not a failure.
+            if self.last_rang and time.monotonic() - self.last_rang[1] < 60:
+                return Result("闹钟已经关了", True)
+            return Result(NOTHING_RINGING, False)
         if action == "snooze":
             minutes = args.get("minutes")
             reply = self.snooze(minutes if type(minutes) is int and 1 <= minutes <= 60 else 5)
@@ -472,6 +496,9 @@ class AlarmService:
                 with self.lock:
                     self.ringing = False
                     self.ringing_id = None
+                    # Snoozing or confirming right after it stopped refers to this ring.
+                    if self.last_rang:
+                        self.last_rang = (self.last_rang[0], time.monotonic())
                     complete = delivered or self.silence.is_set()
                     if due in self.items and not self.stopped.is_set() and not complete:
                         self.retry_after[due["id"]] = time.monotonic() + 30

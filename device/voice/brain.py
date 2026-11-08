@@ -118,6 +118,7 @@ class Brain:
         if config["model"] != self.provider_order_model:
             self.config["providerOrder"] = []
         self.messages = []
+        self.last_active = time.monotonic()
         self.last_turn = None
         self.next_id = 0
         self.request = None
@@ -151,7 +152,14 @@ class Brain:
                 text = text.replace(key, "[redacted]")
         return text
 
+    def forget_if_idle(self, seconds):
+        """Drops the short-term history when the last turn ended over this many seconds ago."""
+        if self.messages and seconds > 0 and time.monotonic() - self.last_active > seconds:
+            logging.info("距上一轮已超过%d分钟，清空对话上下文", seconds // 60)
+            self.messages = []
+
     def _trim_history(self):
+        self.last_active = time.monotonic()
         user_indices = [i for i, m in enumerate(self.messages) if m.get("role") == "user"]
         if len(user_indices) > HISTORY_TURNS:
             cut = user_indices[-HISTORY_TURNS]

@@ -33,6 +33,7 @@ from music import (
     CommandCancelled as TurnCancelled,
 )
 import information
+import memory
 import offline
 import skills
 from alarms import AlarmService
@@ -97,8 +98,18 @@ TOOL_RULES = (
     "使用工具时不要提前声称操作成功，以工具返回结果为准。"
     "新闻、比赛、行情等需要最新信息的问题可以参考联网搜索结果，用一两句话概括，不要念出网址。"
     "回答结束时不要说“还有什么需要”之类的客套追问；只有确实需要用户补充信息时才用问句结尾。"
+    "【设备实时状态】里附有用户让你长期记住的事，相关时自然地用上（如称呼、口味、家人），不要逐条复述。"
 )
-
+# Spoken with the local voice when a turn fails before any reply, so the device is never silently stuck.
+APOLOGIES = {"network": "网络好像断了，请稍后再试。", "auth": "语音服务的密钥失效了，请在管理页检查。",
+             "config": "语音服务还没配置好，请在管理页检查。"}
+# The turn a dismissed morning alarm starts; its words make the model call daily_briefing.
+BRIEFING_TEXT = "（闹钟刚被我关掉）早安"
+BRIEFING_WAIT_SECONDS = 4
+# A wake this long after the last turn starts a new conversation; follow-up turns never clear it.
+# Shorter gaps keep the history, and the model is told how long ago it was.
+CONTEXT_IDLE_SECONDS = float(os.getenv("THINKSMART_CONTEXT_IDLE_MINUTES", "120")) * 60
+CONTEXT_GAP_SECONDS = 120
 
 LINK = re.compile(r"\[([^\]\n]*)\]\((?:[^()\s]|\([^()\s]*\))*\)")
 # A parenthesised aside holding a link is a source note, e.g. "([site.com](https://...))".
@@ -616,7 +627,8 @@ class ThinkSmartAssistant:
         self.music = MusicService(ui.emit, float(os.getenv("THINKSMART_MUSIC_DUCK_LEVEL", "0.2")), self.check_cancel)
         self.alarms = AlarmService(ui.emit, on_ring=self.on_alarm_ring, music=self.music)
         self.offline_commands = offline.OfflineCommands(KWS_MODEL, f"{VOICE_ROOT}/offline-keywords.txt")
-        self.skills = skills.Skills(self, self.music, self.alarms, information)
+        self.memory = memory.Memory()
+        self.skills = skills.Skills(self, self.music, self.alarms, information, self.memory)
         self.offline_mode = False
         self.music_started = False
         self.conversation_over = False
@@ -1045,6 +1057,17 @@ class ThinkSmartAssistant:
         except OSError:
             pass
 
+    def apologize(self, error):
+        code = classify_error(error)
+        if self.phase not in ("think", "speak") or self.heard_reply or code in ("mic", "speaker"):
+            return
+        try:
+            offline.speak(APOLOGIES.get(code, "抱歉，刚才没处理好，请再说一次。"),
+                          lambda: self.stop_requested or self.barge_in_requested.is_set(),
+                          gain=0.5 if self.night_active() else 1.0)
+        except Exception as warning:
+            logging.warning("错误提示播报失败：%s", warning)
+
     def report_error(self, error):
         code = classify_error(error)
         self.turn_models['error'] = code
@@ -1408,6 +1431,11 @@ class ThinkSmartAssistant:
                     self.turn_timing = {"wake_at": time.time(), "source": "button"}
                 self.set_phase("wake")
                 return True
+            if not self.alarms.ringing and self.alarms.take_briefing():
+                self.wake_started = time.monotonic()
+                self.turn_timing = {"wake_at": time.time(), "source": "briefing"}
+                self.set_phase("wake")
+                return "briefing"
             self.check_cancel()
             if not self.capture_thread.is_alive():
                 raise RuntimeError("microphone stream ended")
@@ -1440,6 +1468,8 @@ class ThinkSmartAssistant:
     _TONE_NIGHT = _build_listen_tone.__func__(0.065)
     _CUE_DAY = _build_listen_tone.__func__(0.06, 440, 0.22)
     _CUE_NIGHT = _build_listen_tone.__func__(0.03, 440, 0.22)
+    _OK_DAY = _build_listen_tone.__func__(0.10, 880, 0.18)
+    _OK_NIGHT = _build_listen_tone.__func__(0.05, 880, 0.18)
 
     def play_listen_tone(self):
         # Pre-rendered soft bell: smooth 15 ms attack, natural decay, zero per-wake math overhead.
@@ -1665,7 +1695,22 @@ class ThinkSmartAssistant:
             f"{self.device_status_summary()}"
             f"当前闹钟与计时计划：{scheduled}。"
             + self.music.describe()
+            + self.memory.describe()
+            + self.conversation_gap()
         )
+
+    def conversation_gap(self):
+        gap = time.monotonic() - self.brain.last_active
+        if not self.brain.messages or gap < CONTEXT_GAP_SECONDS:
+            return ""
+        return (f"上一次对话结束于约{round(gap / 60)}分钟前：用户提到之前聊过的内容（如“刚才”“那首歌”“那家店”）时接着之前的对话回答，"
+                "否则当作新话题，不要牵扯之前的内容。")
+
+    def daily_briefing(self, args):
+        weather = information.get_weather({}).message
+        plan = self.alarms.today_plan()
+        return Result(f"{information.current_time()}{weather}"
+                      + (f"今天接下来的安排：{plan}。" if plan else "今天接下来没有闹钟或提醒。"), True)
 
     def check_cancel(self):
         self.last_progress = time.monotonic()
@@ -1777,13 +1822,13 @@ class ThinkSmartAssistant:
                 if time.monotonic() >= deadline:
                     raise
 
-    def handle_turn(self, user_text):
+    def handle_turn(self, user_text, shown=True):
         self.turn_models = {'started_at': time.time(), 'chat_model': None, 'speech': None}
         self.heard_reply = ""
         self.local_result = ""
         self.model_turn = False
         try:
-            self.answer_turn(user_text)
+            self.answer_turn(user_text, shown)
         finally:
             if not self.model_turn:
                 reply = self.heard_reply
@@ -1793,7 +1838,7 @@ class ThinkSmartAssistant:
                     reply += f"（设备已执行：{self.local_result}）"
                 self.brain.note(user_text, reply)
 
-    def answer_turn(self, user_text):
+    def answer_turn(self, user_text, shown=True):
         logging.info("用户：%s", user_text)
         compact = re.sub(r"[\s，。！？、,.!?~～…]+", "", user_text or "")
         if self.wake_phrase and compact == self.wake_phrase:
@@ -1801,7 +1846,8 @@ class ThinkSmartAssistant:
                 self.alarms.dismiss()
             self.play_listen_tone()
             self.followup_question = False
-            self.next_followup = float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8"))
+            self.next_followup = (BRIEFING_WAIT_SECONDS if self.alarms.briefing_at is not None
+                                  else float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8")))
             return
         stripped_text = user_text
         if self.wake_phrase and compact.startswith(self.wake_phrase):
@@ -1810,7 +1856,8 @@ class ThinkSmartAssistant:
                 "",
                 user_text,
             ).strip() or user_text
-        self.ui.emit("user", text=user_text)
+        if shown:
+            self.ui.emit("user", text=user_text)
         self.set_phase("think")
         self.music_started = False
         self.conversation_over = False
@@ -1820,7 +1867,17 @@ class ThinkSmartAssistant:
         local = skills.match(stripped_text, self.music.active(), self.wake_phrase, self.offline_mode)
         if local:
             logging.info("本地指令：%s %s", local[0], json.dumps(local[1], ensure_ascii=False))
-            reply = self.call_tool(*local, False)[0]
+            reply, ok, _ = self.call_tool(*local, False)
+            action = local[1].get("action")
+            quiet = ("mute" not in local[1] if local[0] == "set_volume"
+                     else local[0] == "control_music" and (action in ("pause", "next", "previous")
+                                                           or action == "resume" and self.music_started))
+            if ok and quiet:
+                self.local_result = self.heard_reply = reply
+                self.ui.emit("reply", text=reply)
+                self.play_cue(self._OK_NIGHT if self.night_active() else self._OK_DAY)
+                logging.info("助手（提示音）：%s", reply)
+                return
         elif self.offline_mode:
             reply = skills.OFFLINE_HINT
         else:
@@ -2020,6 +2077,7 @@ class ThinkSmartAssistant:
                 if self.recovery_requested.is_set() and not self.alarms.ringing:
                     self.recover_audio()
                 self.cancel_requested.clear()
+                woke = True
                 if self.barge_in_requested.is_set():
                     self.set_phase("wake")
                     self.barge_in_requested.clear()
@@ -2029,39 +2087,22 @@ class ThinkSmartAssistant:
                     if self.screen_off_pending:
                         self.screen_off_pending = False
                         self.ui.emit("sleep")
-                    if not self.wait_for_wake():
+                    woke = self.wait_for_wake()
+                    if not woke:
                         break
+                    self.brain.forget_if_idle(CONTEXT_IDLE_SECONDS)
                 threading.Thread(target=self.prepare_link, name="link-prepare", daemon=True).start()
                 self.duck()
                 self.begin_turn()
-                # Keep the wake stream running through the tone so an immediate
-                # follow-on command is still captured.
-                self.start_listening()
-                if self.stop_requested:
-                    break
                 self.offline_mode = False
-                self.check_cancel()
-                self.set_cloud("busy")
-                try:
-                    text = self.transcribe_live()
-                except TurnCancelled:
-                    raise
-                except Exception as error:
-                    if classify_error(error) == "mic":
-                        raise
-                    logging.warning("云端识别不可用，改用离线指令：%s", error)
-                    self.offline_mode = True
-                    self.set_cloud("offline")
-                    self.set_phase("think")
-                    self.speak_reply("网络不可用，请再说一次简单指令。")
-                    self.start_listening()
-                    text = self.offline_commands.listen(self)
-                if text:
-                    self.handle_turn(text)
-                    self.follow_up()
+                self.conversation_over = False
+                if woke == "briefing":
+                    self.set_cloud("busy")
+                    self.brief()
                 else:
-                    logging.info("唤醒后未识别到有效语音")
-                    self.ui.emit("nospeech")
+                    self.converse()
+                    if self.alarms.take_briefing():
+                        self.brief()
                 self.set_cloud("offline" if self.offline_mode else "ready")
             except TurnCancelled:
                 logging.info("本轮对话已取消")
@@ -2075,10 +2116,49 @@ class ThinkSmartAssistant:
                 if not self.stop_requested:
                     logging.exception("语音处理失败：%s", error)
                     self.report_error(error)
+                    self.apologize(error)
                     time.sleep(2)
             finally:
                 if not self.barge_in_requested.is_set():
                     self.unduck()
+
+    def converse(self):
+        # Keep the wake stream running through the tone so an immediate
+        # follow-on command is still captured.
+        self.start_listening()
+        if self.stop_requested:
+            return
+        self.check_cancel()
+        self.set_cloud("busy")
+        try:
+            # Waking only to turn off an alarm should not keep the briefing waiting long.
+            text = self.transcribe_live(BRIEFING_WAIT_SECONDS if self.alarms.briefing_at is not None else None)
+        except TurnCancelled:
+            raise
+        except Exception as error:
+            if classify_error(error) == "mic":
+                raise
+            logging.warning("云端识别不可用，改用离线指令：%s", error)
+            self.offline_mode = True
+            self.set_cloud("offline")
+            self.set_phase("think")
+            self.speak_reply("网络不可用，请再说一次简单指令。")
+            self.start_listening()
+            text = self.offline_commands.listen(self)
+        if text:
+            self.handle_turn(text)
+            self.follow_up()
+        else:
+            logging.info("唤醒后未识别到有效语音")
+            self.ui.emit("nospeech")
+
+    def brief(self):
+        """The day's briefing once a morning alarm is turned off, unless the user moved on to something else."""
+        if self.offline_mode or self.conversation_over or self.music.active():
+            return
+        logging.info("闹钟已关闭，播报今日简报")
+        self.handle_turn(BRIEFING_TEXT, shown=False)
+        self.follow_up()
 
     def stop(self, *_args):
         self.stop_requested = True

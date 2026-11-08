@@ -213,6 +213,12 @@ _WEATHER = re.compile(
     r"|^(?:现在|今天|明天|外面)?(?:多少度|几度|冷不冷|热不热)[？?吗呢吧呀啊]*$"
 )
 
+_MEMORY = re.compile(
+    r"^(?!.*(?:提醒|闹钟|叫醒|叫我|计时)).*"
+    r"(?:记住|记下来|记一下|别忘了|不要忘了|忘掉|忘了吧|别记|不用记|你都记得|你记得我什么|你还记得什么)"
+)
+_BRIEFING = re.compile(r"(?:早安|早间|今日|每日)简报|今天(?:有什么|有啥|的)安排|早上好|早安")
+
 SKILLS = (
     Skill(
         "end_conversation", "结束对话，可同时关屏或停止音乐",
@@ -284,6 +290,27 @@ SKILLS = (
         }},
         kind="info", phrases=(_time,),
         offline=("现在几点了", "现在几点钟@现在几点了", "今天几号", "今天星期几"),
+    ),
+    Skill(
+        "daily_briefing", "今日简报：日期、天气和今天剩下的闹钟与提醒",
+        "汇总今天的日期、本地天气和今天剩下的闹钟与提醒。用于早安问候、闹钟关掉后的早间播报，或用户问今天有什么安排。"
+        "拿到结果后用三四句自然口语播报：先问好，再说天气并给出穿衣或带伞建议，最后说今天的安排；没有安排就不提。",
+        {"type": "object", "properties": {}},
+        kind="info", force=_BRIEFING,
+    ),
+    Skill(
+        "manage_memory", "长期记住、查看或忘掉用户的称呼、家人、喜好等",
+        "长期记住用户明确要求你记住的事，或查看、修改、忘掉已记住的内容；已记住的内容附在【设备实时状态】中。"
+        "用户说“记住…”“别忘了…”“忘掉…”“你都记得我什么”时调用；用户只是闲聊提到时不要擅自记录。"
+        "text用用户自己的口吻简洁记录，如“我女儿叫小米”“我不吃香菜”；与已有记忆冲突时用update覆盖旧编号。"
+        "不要记录密码、证件号、银行卡号等敏感信息。",
+        {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["add", "update", "forget", "clear", "list"],
+                       "description": "新增add、覆盖update、忘掉一条forget、全部忘掉clear（仅当用户明确要求全部忘掉）、查看list"},
+            "text": {"type": "string", "description": "add或update时要记住的内容，用用户口吻，最多80字"},
+            "id": {"type": "string", "description": "update或forget时的记忆编号"},
+        }, "required": ["action"]},
+        kind=lambda args: "info" if args.get("action") == "list" else "action", retry=True, force=_MEMORY,
     ),
     Skill(
         "get_weather", "实时天气与三天预报",
