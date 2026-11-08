@@ -864,7 +864,7 @@ class ThinkSmartAssistant:
         self.ui.snapshot()
 
     def on_alarm_ring(self, ringing):
-        # Alarms replace what was playing with their own music; timers and reminders pause it.
+        # Alarms and reminders replace what was playing with their own music; timers pause it.
         if ringing:
             self.music.hold()
         elif self.phase == "idle":

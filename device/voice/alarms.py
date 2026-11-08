@@ -20,7 +20,8 @@ STATE_FILE = "/data/thinksmart/music/alarms.json"
 MAX_ITEMS = 64
 NAMES = {"alarm": "闹钟", "timer": "计时器", "reminder": "提醒"}
 NOTHING_RINGING = "现在没有正在响的闹钟或提醒"
-# Alarms wake with music, which plays this long unless stopped; timers and reminders beep.
+# Alarms and reminders ring with music, which plays this long unless stopped; timers beep.
+MUSIC_KINDS = ("alarm", "reminder")
 MUSIC_SECONDS = 300
 
 def _describe(item, with_id=True):
@@ -476,7 +477,7 @@ class AlarmService:
             try:
                 if self.emit:
                     self.emit("alarm", text=(due.get("label") or NAMES[due["kind"]]) + "时间到了")
-                if due["kind"] == "alarm" and self.music is not None:
+                if due["kind"] in MUSIC_KINDS and self.music is not None:
                     if due.get("label"):
                         self._announce(due["label"] + "时间到了")
                     if not self._ring_music():
@@ -605,17 +606,17 @@ class AlarmService:
 
     def _announce(self, text):
         try:
-            with tempfile.TemporaryFile() as sound:
+            # pw-play reads stdin as raw 48 kHz stereo; a file keeps espeak's WAV header and rate.
+            with tempfile.NamedTemporaryFile(suffix=".wav") as sound:
                 subprocess.run(
-                    ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "160", "--stdout", text],
-                    stdout=sound, stderr=subprocess.DEVNULL, timeout=15, check=True,
+                    ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "160", "-w", sound.name, text],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True,
                 )
                 if self.silence.is_set() or self.stopped.is_set():
                     return
-                sound.seek(0)
                 process = subprocess.Popen(
-                    ["/usr/bin/pw-play", "--media-role", "Notification", "-"],
-                    stdin=sound, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    ["/usr/bin/pw-play", "--media-role", "Notification", sound.name],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 deadline = time.monotonic() + 30
                 try:

@@ -80,7 +80,12 @@ LYRIC_DELAY = 0.5
 # Lines switch slightly early so a singer can read ahead.
 LYRIC_LEAD = 0.5
 LYRIC_SPAN = 4
-CARD_RECT = (16, 700, 784, 1264)
+# The assistant card grows up from the bottom with its answer, at most to just below the weather
+# (or the player row when music plays).
+CARD_LEFT, CARD_RIGHT, CARD_BOTTOM = 16, 784, 1264
+CARD_TOP, CARD_MUSIC_TOP = 412, 534
+CARD_HEADER = 226
+CARD_LINE = 50
 UI_FONTS = (
     ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
     ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
@@ -369,8 +374,8 @@ class App:
         self.console = Console()
         self.frame = Image.new("RGB", (W, H))
         self.draw = ImageDraw.Draw(self.frame)
-        self.backgrounds = {assist: (self.make_background(assist), {}) for assist in (False, True)}
-        self.bg, self.bg_crops = self.backgrounds[False]
+        self.backgrounds = {None: (self.make_background(None), {})}
+        self.bg, self.bg_crops = self.backgrounds[None]
         self.fonts = Fonts()
         self.orb = Orb()
         self.ime = PinyinInput()
@@ -465,11 +470,23 @@ class App:
         self.link.send("hello")
 
     @staticmethod
-    def make_background(assist):
+    def make_background(card):
         image = Image.new("RGB", (W, H), BG)
-        if assist:
-            ImageDraw.Draw(image).rounded_rectangle(CARD_RECT, radius=40, fill=CARD)
+        if card:
+            ImageDraw.Draw(image).rounded_rectangle(card, radius=40, fill=CARD)
         return image
+
+    def card_rect(self):
+        top = next((int(part[4:]) for part in (self.layout or "").split(":") if part.startswith("card")), None)
+        return None if top is None else (CARD_LEFT, top, CARD_RIGHT, CARD_BOTTOM)
+
+    def card_top(self):
+        width = CARD_RIGHT - CARD_LEFT - 72
+        lines = len(self.wrap(self.fonts.ui(34), self.answer, width)) if self.answer else 0
+        # Grow two lines at a time so a streaming answer rebuilds the screen rarely.
+        lines = max(2, lines + lines % 2)
+        limit = CARD_MUSIC_TOP if self.music_visible(time.monotonic()) else CARD_TOP
+        return max(limit, CARD_BOTTOM - CARD_HEADER - 24 - lines * CARD_LINE)
 
     # ---- layout -------------------------------------------------------
 
@@ -489,7 +506,7 @@ class App:
         else:
             base = "idle:music:lyrics" if self.has_lyrics() else "idle:music"
         if self.phase in ACTIVE or now < self.conv_until:
-            return base + (":assist:alarm" if self.alarm_active else ":assist")
+            return base + (":assist:alarm" if self.alarm_active else ":assist") + f":card{self.card_top()}"
         return base
 
     def layout_has(self, flag):
@@ -516,7 +533,12 @@ class App:
         self.active = None
         self.drag_value = None
         self.orb_rect = None
-        self.bg, self.bg_crops = self.backgrounds[self.layout_has("assist")]
+        card = self.card_rect()
+        if card not in self.backgrounds:
+            if len(self.backgrounds) > 16:
+                self.backgrounds = {None: self.backgrounds[None]}
+            self.backgrounds[card] = (self.make_background(card), {})
+        self.bg, self.bg_crops = self.backgrounds[card]
         kind = layout.split(":")[0]
         builder = {
             "idle": self.build_idle,
@@ -554,12 +576,9 @@ class App:
         if self.layout_has("lyrics"):
             self.lyric_index = -2
         if self.layout_has("assist"):
-            # The assistant card covers the bottom of the home screen; keep what is above it.
-            bottom = CARD_RECT[1] - 12
-            if self.layout_has("lyrics"):
-                widgets.append(Widget("lyrics", (24, 412, 776, bottom), self.paint_lyrics, tap=self.toggle_lyrics))
-            elif self.layout_has("music"):
-                widgets.append(Widget("player", (40, bottom - 110, 760, bottom), self.paint_player, tap=self.tap_player))
+            # The assistant card covers the home screen below the weather; music keeps a player row.
+            if self.layout_has("music"):
+                widgets.append(Widget("player", (40, 412, 760, 522), self.paint_player, tap=self.tap_player))
             return widgets + self.card_widgets()
         if self.layout_has("lyrics"):
             widgets.append(Widget("lyrics", (24, 424, 776, 1016), self.paint_lyrics, tap=self.toggle_lyrics))
@@ -573,18 +592,18 @@ class App:
         return widgets + self.bottom_buttons()
 
     def card_widgets(self):
-        x0, y0, x1, y1 = CARD_RECT
-        self.orb_rect = (x0 + 28, y0 + 24, x0 + 140, y0 + 136)
+        x0, y0, x1, y1 = self.card_rect()
+        self.orb_rect = (x0 + 24, y0 + 20, x0 + 120, y0 + 116)
         phase_right = x1 - 244 if self.alarm_active else x1 - 112
         widgets = [
             Widget("orb", self.orb_rect, None, tap=self.tap_orb),
-            Widget("phase", (x0 + 160, y0 + 24, phase_right, y0 + 136), self.paint_phase),
-            Widget("stop", (x1 - 108, y0 + 44, x1 - 28, y0 + 116), self.paint_stop, tap=self.tap_stop),
-            Widget("user", (x0 + 36, y0 + 150, x1 - 36, y0 + 254), self.paint_user),
-            Widget("answer", (x0 + 36, y0 + 264, x1 - 36, y1 - 24), self.paint_answer),
+            Widget("phase", (x0 + 140, y0 + 20, phase_right, y0 + 116), self.paint_phase),
+            Widget("stop", (x1 - 108, y0 + 32, x1 - 28, y0 + 104), self.paint_stop, tap=self.tap_stop),
+            Widget("user", (x0 + 36, y0 + 128, x1 - 36, y0 + 214), self.paint_user),
+            Widget("answer", (x0 + 36, y0 + CARD_HEADER, x1 - 36, y1 - 24), self.paint_answer),
         ]
         if self.alarm_active:
-            widgets.insert(2, Widget("snooze", (x1 - 232, y0 + 44, x1 - 120, y0 + 116),
+            widgets.insert(2, Widget("snooze", (x1 - 232, y0 + 32, x1 - 120, y0 + 104),
                                      self.paint_snooze, tap=self.tap_snooze))
         return widgets
 
@@ -820,7 +839,8 @@ class App:
             used = 0.0
             for char in paragraph:
                 size = self.fonts.char_width(font, char)
-                if line and used + size > width:
+                # Closing punctuation may overhang rather than start a line on its own.
+                if line and used + size > width and char not in "，。！？、；：,.!?;:）》」』”’)":
                     lines.append(line)
                     line, used = char, size
                 else:
@@ -989,8 +1009,7 @@ class App:
         d.text((rect[2] - 70, cy), "设置", font=self.fonts.ui(24), fill=DIM, anchor="rm")
 
     def paint_stop(self, d, rect, pressed):
-        if self.phase not in ACTIVE and not self.alarm_active:
-            return
+        # Outside a conversation the same button closes the lingering card.
         if self.alarm_active:
             d.rounded_rectangle(rect, radius=36, fill=ACCENT_PRESSED if pressed else ACCENT)
             cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
@@ -1046,7 +1065,7 @@ class App:
         d.rounded_rectangle((left, y - 2, right, y + 2), radius=2, fill=LINE)
         if duration > 0:
             done = left + (right - left) * min(1.0, position / duration)
-            d.rounded_rectangle((left, y - 2, max(left + 4, done), y + 2), radius=2, fill=ACCENT)
+            d.rounded_rectangle((left, y - 2, max(left + 6, done), y + 2), radius=2, fill=ACCENT)
         cy = y0 + 52
         cx = controls + 42
         d.rounded_rectangle((cx - 34, cy - 22, cx + 34, cy + 22), radius=22, outline=FAINT, width=2)
@@ -1185,21 +1204,21 @@ class App:
             text, color = "请说出你的问题…", FAINT
         else:
             return
-        font = self.fonts.ui(32)
+        font = self.fonts.ui(28)
         lines = self.wrap(font, text, x1 - x0)
         if len(lines) > 2:
             lines = ["…" + lines[-2]] + lines[-1:]
-        y = y0 + 4
+        y = y0 + 2
         for line in lines:
             d.text((x0, y), line, font=font, fill=color)
-            y += 46
+            y += 40
 
     def paint_answer(self, d, rect, pressed):
         x0, y0, x1, y1 = rect
         if not self.answer:
             return
-        font = self.fonts.ui(38)
-        line_height = 56
+        font = self.fonts.ui(34)
+        line_height = CARD_LINE
         lines = self.wrap(font, self.answer, x1 - x0)
         visible = max(1, (y1 - y0) // line_height)
         if len(lines) > visible:
@@ -1648,6 +1667,8 @@ class App:
             self.link.send("alarm_stop")
         elif self.phase in ACTIVE:
             self.link.send("stop")
+        else:
+            self.conv_until = 0.0
 
     def tap_snooze(self, *_args):
         if self.alarm_active:
@@ -2019,8 +2040,8 @@ class App:
             return
         if event == "alarm_end":
             self.alarm_active = False
-            if self.phase not in ACTIVE:
-                self.conv_until = now
+            # Drop the ringing card's long hold; a conversation that silenced it keeps its own.
+            self.conv_until = now
             self.dirty |= {"stop", "phase"}
             return
         if event == "sleep":

@@ -91,6 +91,18 @@ class Service(unittest.TestCase):
         self.assertEqual(AlarmService(state_file=self.path).items, [])
         self.assertFalse(self.command(action="cancel", id="nope").ok)
 
+    def test_alarms_and_reminders_ring_with_music(self):
+        for kind, expected in (("alarm", "music"), ("reminder", "music"), ("timer", "beep")):
+            with self.subTest(kind=kind):
+                rang = []
+                service = AlarmService(state_file=self.path, music=object())
+                service.items = [{"id": kind, "kind": kind, "due": time.time(), "label": "", "weekdays": []}]
+                service._ring_music = lambda: rang.append("music") or service.stopped.set() or True
+                service._ring = lambda cycles=100: rang.append("beep") or service.stopped.set()
+                with mock.patch.object(service, "_save"):
+                    service._run()
+                self.assertEqual(rang, [expected])
+
     def test_dismiss(self):
         self.assertEqual(self.command(action="dismiss"), (NOTHING_RINGING, False, False))
         self.ring()
