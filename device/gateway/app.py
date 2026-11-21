@@ -10,7 +10,6 @@ import socket
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
 
 from aiohttp import web
 from schema import SERVICES, MODEL_FIELDS, preferences, voice_values, tts_pair, number, config_revision
@@ -32,7 +31,10 @@ async def command(*args, timeout=5):
         output, _ = await asyncio.wait_for(proc.communicate(), timeout)
     except BaseException:
         if proc.returncode is None:
-            proc.kill()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
             await proc.wait()
         raise
     if proc.returncode:
@@ -68,6 +70,7 @@ async def voice(command_name, reply_timeout=3, **fields):
 class Gateway:
     def __init__(self):
         self.maintenance = asyncio.Lock()
+        self.logs_lock = asyncio.Lock()
         self.busy = None
         self.cache = {}
         self.cache_at = 0.0
@@ -86,16 +89,22 @@ class Gateway:
 
     async def root_action(self, action, **fields):
         async with self.maintenance:
-            if (RUNTIME / 'request.json').exists():
-                raise ValueError('上一项维护请求仍在处理中，请稍后再试')
+            request_path = RUNTIME / 'request.json'
+            try:
+                age = time.time() - request_path.stat().st_mtime
+                if age < 130:
+                    raise ValueError('上一项维护请求仍在处理中，请稍后再试')
+                request_path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
             ident = secrets.token_hex(16)
             fd, temporary = tempfile.mkstemp(prefix='.request-', dir=RUNTIME)
             try:
                 with os.fdopen(fd, 'w') as target:
                     json.dump(dict(fields, id=ident, action=action), target)
                 self.busy = action
-                os.replace(temporary, RUNTIME / 'request.json')
-                deadline = time.monotonic() + 80
+                os.replace(temporary, request_path)
+                deadline = time.monotonic() + 110
                 while time.monotonic() < deadline:
                     try:
                         response = json.loads((RUNTIME / 'result.json').read_text())
@@ -133,25 +142,37 @@ class Gateway:
         async with self.status_lock:
             if time.monotonic() - self.cache_at < 1.5:
                 return dict(self.cache, maintenance=self.busy)
-            health, snapshot = None, {}
-            try:
-                health = await voice('ping', seq=1)
-                snapshot = await voice('snapshot')
-            except (OSError, ValueError, asyncio.TimeoutError, RuntimeError):
-                pass
-            try:
-                services = await self.service_status()
-            except (OSError, RuntimeError, asyncio.TimeoutError):
-                services = self.services
-            if time.monotonic() - self.volume_at > 10:
+
+            async def fetch_voice():
+                try:
+                    health = await voice('ping', seq=1)
+                    snapshot = await voice('snapshot')
+                    return health, snapshot
+                except (OSError, ValueError, asyncio.TimeoutError, RuntimeError):
+                    return None, {}
+
+            async def fetch_services():
+                try:
+                    return await self.service_status()
+                except (OSError, RuntimeError, asyncio.TimeoutError):
+                    return self.services
+
+            async def fetch_volume():
+                if time.monotonic() - self.volume_at <= 10:
+                    return self.volume
                 try:
                     self.volume = (await asyncio.to_thread(read_volume))[0]
                 except Exception:
                     self.volume = None
                 self.volume_at = time.monotonic()
+                return self.volume
+
+            (health, snapshot), services, volume, prefs = await asyncio.gather(
+                fetch_voice(), fetch_services(), fetch_volume(), asyncio.to_thread(self.current_preferences),
+            )
             self.cache = {'version': VERSION, 'time': time.time(), 'health': health, 'snapshot': snapshot,
-                          'services': services, 'volume': self.volume, 'wake_word': read_wake_phrase(),
-                          'preferences': self.current_preferences(), 'load': list(os.getloadavg()),
+                          'services': services, 'volume': volume, 'wake_word': read_wake_phrase(),
+                          'preferences': prefs, 'load': list(os.getloadavg()),
                           'maintenance': self.busy}
             try:
                 saved = json.loads((RUNTIME / 'config-view.json').read_text())
@@ -167,9 +188,14 @@ class Gateway:
             return self.cache
 
 
+HOST_PATTERN = re.compile(r'^(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$', re.I)
+
+
 def origin_allowed(request):
-    host = urlsplit('http://' + request.host).hostname
-    if host not in ('127.0.0.1', 'localhost', '::1'):
+    if not HOST_PATTERN.fullmatch(request.host or ''):
+        return False
+    fetch_site = request.headers.get('Sec-Fetch-Site')
+    if fetch_site and fetch_site not in ('same-origin', 'same-site', 'none'):
         return False
     origin = request.headers.get('Origin')
     return origin is None or origin == 'http://' + request.host
@@ -221,23 +247,29 @@ def make_app():
                 saved = await gateway.root_action('read')
         except (OSError, ValueError):
             saved = await gateway.root_action('read')
-        return web.json_response({'preferences': gateway.current_preferences(), 'voice': saved})
+        prefs = await asyncio.to_thread(gateway.current_preferences)
+        return web.json_response({'preferences': prefs, 'voice': saved})
 
     async def save_preferences(request):
         values = preferences(await request.json())
-        settings = Settings()
-        settings.update(strict=True, **values)
+
+        def _save():
+            current = Settings()
+            current.update(strict=True, **values)
+            return current.data
+
+        saved_prefs = await asyncio.to_thread(_save)
         applied = False
         try:
-            await voice('prefs', rate=settings['speech_rate'], think=settings['thinking'], night=settings['night'])
-            await voice('mic', on=int(settings['mic']))
+            await voice('prefs', rate=saved_prefs['speech_rate'], think=saved_prefs['thinking'])
+            await voice('mic', on=int(saved_prefs['mic']))
             applied = True
         except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
             pass
         gateway.cache_at = 0
         return web.json_response({'ok': True, 'status': 'applied' if applied else 'saved',
                                   'message': '已保存，语音设置已生效；屏幕会自动同步' if applied else '已保存，语音服务恢复后生效',
-                                  'preferences': settings.data})
+                                  'preferences': saved_prefs})
 
     async def configure(request):
         values = voice_values(await request.json())
@@ -254,7 +286,8 @@ def make_app():
         model, selected_voice = tts_pair(body['model'], body['voice'])
         response = await voice('preview', model=model, voice=selected_voice, reply_timeout=40)
         path = Path('/run/thinksmart-voice') / ('preview-' + response['id'] + '.wav')
-        return web.Response(body=path.read_bytes(), content_type='audio/wav')
+        data = await asyncio.to_thread(path.read_bytes)
+        return web.Response(body=data, content_type='audio/wav')
 
     async def restart(request):
         body = await request.json()
@@ -307,17 +340,22 @@ def make_app():
         target = request.query.get('target', 'voice')
         if target not in ALL_SERVICES:
             raise ValueError('日志来源无效')
-        output = await command('journalctl', '-u', ALL_SERVICES[target], '--since', '15 minutes ago',
-                               '-n', '70', '-o', 'json', '--no-pager')
+        async with gateway.logs_lock:
+            output = await command('journalctl', '-u', ALL_SERVICES[target], '--since', '15 minutes ago',
+                                   '-n', '70', '-o', 'json', '--no-pager')
         rows = []
         for line in output.splitlines():
             try:
                 record = json.loads(line)
-                message = str(record.get('MESSAGE', ''))
-                if re.search(r'api[_-]?key|authorization|bearer|password|secret|access_token', message, re.I):
+                raw_msg = record.get('MESSAGE', '')
+                if isinstance(raw_msg, list):
+                    message = bytes(b for b in raw_msg if isinstance(b, int) and 0 <= b <= 255).decode('utf-8', 'replace')
+                else:
+                    message = str(raw_msg)
+                if re.search(r'api[_-]?key|authorization|bearer|password|secret|access_token|cookie|musickey|credential', message, re.I):
                     message = '[已隐藏包含敏感字段的日志]'
                 message = re.sub(r'sk-[A-Za-z0-9_-]+', '[已隐藏密钥]', message)
-                message = re.sub(r'(用户：|助手：|已听到：).*', r'\1[内容已省略]', message)
+                message = re.sub(r'(用户：|助手：|已听到：).*', r'\1[内容已省略]', message, flags=re.S)
                 rows.append({'time': int(record['__REALTIME_TIMESTAMP']) / 1e6, 'message': message[:500],
                              'level': 'error' if re.search(r'ERROR|CRITICAL|Traceback', message) else 'warning' if 'WARNING' in message else 'info'})
             except (ValueError, KeyError, TypeError):

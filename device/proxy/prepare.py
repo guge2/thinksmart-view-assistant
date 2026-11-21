@@ -10,7 +10,14 @@ import shutil
 import yaml
 
 
+def write_private(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as target:
+        target.write(text)
+
+
 def prepare(source, output):
+    source = source.resolve()
     output.mkdir(parents=True, exist_ok=True)
     config = yaml.safe_load((source / "clash-verge.yaml").read_text(encoding="utf-8"))
     profiles = yaml.safe_load((source / "profiles.yaml").read_text(encoding="utf-8"))
@@ -27,7 +34,7 @@ def prepare(source, output):
         if choice in entries:
             group["proxies"] = [choice] + [name for name in entries if name != choice]
 
-    rules = config["rules"]
+    rules = config.setdefault("rules", [])
     openrouter = f"DOMAIN-SUFFIX,openrouter.ai,{ai_group}"
     if openrouter not in rules:
         index = next((i for i, rule in enumerate(rules) if rule.startswith("RULE-SET,Custom_AI,")), 0)
@@ -42,8 +49,11 @@ def prepare(source, output):
         "log-level": "info",
         "profile": {"store-selected": True, "store-fake-ip": True},
     })
-    for key in ("external-controller-pipe", "external-controller-unix", "external-controller-cors",
-                "external-ui", "external-ui-url", "external-ui-name"):
+    for key in (
+        "port", "socks-port", "redir-port", "tproxy-port", "listeners",
+        "external-controller-tls", "external-controller-pipe", "external-controller-unix",
+        "external-controller-cors", "external-ui", "external-ui-url", "external-ui-name",
+    ):
         config.pop(key, None)
     config.setdefault("dns", {})["listen"] = "127.0.0.1:7874"
     config["tun"] = {
@@ -58,29 +68,38 @@ def prepare(source, output):
         "route-exclude-address": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
                                   "100.64.0.0/10", "fc00::/7", "fe80::/10"],
     }
+    output_resolved = output.resolve()
     for provider in (config.get("rule-providers") or {}).values():
         relative = Path(provider["path"])
-        if relative.is_absolute() or ".." in relative.parts:
+        if relative.is_absolute() or ".." in relative.parts or relative.drive:
             raise ValueError("Rule cache must have a relative path")
-        target = output / relative
+        src_file = (source / relative).resolve()
+        target = (output_resolved / relative).resolve()
+        if not src_file.is_relative_to(source) or not target.is_relative_to(output_resolved):
+            raise ValueError("Rule cache escapes source or output directory")
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source / relative, target)
+        shutil.copy2(src_file, target)
     for name in ("Country.mmdb", "ASN.mmdb", "geoip.dat", "geosite.dat"):
         if (source / name).is_file():
             shutil.copy2(source / name, output / name)
     for name, enabled in (("config.yaml", True), ("bootstrap.yaml", False)):
         exported = copy.deepcopy(config)
         exported["tun"]["enable"] = enabled
-        (output / name).write_text(yaml.safe_dump(exported, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        write_private(output / name, yaml.safe_dump(exported, allow_unicode=True, sort_keys=False))
     (output / "selections.json").write_text(json.dumps(selected, ensure_ascii=False), encoding="utf-8")
     # All node credentials and subscription URLs stay in ignored work files.
-    (output / "controller.json").write_text(json.dumps({"secret": config["secret"]}), encoding="utf-8")
-    print(f"Exported {len(config['proxies'])} nodes, {len(config['rule-providers'])} rule providers; no credentials printed")
+    write_private(output / "controller.json", json.dumps({"secret": config["secret"]}))
+    print(f"Exported {len(config.get('proxies') or [])} nodes, {len(config.get('rule-providers') or {})} rule providers; no credentials printed")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, default=Path(os.environ["APPDATA"]) / "io.github.clash-verge-rev.clash-verge-rev")
+    parser.add_argument("--source", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.source is None:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            parser.error("--source is required when APPDATA is not set")
+        args.source = Path(appdata) / "io.github.clash-verge-rev.clash-verge-rev"
     prepare(args.source, args.output)

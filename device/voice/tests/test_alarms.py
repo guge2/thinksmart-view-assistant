@@ -161,6 +161,32 @@ class Service(unittest.TestCase):
         self.assertEqual(item["id"], "daily")
         self.assertAlmostEqual(item["due"], now - 3600 + 86400, delta=3700)
 
+    def test_announce_runs_outside_lock(self):
+        import threading
+
+        locked_during_emit = []
+
+        def emit(event, **_fields):
+            if event != "alarms":
+                return
+            result = []
+
+            def probe():
+                acquired = service.lock.acquire(blocking=False)
+                if acquired:
+                    service.lock.release()
+                result.append(not acquired)
+
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join()
+            locked_during_emit.append(result[0])
+
+        service = AlarmService(emit=emit, state_file=self.path)
+        self.assertTrue(service.manage_alarm({"action": "create", "kind": "timer", "minutes": 5, "label": "茶"}).ok)
+        self.assertTrue(service.manage_alarm({"action": "cancel"}).ok)
+        self.assertEqual(locked_during_emit, [False, False])
+
 
 if __name__ == "__main__":
     unittest.main()

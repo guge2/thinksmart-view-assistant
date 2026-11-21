@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 ANCHOR = "/var/lib/thinksmart-clock/anchor.json"
@@ -48,14 +49,25 @@ def save():
     except (OSError, ValueError, KeyError, TypeError):
         pass
     anchor = {"rtc": rtc, "realtime": realtime}
-    temporary = ANCHOR + ".tmp"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="ascii") as target:
-        json.dump(anchor, target)
-        target.flush()
-        os.fsync(target.fileno())
-    os.replace(temporary, ANCHOR)
-    directory = os.open(os.path.dirname(ANCHOR), os.O_RDONLY | os.O_DIRECTORY)
+    anchor_dir = os.path.dirname(ANCHOR) or "."
+    fd, temporary = tempfile.mkstemp(prefix=".anchor-", suffix=".tmp", dir=anchor_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as target:
+            fd = None
+            json.dump(anchor, target)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, ANCHOR)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory = os.open(anchor_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(directory)
     finally:
@@ -93,12 +105,14 @@ def restore():
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if len(sys.argv) != 2 or sys.argv[1] not in ("save", "restore"):
+        logging.error("Usage: thinksmart-clock.py <save|restore>")
+        raise SystemExit(2)
     try:
-        if len(sys.argv) != 2 or sys.argv[1] not in ("save", "restore"):
-            raise ValueError("expected save or restore")
         (save if sys.argv[1] == "save" else restore)()
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
-        logging.warning("Clock anchor unavailable: %s", error)
+        logging.error("Clock anchor operation failed: %s", error)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

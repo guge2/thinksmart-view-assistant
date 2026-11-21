@@ -19,6 +19,7 @@ from fbdev import Console, Framebuffer  # noqa: E402
 from ime import PinyinInput  # noqa: E402
 from system import (  # noqa: E402
     DIM_CHOICES,
+    SETTINGS_FILE,
     WAKE_PATTERN,
     WEATHER_CODES,
     Settings,
@@ -381,7 +382,9 @@ class App:
         self.ime = PinyinInput()
         self.settings = Settings()
         self.applied_settings = dict(self.settings.data)
+        self.settings_mtime = None
         self.next_settings_check = 0.0
+        self.last_orb_state = None
         self.status = SystemStatus(self.settings)
         self.link = VoiceLink()
         self.touch = Touchscreen(W, H)
@@ -543,7 +546,6 @@ class App:
         builder = {
             "idle": self.build_idle,
             "settings": self.build_settings,
-            "night": self.build_night,
             "keyboard": self.build_keyboard,
             "places": self.build_places,
             "music": self.build_music,
@@ -626,28 +628,9 @@ class App:
             Widget("think", (40, 748, 760, 822), self.paint_think_row, tap=self.toggle_thinking),
             Widget("dim", (40, 826, 760, 900), self.paint_dim_row, tap=self.cycle_dim),
             Widget("qqmusic", (40, 904, 760, 978), self.paint_qqmusic_row, tap=self.open_music),
-            Widget("night", (40, 982, 760, 1056), self.paint_night_row, tap=lambda x, y: self.set_screen("night")),
-            Widget("notice", (40, 1060, 760, 1094), self.paint_notice),
-            Widget("info", (40, 1098, 760, 1280), self.paint_info),
+            Widget("notice", (40, 982, 760, 1016), self.paint_notice),
+            Widget("info", (40, 1020, 760, 1202), self.paint_info),
         ]
-
-    def build_night(self):
-        widgets = self.header("夜间模式", "返回", lambda x, y: self.set_screen("settings"))
-        widgets.append(Widget("night_toggle", (40, 200, 760, 300),
-                              lambda d, r, p: self.paint_toggle(d, r, p, "定时开启", self.settings["night"]["enabled"]),
-                              tap=self.toggle_night))
-        for field, title, top in (("start", "开始时间", 360), ("end", "结束时间", 660)):
-            widgets.append(Widget(field + "_label", (40, top, 760, top + 64),
-                                  lambda d, r, p, t=title: self.paint_title(d, r, t)))
-            widgets.append(Widget(field + "_time", (240, top + 84, 560, top + 188),
-                                  lambda d, r, p, f=field: d.text((400, (r[1] + r[3]) // 2),
-                                      self.night_time(f), font=self.fonts.digits(64), fill=TEXT, anchor="mm")))
-            for side, label, delta in ((40, "−", -30), (580, "+", 30)):
-                widgets.append(Widget(f"{field}:{delta}", (side, top + 92, side + 180, top + 180),
-                                      lambda d, r, p, t=label: self.paint_button(d, r, p, t),
-                                      tap=lambda x, y, f=field, n=delta: self.change_night_time(f, n)))
-        widgets.append(Widget("night_hint", (40, 1000, 760, 1200), self.paint_night_hint))
-        return widgets
 
     def build_music(self):
         widgets = self.header("QQ音乐", "返回", self.close_music)
@@ -819,7 +802,9 @@ class App:
     def paint_orb(self, now):
         self.level += (self.level_target - self.level) * 0.35
         self.level_target *= 0.86
-        self.orb.render(self.frame, self.orb_rect, self.orb_state(now), now, self.level)
+        state = self.orb_state(now)
+        self.last_orb_state = state
+        self.orb.render(self.frame, self.orb_rect, state, now, self.level)
 
     def fit(self, text, font, width):
         if font.getlength(text) <= width:
@@ -1293,30 +1278,6 @@ class App:
     def paint_dim_row(self, d, rect, pressed):
         self.paint_row(d, rect, pressed, "自动调暗", DIM_LABELS.get(self.settings["dim_after"], "5 分钟"))
 
-    def night_time(self, field):
-        minutes = self.settings["night"][field]
-        return f"{minutes // 60:02d}:{minutes % 60:02d}"
-
-    def night_active(self):
-        night = self.settings["night"]
-        local = time.localtime()
-        minute = local.tm_hour * 60 + local.tm_min
-        start, end = night["start"], night["end"]
-        return night["enabled"] and start != end and (
-            start <= minute < end if start < end else minute >= start or minute < end
-        )
-
-    def paint_night_row(self, d, rect, pressed):
-        value = f"{self.night_time('start')}–{self.night_time('end')}" if self.settings["night"]["enabled"] else "关闭"
-        self.paint_row(d, rect, pressed, "夜间模式", value)
-
-    def paint_night_hint(self, d, rect, pressed):
-        lines = ["每次调整 30 分钟，支持跨午夜", "夜间助手音量减半，屏幕亮度降低", "闹钟和计时提醒保持原音量"]
-        if self.settings["night"]["start"] == self.settings["night"]["end"]:
-            lines[0] = "开始与结束相同，夜间模式不生效"
-        for index, line in enumerate(lines):
-            d.text((400, rect[1] + index * 52), line, font=self.fonts.ui(28), fill=DIM, anchor="mt")
-
     def paint_mic_row(self, d, rect, pressed):
         self.paint_toggle(d, rect, pressed, "语音唤醒", self.mic_on)
 
@@ -1649,9 +1610,15 @@ class App:
 
     @staticmethod
     def decode_qr(data):
+        if not isinstance(data, (str, bytes)):
+            return None
         try:
-            image = Image.open(io.BytesIO(base64.b64decode(data or ""))).convert("L")
-        except (ValueError, OSError) as error:
+            raw = base64.b64decode(data)
+            with Image.open(io.BytesIO(raw)) as opened:
+                if opened.width <= 0 or opened.height <= 0 or opened.width * opened.height > 4096 * 4096:
+                    raise ValueError("QR image dimensions out of range")
+                image = opened.convert("L")
+        except (ValueError, TypeError, OSError) as error:
             logging.warning("二维码解析失败：%s", error)
             return None
         side = 440
@@ -1689,7 +1656,7 @@ class App:
 
     def send_prefs(self):
         self.link.send("prefs", rate=self.settings["speech_rate"], think=int(self.settings["thinking"]),
-                       night=self.settings["night"], brightness=round(self.brightness))
+                       brightness=round(self.brightness))
 
     def apply_voice_settings(self, message, now):
         """Settings changed by voice; this process owns the settings file and the backlight."""
@@ -1702,8 +1669,6 @@ class App:
             values["speech_rate"] = round(float(rate), 1)
         if isinstance(message.get("thinking"), bool):
             values["thinking"] = message["thinking"]
-        if isinstance(message.get("night"), bool):
-            values["night"] = dict(self.settings["night"], enabled=message["night"])
         location = valid_location(message.get("location"))
         if location:
             values["location"] = location
@@ -1715,24 +1680,10 @@ class App:
         self.activity(now)
         self.update_dim(now)
         target = message.get("screen")
-        if target in ("home", "weather", "alarms", "settings", "music", "night"):
+        if target in ("home", "weather", "alarms", "settings", "music"):
             self.cancel_login()
             self.screen = target
         self.full_redraw = True
-
-    def toggle_night(self, *_args):
-        night = dict(self.settings["night"])
-        night["enabled"] = not night["enabled"]
-        self.save_settings(night=night)
-        self.send_prefs()
-        self.dirty |= {"night_toggle", "night"}
-
-    def change_night_time(self, field, delta):
-        night = dict(self.settings["night"])
-        night[field] = (night[field] + delta) % 1440
-        self.save_settings(night=night)
-        self.send_prefs()
-        self.dirty |= {field + "_time", "night_hint"}
 
     def toggle_thinking(self, *_args):
         self.save_settings(thinking=not self.settings["thinking"])
@@ -1769,8 +1720,6 @@ class App:
         if phase == "up":
             self.save_settings(brightness=self.brightness)
             self.send_prefs()
-            if self.night_active() and self.brightness > 20:
-                self.set_notice("日常亮度已保存，夜间模式中限制为 20%", DIM, 5)
             self.update_dim(time.monotonic())
         else:
             self.applied_brightness = self.brightness
@@ -1938,7 +1887,7 @@ class App:
                 self.answer = str(message.get("alarm_text") or "")
             self.mic_on = bool(message.get("mic"))
             self.hardware_mic = message.get("hardware_mic")
-            if message.get("wake"):
+            if isinstance(message.get("wake"), str) and message["wake"]:
                 self.wake_phrase = message["wake"][:16]
             if message.get("cloud") in CLOUD_STATES:
                 self.cloud = message["cloud"]
@@ -1948,8 +1897,9 @@ class App:
             for key, kind in (("lyric", "lyric"), ("account", "mlogin"), ("login", "mlogin")):
                 if isinstance(message.get(key), dict):
                     self.on_voice(dict(message[key], e=kind), now)
-            if message.get("error_code") in ERRORS and message.get("error_until", 0) > now:
-                self.show_error(message["error_code"], now, message["error_until"] - now)
+            error_until = message.get("error_until")
+            if message.get("error_code") in ERRORS and isinstance(error_until, (int, float)) and error_until > now:
+                self.show_error(message["error_code"], now, error_until - now)
             if self.phase in ACTIVE or self.alarm_active:
                 self.activity(now)
                 self.conv_until = now + 120 if self.alarm_active else now
@@ -2117,10 +2067,7 @@ class App:
             and backlight.writable()
         )
         self.dimmed = wanted
-        night = self.night_active()
-        brightness = min(self.brightness, 20) if night else self.brightness
-        if wanted:
-            brightness = 0 if night else max(1.0, brightness * 0.12)
+        brightness = max(1.0, self.brightness * 0.12) if wanted else self.brightness
         if brightness != self.applied_brightness:
             self.applied_brightness = brightness
             self.status.set_brightness(brightness)
@@ -2172,21 +2119,27 @@ class App:
     def tick(self, now):
         if now >= self.next_settings_check:
             self.next_settings_check = now + 2
-            saved = Settings().data
-            if saved != self.applied_settings:
-                previous = self.applied_settings
-                self.settings.data = saved
-                self.applied_settings = dict(saved)
-                self.brightness = saved["brightness"] or self.brightness
-                if saved["brightness"] != previous["brightness"]:
-                    self.activity(now)
-                if saved["location"] != previous["location"]:
-                    self.status.refresh_weather()
-                if saved["mic"] != previous["mic"]:
-                    self.mic_on = saved["mic"] and self.hardware_mic is not False
-                    self.link.send("mic", on=int(saved["mic"]))
-                self.send_prefs()
-                self.full_redraw = True
+            try:
+                mtime = os.stat(SETTINGS_FILE).st_mtime_ns
+            except OSError:
+                mtime = None
+            if mtime != self.settings_mtime:
+                self.settings_mtime = mtime
+                saved = Settings().data
+                if saved != self.applied_settings:
+                    previous = self.applied_settings
+                    self.settings.data = saved
+                    self.applied_settings = dict(saved)
+                    self.brightness = saved["brightness"] or self.brightness
+                    if saved["brightness"] != previous["brightness"]:
+                        self.activity(now)
+                    if saved["location"] != previous["location"]:
+                        self.status.refresh_weather()
+                    if saved["mic"] != previous["mic"]:
+                        self.mic_on = saved["mic"] and self.hardware_mic is not False
+                        self.link.send("mic", on=int(saved["mic"]))
+                    self.send_prefs()
+                    self.full_redraw = True
         clock = time.strftime("%H:%M")
         if clock != self.clock_key:
             self.clock_key = clock
@@ -2272,7 +2225,12 @@ class App:
         fds = [self.link.fileno()]
         if self.touch.fd is not None:
             fds.append(self.touch.fd)
-        animating = self.orb_rect is not None and not self.dimmed
+        orb_state = self.orb_state(now) if self.orb_rect is not None else None
+        animating = (
+            self.orb_rect is not None
+            and not self.dimmed
+            and (orb_state not in ("muted", "offline", "error") or orb_state != self.last_orb_state)
+        )
         deadline = self.next_tick
         if animating:
             deadline = min(deadline, self.next_frame)
@@ -2301,10 +2259,12 @@ class App:
         if self.layout_has("lyrics"):
             self.update_lyric(now)
         self.render(now)
-        if self.orb_rect is not None and not self.dimmed and now >= self.next_frame:
-            fast = self.phase in ACTIVE or now < self.error_until
-            self.next_frame = now + (1 / 40 if fast else 1 / 20)
-            self.animate(now)
+        if self.orb_rect is not None and not self.dimmed:
+            orb_state = self.orb_state(now)
+            if orb_state != self.last_orb_state or (orb_state not in ("muted", "offline", "error") and now >= self.next_frame):
+                fast = self.phase in ACTIVE
+                self.next_frame = now + (1 / 40 if fast else 1 / 20)
+                self.animate(now)
 
     def run(self):
         signal.signal(signal.SIGTERM, self.stop)

@@ -12,6 +12,20 @@ RuntimeDirectoryMode=0755
 ExecStart=/usr/local/bin/thinksmart-volume-keys
 Restart=always
 RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

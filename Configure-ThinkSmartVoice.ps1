@@ -45,6 +45,8 @@ try {
     $encoded = [Convert]::ToBase64String($bytes)
 
     $encoded | & $sshExe `
+        -o 'BatchMode=yes' `
+        -o 'ConnectTimeout=10' `
         -o 'StrictHostKeyChecking=yes' `
         -o "UserKnownHostsFile=$knownHosts" `
         -o 'IdentitiesOnly=yes' `

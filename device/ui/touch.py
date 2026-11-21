@@ -139,6 +139,14 @@ class Touchscreen:
         ny = min(1.0, max(0.0, ny))
         return int(nx * (self.width - 1)), int(ny * (self.height - 1))
 
+    def cancel_contact(self, events):
+        self.contact = False
+        self.button = False
+        self.tracking_seen = False
+        if self.was_down:
+            self.was_down = False
+            events.append(("up",) + self.last)
+
     def read(self):
         events = []
         if self.fd is None:
@@ -150,6 +158,12 @@ class Touchscreen:
         except OSError as error:
             logging.warning("触摸屏读取失败：%s", error)
             self.close()
+            self.cancel_contact(events)
+            return events
+        if not data:
+            logging.warning("触摸屏设备已断开")
+            self.close()
+            self.cancel_contact(events)
             return events
         for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
             _sec, _usec, kind, code, value = EVENT.unpack_from(data, offset)
@@ -174,6 +188,7 @@ class Touchscreen:
             elif kind == EV_SYN:
                 if code == SYN_DROPPED:
                     self.dropped = True
+                    self.cancel_contact(events)
                 elif code == SYN_REPORT:
                     if self.dropped:
                         self.dropped = False

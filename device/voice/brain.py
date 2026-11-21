@@ -50,15 +50,16 @@ class _SSEConnectionPool:
         key = (scheme, host, port)
 
         for attempt in range(2):
+            connect_timeout = min(20.0, timeout)
             conn = self._conns.pop(key, None)
             reused = conn is not None
             if conn is None:
-                conn = self._make(scheme, host, port, timeout)
+                conn = self._make(scheme, host, port, connect_timeout)
             else:
                 try:
                     if conn.sock is None:
                         reused = False
-                        conn = self._make(scheme, host, port, timeout)
+                        conn = self._make(scheme, host, port, connect_timeout)
                     else:
                         conn.sock.settimeout(timeout)
                 except OSError:
@@ -67,8 +68,12 @@ class _SSEConnectionPool:
                     except Exception:
                         pass
                     reused = False
-                    conn = self._make(scheme, host, port, timeout)
+                    conn = self._make(scheme, host, port, connect_timeout)
             try:
+                if conn.sock is None:
+                    conn.connect()
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
                 conn.request("POST", path, body=body_bytes, headers=headers)
                 resp = conn.getresponse()
                 return key, conn, resp
@@ -136,7 +141,8 @@ class Brain:
             raise ValueError("所选服务尚未配置日常对话凭据")
         self.config.update(self.profiles[provider])
         self.config["model"] = model
-        self.config["expert"]["model"] = expert_model
+        if isinstance(self.config.get("expert"), dict):
+            self.config["expert"]["model"] = expert_model
         self.config["providerOrder"] = self.provider_order if model == self.provider_order_model else []
 
     def _profile(self, expert=False):
@@ -146,8 +152,13 @@ class Brain:
 
     def _describe_error(self, message):
         text = str(message or "unknown error")
-        for key in (self.config.get("apiKey"), (self.config.get("expert") or {}).get("apiKey"),
-                    (self.config.get("bailian") or {}).get("apiKey")):
+        keys = {
+            self.config.get("apiKey"),
+            (self.config.get("expert") or {}).get("apiKey"),
+            (self.config.get("bailian") or {}).get("apiKey"),
+            *(profile.get("apiKey") for profile in self.profiles.values() if isinstance(profile, dict)),
+        }
+        for key in keys:
             if key:
                 text = text.replace(key, "[redacted]")
         return text
@@ -518,6 +529,8 @@ class Brain:
         text_parts = []
         tc_by_index = {}
         tc_order = []
+        saw_finish = False
+        self._last_sse_done = False
 
         for chunk in self._iter_sse(url, selected["apiKey"], payload, timeout, check_cancel):
             if chunk.get("error"):
@@ -527,7 +540,10 @@ class Brain:
             choices = chunk.get("choices")
             if not isinstance(choices, list) or not choices:
                 continue
-            delta = (choices[0] or {}).get("delta") or {}
+            choice = choices[0] or {}
+            if choice.get("finish_reason"):
+                saw_finish = True
+            delta = choice.get("delta") or {}
             content = delta.get("content")
             if isinstance(content, str) and content:
                 text_parts.append(content)
@@ -553,6 +569,9 @@ class Brain:
                         slot["name"] = fn["name"]
                     if fn.get("arguments"):
                         slot["partial"] += fn["arguments"]
+
+        if not saw_finish and not self._last_sse_done:
+            raise RuntimeError("stream ended before completion")
 
         blocks = []
         if text_parts:
@@ -587,8 +606,9 @@ class Brain:
             headers["HTTP-Referer"] = "https://pi.dev"
             headers["X-OpenRouter-Title"] = "pi"
 
-        key, conn, resp = self._pool.request_stream(url, headers, body_bytes, timeout=min(20.0, timeout))
+        key, conn, resp = self._pool.request_stream(url, headers, body_bytes, timeout=timeout)
         clean_eof = False
+        self._last_sse_done = False
         try:
             if resp.status >= 400:
                 err_body = resp.read(4096).decode("utf-8", errors="replace").strip()
@@ -620,7 +640,6 @@ class Brain:
                             raise RuntimeError("chat request timed out")
                 raw_line = resp.readline()
                 if not raw_line:
-                    clean_eof = True
                     break
                 deadline = time.monotonic() + timeout
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -629,6 +648,7 @@ class Brain:
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
                     clean_eof = True
+                    self._last_sse_done = True
                     break
                 try:
                     event = json.loads(data_str)

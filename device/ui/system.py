@@ -8,6 +8,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -49,12 +50,24 @@ def env_float(name, default):
 
 
 def write_atomic(path, data):
-    temporary = f"{path}.tmp"
-    with open(temporary, "wb") as target:
-        target.write(data)
-        target.flush()
-        os.fsync(target.fileno())
-    os.replace(temporary, path)
+    directory = os.path.dirname(path) or "."
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as target:
+            fd = None
+            target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def read_wake_phrase():
@@ -91,7 +104,10 @@ def valid_location(value):
     lon = value.get("lon")
     if not isinstance(name, str) or not 0 < len(name) <= 40:
         return None
-    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+    if (
+        isinstance(lat, bool) or isinstance(lon, bool)
+        or not isinstance(lat, (int, float)) or not isinstance(lon, (int, float))
+    ):
         return None
     if not -90 <= lat <= 90 or not -180 <= lon <= 180:
         return None
@@ -107,7 +123,6 @@ class Settings:
             "mic": True,
             "speech_rate": 1.5,
             "thinking": True,
-            "night": {"enabled": False, "start": 22 * 60, "end": 7 * 60},
             "location": {
                 "name": os.getenv("THINKSMART_UI_CITY", "上海")[:40] or "上海",
                 "lat": env_float("THINKSMART_UI_LATITUDE", 31.2304),
@@ -121,24 +136,18 @@ class Settings:
             saved = {}
         if isinstance(saved, dict):
             brightness = saved.get("brightness")
-            if isinstance(brightness, int) and 1 <= brightness <= 100:
+            if type(brightness) is int and 1 <= brightness <= 100:
                 self.data["brightness"] = brightness
-            if saved.get("dim_after") in DIM_CHOICES:
-                self.data["dim_after"] = saved["dim_after"]
+            dim_after = saved.get("dim_after")
+            if type(dim_after) is int and dim_after in DIM_CHOICES:
+                self.data["dim_after"] = dim_after
             if isinstance(saved.get("mic"), bool):
                 self.data["mic"] = saved["mic"]
             rate = saved.get("speech_rate")
-            if isinstance(rate, (int, float)) and 0.5 <= rate <= 2.0:
+            if not isinstance(rate, bool) and isinstance(rate, (int, float)) and 0.5 <= rate <= 2.0:
                 self.data["speech_rate"] = round(float(rate), 1)
             if isinstance(saved.get("thinking"), bool):
                 self.data["thinking"] = saved["thinking"]
-            night = saved.get("night")
-            if isinstance(night, dict):
-                self.data["night"] = {
-                    "enabled": bool(night.get("enabled", False)),
-                    "start": int(night.get("start", 1320)) % 1440,
-                    "end": int(night.get("end", 420)) % 1440,
-                }
             location = valid_location(saved.get("location"))
             if location:
                 self.data["location"] = location
@@ -222,8 +231,10 @@ def read_volume():
 
 
 def write_volume(percent):
-    run_wpctl("set-volume", "-l", "1.0", SINK, f"{percent / 100:.2f}")
-    run_wpctl("set-mute", SINK, "0" if percent > 0 else "1")
+    vol = run_wpctl("set-volume", "-l", "1.0", SINK, f"{percent / 100:.2f}")
+    mute = run_wpctl("set-mute", SINK, "0" if percent > 0 else "1")
+    if vol.returncode != 0 or mute.returncode != 0:
+        raise RuntimeError("wpctl volume update failed")
 
 
 def default_interface():
@@ -359,8 +370,10 @@ class SystemStatus:
         self.weather_failed = False
         self.places = []
         self.places_state = "idle"
+        self.pending_lock = threading.Lock()
         self.pending_volume = None
         self.pending_brightness = None
+        self.search_seq = 0
         self.jobs = queue.Queue()
         self.interval = max(10, env_float("THINKSMART_UI_WEATHER_MINUTES", 30)) * 60
         self.failures = 0
@@ -386,6 +399,15 @@ class SystemStatus:
                 or abs(cached["lat"] - location["lat"]) > 0.01
                 or abs(cached["lon"] - location["lon"]) > 0.01
                 or not isinstance(cached["temp"], (int, float))
+                or not isinstance(cached.get("days", []), list)
+                or any(
+                    not isinstance(day, dict)
+                    or not isinstance(day.get("date"), str)
+                    or not isinstance(day.get("code"), int)
+                    or not isinstance(day.get("max"), (int, float))
+                    or not isinstance(day.get("min"), (int, float))
+                    for day in cached.get("days", [])
+                )
             ):
                 return None
         except (AttributeError, KeyError, TypeError):
@@ -396,11 +418,13 @@ class SystemStatus:
         self.version += 1
 
     def set_volume(self, percent):
-        self.pending_volume = percent
+        with self.pending_lock:
+            self.pending_volume = percent
         self.jobs.put(None)
 
     def set_brightness(self, percent):
-        self.pending_brightness = percent
+        with self.pending_lock:
+            self.pending_brightness = percent
         self.jobs.put(None)
 
     def refresh_weather(self):
@@ -412,18 +436,27 @@ class SystemStatus:
         self.jobs.put(None)
 
     def find_places(self, name):
+        with self.pending_lock:
+            self.search_seq += 1
+            seq = self.search_seq
         self.places = []
         self.places_state = "searching"
         self.changed()
-        self.jobs.put(lambda: self.search(name))
+        self.jobs.put(lambda: self.search(name, seq))
 
-    def search(self, name):
+    def search(self, name, seq):
         try:
             places = search_places(name)
+            with self.pending_lock:
+                if seq != self.search_seq:
+                    return
             self.places = places
             self.places_state = "done" if places else "empty"
         except Exception as error:
             logging.warning("城市搜索失败：%s", error)
+            with self.pending_lock:
+                if seq != self.search_seq:
+                    return
             self.places_state = "error"
         self.changed()
 
@@ -434,6 +467,7 @@ class SystemStatus:
             except queue.Empty:
                 job = None
             try:
+                self.apply_pending()
                 if job:
                     job()
                 self.apply_pending()
@@ -443,18 +477,17 @@ class SystemStatus:
                 time.sleep(1)
 
     def apply_pending(self):
-        brightness = self.pending_brightness
+        with self.pending_lock:
+            brightness, self.pending_brightness = self.pending_brightness, None
+            volume, self.pending_volume = self.pending_volume, None
         if brightness is not None:
-            self.pending_brightness = None
             self.backlight.write_percent(brightness)
-        volume = self.pending_volume
         if volume is not None:
-            self.pending_volume = None
             try:
                 write_volume(volume)
                 self.volume = volume
                 self.muted = volume == 0
-            except (OSError, subprocess.SubprocessError) as error:
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 logging.warning("音量设置失败：%s", error)
             self.next_volume = time.monotonic() + 3
             self.changed()

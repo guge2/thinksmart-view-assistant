@@ -54,9 +54,18 @@ for file in thinksmart-clock.py thinksmart-clock-restore.service thinksmart-cloc
 	fi
 done
 
-install -d -m 0755 "$DATA_ROOT" "$MODEL_ROOT" "$CACHE_ROOT"
+install -d -o root -g root -m 0755 "$DATA_ROOT" "$MODEL_ROOT" "$CACHE_ROOT"
 STAGE=$(mktemp -d "$DATA_ROOT/install-XXXXXXXX")
 chmod 0755 "$STAGE"
+PREV_INSTALL=""
+if [ -L "$VENV" ]; then
+    PREV_TARGET=$(readlink -f "$VENV" || true)
+    case "$PREV_TARGET" in
+        "$DATA_ROOT"/install-*/venv)
+            PREV_INSTALL=$(dirname -- "$PREV_TARGET")
+            ;;
+    esac
+fi
 COMMIT=0
 VENV_SWAPPED=0
 VOICE_ACTIVE=0
@@ -124,12 +133,14 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 	python3-venv curl ca-certificates bzip2
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 	python3-pil fonts-wqy-microhei fonts-dejavu-core fonts-dejavu-extra libmpg123-0t64 libpulse0 pipewire-pulse espeak-ng
-runuser -u thinksmart -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable --now pipewire-pulse.socket
+THINKSMART_UID=$(id -u thinksmart)
+runuser -u thinksmart -- env "XDG_RUNTIME_DIR=/run/user/$THINKSMART_UID" systemctl --user enable --now pipewire-pulse.socket
 
 # All network-dependent preparation finishes while the old services still run.
 python3 -m venv "$STAGE/venv"
 if [ -x "$VENV/bin/pip" ]; then
-    "$VENV/bin/pip" freeze > "$STAGE/constraints.txt"
+    # Exclude explicitly pinned packages so future version bumps in this script do not conflict.
+    "$VENV/bin/pip" freeze | grep -Eiv '^(sherpa-onnx|qqmusic-api-python)==' > "$STAGE/constraints.txt" || true
 else
     : > "$STAGE/constraints.txt"
 fi
@@ -234,8 +245,9 @@ if [ ! -s /etc/thinksmart-voice/wake-phrase ]; then
 fi
 /usr/local/sbin/thinksmart-set-wake-word --stdin < /etc/thinksmart-voice/wake-phrase
 
-chown thinksmart:thinksmart "$DATA_ROOT" "$DATA_ROOT/offline-keywords.txt"
-chmod 0644 /etc/thinksmart-voice/wake-phrase "$DATA_ROOT/keywords.txt"
+chown root:root "$DATA_ROOT" "$DATA_ROOT/offline-keywords.txt"
+chmod 0755 "$DATA_ROOT"
+chmod 0644 /etc/thinksmart-voice/wake-phrase "$DATA_ROOT/keywords.txt" "$DATA_ROOT/offline-keywords.txt"
 systemctl daemon-reload
 systemctl enable thinksmart-volume-keys.service
 systemctl restart thinksmart-volume-keys.service
@@ -266,5 +278,8 @@ fi
 systemctl disable --now thinksmart-llm.service >/dev/null 2>&1 || true
 systemctl enable --now thinksmart-gateway-maintenance.path thinksmart-gateway.service
 curl --fail --silent --max-time 30 http://127.0.0.1:8787/api/settings >/dev/null
-rm -rf "$STAGE/backup" "$STAGE/previous-venv" "$STAGE/node-download"
+rm -rf "$STAGE/backup" "$STAGE/previous-venv"
+if [ -n "$PREV_INSTALL" ] && [ "$PREV_INSTALL" != "$STAGE" ]; then
+    rm -rf -- "$PREV_INSTALL"
+fi
 trap - EXIT HUP INT TERM

@@ -19,4 +19,7 @@ patch --directory "$BUILD" -p1 < "$ROOT/device/audio/alsa-pcm-watchdog.patch"
     "$ROOT/device/audio/alsa-pcm-plugin.c" "$BUILD/alsa-pcm.c" "$BUILD/alsa-pcm-sink.c" "$BUILD/alsa-pcm-source.c" \
     ${LDFLAGS:-} -lasound -lm -Wl,--no-undefined \
     -o "$OUTPUT/libspa-alsa-thinksmart.so"
+"${STRIP:-strip}" --strip-unneeded "$OUTPUT/libspa-alsa-thinksmart.so"
+ELF_HEADER=$("${READELF:-readelf}" -h "$OUTPUT/libspa-alsa-thinksmart.so")
+grep -q 'Machine:.*AArch64' <<< "$ELF_HEADER"
 cp "$SRC/COPYING" "$OUTPUT/licenses/PipeWire.txt"

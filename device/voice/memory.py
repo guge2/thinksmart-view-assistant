@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -34,12 +35,24 @@ class Memory:
                 and isinstance(item.get("text"), str)][:MAX_ITEMS] if isinstance(data, list) else []
 
     def _save(self):
-        temporary = self.state_file + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as target:
-            json.dump(self.items, target, ensure_ascii=False)
-            target.flush()
-            os.fsync(target.fileno())
-        os.replace(temporary, self.state_file)
+        directory = os.path.dirname(self.state_file) or "."
+        fd, temporary = tempfile.mkstemp(prefix=".memory-", suffix=".tmp", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as target:
+                fd = None
+                json.dump(self.items, target, ensure_ascii=False)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, self.state_file)
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
     def describe(self):
         with self.lock:

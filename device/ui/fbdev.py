@@ -118,17 +118,21 @@ class Framebuffer:
         stride = stride or sysfs_int(device, "stride") or self.xres * self.bytespp
         yvirt = max(yvirt, self.yres)
         length = smem_len or stride * yvirt
-        if stride < self.xres * self.bytespp or length < stride * (yoff + self.yres):
-            raise RuntimeError("framebuffer geometry is inconsistent")
         self.stride = stride
         self.base = yoff * stride + xoff * self.bytespp
+        if stride < self.xres * self.bytespp or length < self.base + stride * self.yres:
+            raise RuntimeError("framebuffer geometry is inconsistent")
         self.mm = mmap.mmap(
             self.fd,
             length,
             mmap.MAP_SHARED,
             mmap.PROT_READ | mmap.PROT_WRITE,
         )
-        self.encode = self.pick_encoder(bpp, red, blue)
+        try:
+            self.encode = self.pick_encoder(bpp, red, blue)
+        except Exception:
+            self.mm.close()
+            raise
         self.pan = os.getenv("THINKSMART_UI_FB_PAN") == "1"
         rotate = os.getenv("THINKSMART_UI_ROTATE", "").strip()
         if rotate in ("0", "90", "180", "270"):
@@ -232,6 +236,8 @@ class Framebuffer:
             pass
 
     def close(self):
+        self._fast_blit = False
+        self._mm_addr = 0
         try:
             self.mm.close()
         finally:

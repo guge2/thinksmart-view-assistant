@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 """将上游 PCM 恢复和环形位置修正应用到项目提供的 6.19.5 模块。"""
 import hashlib
+import os
 from pathlib import Path
 import struct
 import sys
+import tempfile
 
 # 对照 gregkh/linux v6.19.5 与 torvalds/linux 的 q6asm-dai.c。
 # 精确限定供应方模块；保留其 ABI、重定位和 KCFI 元数据。
 SOURCE_SHA256 = "aec3a6a2aea2469d06fdcb0562d45ce108204725df2ea1a3d5355dc1d644371f"
-data = bytearray(Path(sys.argv[1]).read_bytes())
+
+if len(sys.argv) != 3:
+    raise SystemExit("用法: patch-q6asm.py <输入.ko> <输出.ko>")
+
+src_path = Path(sys.argv[1])
+dst_path = Path(sys.argv[2])
+data = bytearray(src_path.read_bytes())
 if hashlib.sha256(data).hexdigest() != SOURCE_SHA256:
     raise SystemExit("不是已核验的 6.19.5 q6asm-dai 模块")
+if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", data, 0x12)[0] != 183:
+    raise SystemExit("输入不是 AArch64 ELF64 模块")
 section_offset = struct.unpack_from("<Q", data, 0x28)[0]
 entry_size, count, names_index = struct.unpack_from("<HHH", data, 0x3A)
+if entry_size < 64 or count == 0 or names_index >= count or section_offset + entry_size * count > len(data):
+    raise SystemExit("ELF 节表头无效")
 sections = [struct.unpack_from("<IIQQQQIIQQ", data, section_offset + i * entry_size) for i in range(count)]
 names = sections[names_index]
 strings = data[names[4]:names[4] + names[5]]
-text = next(section for section in sections if strings[section[0]:].split(b"\0", 1)[0] == b".text")
+text = next((section for section in sections if strings[section[0]:].split(b"\0", 1)[0] == b".text"), None)
+if text is None:
+    raise SystemExit("模块缺少 .text 节")
 
 patches = [
     # prepare 会重置 ALSA 指针；同步清零排队指针，避免停歌后不再向 DSP 送帧。
@@ -37,5 +51,21 @@ for offset, before, after in patches:
     if len(before) != len(after) or data[start:start + len(before)] != before:
         raise SystemExit(f"模块指令不匹配：.text+{offset:#x}")
     data[start:start + len(before)] = after
-Path(sys.argv[2]).write_bytes(data)
+dst_path.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".q6asm-", suffix=".tmp", dir=dst_path.parent)
+try:
+    with os.fdopen(fd, "wb") as out:
+        fd = None
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temporary, dst_path)
+except BaseException:
+    if fd is not None:
+        os.close(fd)
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
 print(hashlib.sha256(data).hexdigest())

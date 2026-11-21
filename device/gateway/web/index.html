@@ -31,11 +31,10 @@
  <section data-section="settings" hidden>
   <div class="section-intro"><h2>让设备按你的习惯工作</h2><p>模型与音色保存后从下一轮对话开始使用，当前播报会继续完成。</p></div>
   <form id="model-form" class="panel"><div class="section-title"><h3>对话模型与音色</h3><span id="model-update-state" class="pill neutral" role="status">正在读取</span></div>
-   <p>日常对话可选 OpenAI GPT 模型和 OpenRouter 日常低价模型，自动使用对应服务的已有凭据。</p>
    <div class="form-grid model-form">
     <label>日常对话模型<select name="chat_model" required></select><input type="hidden" name="chat_provider"><small id="configured-provider">正在读取服务</small></label>
     <label>复杂任务模型<select name="expert_model" required></select><small id="expert-note">正在读取服务</small></label>
-    <label>语音合成模型<select name="tts_model" required></select><small>阿里云百炼 · 切换后会更新可选音色</small></label>
+    <label>语音合成模型<select name="tts_model" required></select><small>阿里云百炼 · Flash 有更多普通话音色</small></label>
     <label>播报音色<select name="tts_voice" required></select><small id="voice-compatibility">只显示当前合成模型兼容的中文音色</small></label>
    </div>
    <div class="voice-preview"><button type="button" id="preview-voice">试听所选音色</button><span id="preview-state" role="status">点击后在这台电脑播放，试听不会保存设置</span><audio id="voice-audio" controls hidden preload="none"></audio></div>
@@ -47,18 +46,18 @@
   </form>
   <form id="preferences-form" class="panel"><div class="section-title"><h3>常用设置</h3><span class="pill green">即时设置</span></div><div class="form-grid">
    <label>播报语速<select name="speech_rate"><option value="0.5">0.5 倍</option><option value="0.8">0.8 倍</option><option value="1">1.0 倍</option><option value="1.2">1.2 倍</option><option value="1.5">1.5 倍</option><option value="1.8">1.8 倍</option><option value="2">2.0 倍</option></select></label>
-   <label>屏幕亮度<input name="brightness" type="number" min="1" max="100" step="1"><small>1–100，夜间模式仍会限制实际亮度</small></label>
+   <label>屏幕亮度<input name="brightness" type="number" min="1" max="100" step="1" required></label>
    <label>自动调暗<select name="dim_after"><option value="0">从不</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option></select></label>
    <div class="toggles"><label class="toggle"><input type="checkbox" name="mic"><span>允许麦克风收音</span></label><label class="toggle"><input type="checkbox" name="thinking"><span>复杂问题开启思考</span></label></div>
-  </div><div class="night-row"><label class="toggle"><input type="checkbox" name="night_enabled"><span>夜间模式</span></label><label>开始<input type="time" name="night_start"></label><span class="muted">至</span><label>结束<input type="time" name="night_end"></label></div><div class="form-footer"><span id="preferences-state">与设备屏幕共用设置</span><button type="submit" class="primary">保存常用设置</button></div></form>
+  </div><div class="form-footer"><span id="preferences-state">与设备屏幕共用设置</span><button type="submit" class="primary">保存常用设置</button></div></form>
   <form id="wake-form" class="panel compact"><div><h3>唤醒词</h3><p>2–8 个汉字，应用时语音服务会短暂重启。</p></div><div class="inline-form"><label class="sr-only" for="wake-word">新的唤醒词</label><input id="wake-word" minlength="2" maxlength="8" required><button type="submit">应用唤醒词</button></div></form>
   <form id="voice-form" class="panel"><div class="section-title"><h3>识别与唤醒</h3><span class="pill amber">应用后重启语音</span></div><div class="form-grid">
-   <label>唤醒阈值<input type="number" name="kws_threshold" min="0.01" max="0.9" step="0.01"><small>越低越容易唤醒，也更容易误触发</small></label>
-   <label>唤醒词加分<input type="number" name="kws_score" min="1" max="10" step="0.5"><small>越高越偏向识别唤醒词</small></label>
-   <label>等待开口 / 秒<input type="number" name="speech_wait_seconds" min="3" max="20" step="1"></label>
-   <label>最长讲话 / 秒<input type="number" name="max_speech_seconds" min="5" max="60" step="1"></label>
-   <label>普通追问窗口 / 秒<input type="number" name="followup_seconds" min="0" max="15" step="1"></label>
-   <label>需要补充信息时 / 秒<input type="number" name="question_followup_seconds" min="0" max="30" step="1"></label>
+   <label>唤醒阈值<input type="number" name="kws_threshold" min="0.01" max="0.9" step="0.01" required><small>越低越容易唤醒，也更容易误触发</small></label>
+   <label>唤醒词加分<input type="number" name="kws_score" min="1" max="10" step="0.5" required><small>越高越偏向识别唤醒词</small></label>
+   <label>等待开口 / 秒<input type="number" name="speech_wait_seconds" min="3" max="20" step="1" required></label>
+   <label>最长讲话 / 秒<input type="number" name="max_speech_seconds" min="5" max="60" step="1" required></label>
+   <label>普通追问窗口 / 秒<input type="number" name="followup_seconds" min="0" max="15" step="1" required></label>
+   <label>需要补充信息时 / 秒<input type="number" name="question_followup_seconds" min="0" max="30" step="1" required></label>
    <label>语音识别模型<input name="asr_model" maxlength="128" autocomplete="off" required></label>
   </div><div class="form-footer"><span id="voice-config-state">识别与唤醒参数应用后会重启语音，失败时恢复原配置</span><button type="submit" class="primary">应用识别与唤醒参数</button></div></form>
  </section>

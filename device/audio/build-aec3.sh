@@ -13,13 +13,15 @@ if [ -n "${CROSS_FILE:-}" ]; then CROSS=(--cross-file "$CROSS_FILE"); fi
 
 # Upstream WebRTC APM 1.3 and PipeWire 1.0.5; build on the host, not the device.
 # WebRTC archive SHA256: 95552fc17faa0202133707bbb3727e8c2cf64d4266fe31bfdb2298d769c1db75
+rm -rf "$BUILD"
 "${MESON[@]}" setup "$BUILD" "$SRC" "${CROSS[@]}" \
     --buildtype release --default-library static -Db_staticpic=true -Dneon=yes
 ninja -C "$BUILD" -j "${JOBS:-4}"
 cp "$PIPEWIRE/spa/plugins/aec/aec-webrtc.cpp" "$BUILD/aec-webrtc.cpp"
 patch --directory "$BUILD" -p1 < "$ROOT/device/audio/aec3.patch"
 printf '#pragma once\n' > "$BUILD/config.h"
-mapfile -t LIBS < <(find "$BUILD" -name '*.a' -type f)
+mapfile -t LIBS < <(find "$BUILD" -name '*.a' -type f | sort)
+[ "${#LIBS[@]}" -gt 0 ] || { echo "no static libraries produced under $BUILD" >&2; exit 1; }
 mkdir -p "$OUTPUT/licenses"
 "${CXX:-c++}" -std=c++17 -O2 -shared -fPIC -DWEBRTC_POSIX \
     -I"$BUILD" -I"$PIPEWIRE/spa/include" -I"$SRC/webrtc" \
@@ -28,7 +30,8 @@ mkdir -p "$OUTPUT/licenses"
     -pthread -lm -Wl,--no-undefined -Wl,--exclude-libs,ALL \
     -o "$OUTPUT/libspa-aec-thinksmart.so"
 "${STRIP:-strip}" --strip-unneeded "$OUTPUT/libspa-aec-thinksmart.so"
-readelf -h "$OUTPUT/libspa-aec-thinksmart.so" | grep -q 'Machine:.*AArch64'
+ELF_HEADER=$("${READELF:-readelf}" -h "$OUTPUT/libspa-aec-thinksmart.so")
+grep -q 'Machine:.*AArch64' <<< "$ELF_HEADER"
 cp "$PIPEWIRE/COPYING" "$OUTPUT/licenses/PipeWire.txt"
 cp "$SRC/COPYING" "$OUTPUT/licenses/WebRTC.txt"
 cp "$SRC/subprojects/abseil-cpp-20230125.1/LICENSE" "$OUTPUT/licenses/Abseil.txt"

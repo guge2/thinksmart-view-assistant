@@ -1,9 +1,23 @@
 [Unit]
 Description=Apply ThinkSmart wake word request
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/thinksmart-set-wake-word --request /run/thinksmart-ui/wake-request
 TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
 PrivateNetwork=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/etc/thinksmart-voice /data/thinksmart/voice /run/thinksmart-ui
+RestrictAddressFamilies=AF_UNIX

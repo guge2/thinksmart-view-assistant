@@ -23,10 +23,14 @@ def model_paths(model_dir):
 
 class OfflineCommands:
     def __init__(self, model_dir, keywords_file):
+        try:
+            threads = max(1, int(os.getenv("THINKSMART_KWS_THREADS", "1")))
+        except ValueError:
+            threads = 1
         self.spotter = sherpa_onnx.KeywordSpotter(
             **model_paths(model_dir),
             keywords_file=keywords_file,
-            num_threads=int(os.getenv("THINKSMART_KWS_THREADS", "1")),
+            num_threads=threads,
             sample_rate=16000,
             feature_dim=80,
             max_active_paths=4,
@@ -53,17 +57,19 @@ class OfflineCommands:
         return ""
 
 
-def speak(text, cancelled=None, gain=1.0):
+def speak(text, cancelled=None, on_play=None):
     """Speak a short response without network; return whether playback succeeded."""
     try:
         # pw-play reads stdin as raw 48 kHz stereo; a file keeps espeak's WAV header and rate.
         with tempfile.NamedTemporaryFile(suffix=".wav") as sound:
             subprocess.run(
-                ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "160", "-a", str(round(100 * gain)), "-w", sound.name, text],
+                ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "160", "-a", "100", "-w", sound.name, "--", text],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True,
             )
             if cancelled is not None and cancelled():
                 return False
+            if on_play is not None:
+                on_play()
             playback = subprocess.Popen(
                 ["/usr/bin/pw-play", "--media-role", "Assistant", sound.name],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

@@ -1,5 +1,4 @@
 """PCM playback through PipeWire's Pulse server, with the audible position."""
-import array
 import ctypes as C
 import queue
 import subprocess
@@ -21,26 +20,29 @@ class BufferAttr(C.Structure):
 
 class PCMPlayer:
     _lib = None
+    _lib_lock = threading.Lock()
 
     @classmethod
     def library(cls):
-        if cls._lib is None:
-            lib = C.CDLL("libpulse-simple.so.0")
-            lib.pa_simple_new.restype = C.c_void_p
-            lib.pa_simple_new.argtypes = [C.c_char_p, C.c_char_p, C.c_int, C.c_char_p, C.c_char_p,
-                                          C.POINTER(SampleSpec), C.c_void_p, C.POINTER(BufferAttr), C.c_void_p]
-            lib.pa_simple_write.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t, C.c_void_p]
-            lib.pa_simple_get_latency.argtypes = [C.c_void_p, C.c_void_p]
-            lib.pa_simple_get_latency.restype = C.c_uint64
-            lib.pa_simple_flush.argtypes = [C.c_void_p, C.c_void_p]
-            lib.pa_simple_drain.argtypes = [C.c_void_p, C.c_void_p]
-            lib.pa_simple_free.argtypes = [C.c_void_p]
-            cls._lib = lib
-        return cls._lib
+        if cls._lib is not None:
+            return cls._lib
+        with cls._lib_lock:
+            if cls._lib is None:
+                lib = C.CDLL("libpulse-simple.so.0")
+                lib.pa_simple_new.restype = C.c_void_p
+                lib.pa_simple_new.argtypes = [C.c_char_p, C.c_char_p, C.c_int, C.c_char_p, C.c_char_p,
+                                              C.POINTER(SampleSpec), C.c_void_p, C.POINTER(BufferAttr), C.c_void_p]
+                lib.pa_simple_write.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t, C.c_void_p]
+                lib.pa_simple_get_latency.argtypes = [C.c_void_p, C.c_void_p]
+                lib.pa_simple_get_latency.restype = C.c_uint64
+                lib.pa_simple_flush.argtypes = [C.c_void_p, C.c_void_p]
+                lib.pa_simple_drain.argtypes = [C.c_void_p, C.c_void_p]
+                lib.pa_simple_free.argtypes = [C.c_void_p]
+                cls._lib = lib
+            return cls._lib
 
-    def __init__(self, rate, gain=1.0):
+    def __init__(self, rate):
         self.rate = rate
-        self.gain = gain
         self.played_seconds = 0.0
         self.frames = queue.Queue(maxsize=50)
         self.io_started = None
@@ -133,9 +135,10 @@ class PCMPlayer:
                             raise RuntimeError("speaker drain failed")
                         self.played_seconds = written / (self.rate * 2)
                     break
-                if self.gain != 1.0:
-                    samples = array.array("h", pcm)
-                    pcm = array.array("h", (int(v * self.gain) for v in samples)).tobytes()
+                if len(pcm) & 1:
+                    pcm = pcm[:-1]
+                if not pcm:
+                    continue
                 step = self.rate * 2 // 25
                 for offset in range(0, len(pcm), step):
                     if self.stopped.is_set():

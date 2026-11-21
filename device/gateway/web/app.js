@@ -7,22 +7,23 @@ const numericVoice = ['kws_score','kws_threshold','speech_wait_seconds','max_spe
 const modelFields = ['chat_model','chat_provider','expert_model','tts_model','tts_voice'];
 const providerNames = {bailian:'阿里云百炼',openrouter:'OpenRouter',openai:'OpenAI'};
 let csrf='', page='overview', latest=null, prefsBase=null, voiceBase=null, settingsLoaded=false, polling=false, logsAt=0, loadingLogs=false, busy=false, toastTimer;
-let previewController=null, previewUrl=null, previewSequence=0, modelSaving=false;
+let previewController=null, previewUrl=null, previewSequence=0, modelSaving=false, modelSaveFailed=false;
 const prefsTouched=new Set();
 const clock = seconds => new Date(seconds*1000).toLocaleTimeString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'});
 const mb = value => typeof value==='number' ? `${(value/1048576).toFixed(1)} MB` : '—';
 const text = (id,value) => { $(id).textContent = value; };
 function pill(id,label,kind='neutral'){text(id,label);$(id).className=`pill ${kind}`;}
 function toast(message,error=false){clearTimeout(toastTimer);$('toast').textContent=message;$('toast').className=error?'error':'';$('toast').hidden=false;toastTimer=setTimeout(()=>$('toast').hidden=true,error?8500:5000);}
-async function api(path,body,retrySession=true){
- const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),95000);
+async function api(path,body,retrySession=true,timeoutMs){
+ const controller=new AbortController();const limit=timeoutMs??(body===undefined?10000:115000);const timer=setTimeout(()=>controller.abort(),limit);
  try{
   const response=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,credentials:'same-origin'});
-  const data=await response.json();
-  if(response.status===403&&body!==undefined&&retrySession){csrf=(await api('/api/session')).csrf;return await api(path,body,false);}
-  if(!response.ok||data.ok===false)throw new Error(data.error||'操作未完成');
+  let data=null;try{data=await response.json();}catch{}
+  if(response.status===403&&body!==undefined&&retrySession){csrf=(await api('/api/session')).csrf;return await api(path,body,false,limit);}
+  if(!response.ok||data?.ok===false)throw new Error(data?.error||`请求失败（HTTP ${response.status}）`);
+  if(data===null)throw new Error('设备返回了无效数据');
   return data;
- }catch(error){if(error.name==='AbortError')throw new Error('尚未确认操作结果，请刷新状态后查看');throw error;}finally{clearTimeout(timer);}
+ }catch(error){if(error.name==='AbortError')throw new Error(body===undefined?'设备响应超时':'尚未确认操作结果，请刷新状态后查看');throw error;}finally{clearTimeout(timer);}
 }
 async function mutate(path,body,button){
  if(busy)return null;
@@ -48,8 +49,8 @@ function levels(health){
   $(`${kind}-meter`).style.width=`${Math.min(100,Math.max(0,Number(value)||0))}%`;
  }
  $('overview-level').style.width=`${Math.min(100,Math.max(0,Number(lv.aec)||0))}%`;
- text('raw-age',health?.raw_age===null||health?.raw_age===undefined?'尚无数据':`${health.raw_age.toFixed(2)} 秒前更新`);
- text('aec-age',health?`${health.capture_age.toFixed(2)} 秒前更新`:'尚无数据');
+ text('raw-age',typeof health?.raw_age==='number'?`${health.raw_age.toFixed(2)} 秒前更新`:'尚无数据');
+ text('aec-age',typeof health?.capture_age==='number'?`${health.capture_age.toFixed(2)} 秒前更新`:'尚无数据');
  text('buffer-ms',health?`${health.queued_audio_ms} ms`:'—');
  text('dropped-frames',health?.dropped_frames??'—');
  const timing=health?.timing||{};
@@ -64,7 +65,18 @@ function renderServices(services){
   let card=$(`service-${key}`);
   if(!card){
    card=document.createElement('article');card.className='panel';card.id=`service-${key}`;
-   card.innerHTML=`<div class="section-title"><h3>${title}</h3><span id="service-state-${key}" class="pill neutral">—</span></div><p>${description}</p><div class="service-metrics"><span>内存占用<strong id="service-memory-${key}">—</strong></span><span>自动重启<strong id="service-restarts-${key}">—</strong></span></div>`;
+   const head=document.createElement('div');head.className='section-title';
+   const heading=document.createElement('h3');heading.textContent=title;
+   const state=document.createElement('span');state.id=`service-state-${key}`;state.className='pill neutral';state.textContent='—';
+   head.append(heading,state);
+   const desc=document.createElement('p');desc.textContent=description;
+   const metrics=document.createElement('div');metrics.className='service-metrics';
+   for(const [label,metricId] of [['内存占用',`service-memory-${key}`],['自动重启',`service-restarts-${key}`]]){
+    const span=document.createElement('span');span.textContent=label;
+    const strong=document.createElement('strong');strong.id=metricId;strong.textContent='—';
+    span.append(strong);metrics.append(span);
+   }
+   card.append(head,desc,metrics);
    if(key!=='gateway'){const button=document.createElement('button');button.textContent=`重启${title}`;button.addEventListener('click',()=>mutate('/api/restart',{target:key},button));card.append(button);}
    else {const note=document.createElement('small');note.className='muted';note.textContent='网页渲染在浏览器中完成';card.append(note);}
    $('service-cards').append(card);
@@ -91,7 +103,7 @@ function render(data){
  const recovery=h?.audio_recovery;
  const recoveryText=recovery?.status==='recovering'?' · 正在自动恢复':recovery?.status==='limited'?' · 自动恢复已达频率上限':recovery?.status==='failed'?' · 上次恢复未就绪':'';
  text('capture-continuity',(captureClock?`收音连续性：经过 ${captureClock.wall_seconds.toFixed(2)} 秒，实际收到 ${captureClock.audio_seconds.toFixed(2)} 秒音频${inputBad?' · 输入异常':''}`:'正在观察收音连续性')+recoveryText);
- text('capture-note',h?`采集更新 ${h.capture_age.toFixed(2)} 秒前 · 唤醒命中 ${wakeCount??'—'} 次`:'等待语音服务响应');
+ text('capture-note',typeof h?.capture_age==='number'?`采集更新 ${h.capture_age.toFixed(2)} 秒前 · 唤醒命中 ${wakeCount??'—'} 次`:'等待语音服务响应');
  text('wake-model',h?.models?.wake_model?`本地唤醒模型：${h.models.wake_model} · 本次运行命中 ${wakeCount??0} 次`:'等待语音服务返回唤醒模型');
  const turn=h?.turn_models||{};const actualModel=turn.chat_model||h?.models?.chat_model;
  text('model-name',modelName(turn.role==='expert'?'expert':'chat',actualModel));text('model-provider',h?`${turn.chat_model?'最近一轮':'日常对话'} · ${serviceName(turn.chat_provider||h.models?.chat_provider)}`:'语音服务离线');
@@ -129,8 +141,6 @@ async function poll(){
  catch(error){pill('connection','连接已断开','red');$('connection-error').hidden=false;text('refreshed','请检查设备或重新打开管理入口');}
  finally{polling=false;}
 }
-const hhmm=minutes=>`${Math.floor(minutes/60).toString().padStart(2,'0')}:${(minutes%60).toString().padStart(2,'0')}`;
-const minutes=value=>{const [h,m]=value.split(':').map(Number);return h*60+m;};
 const serviceName=provider=>providerNames[provider]||provider||'未配置';
 function modelName(slot,id){return (voiceBase?._catalog||latest?.catalog)?.[slot]?.find(m=>m.id===id)?.name||id||'未配置';}
 function voiceName(model,id){return (voiceBase?._catalog||latest?.catalog)?.tts?.find(m=>m.id===model)?.voices.find(v=>v.id===id)?.name||id||'未配置';}
@@ -183,6 +193,7 @@ function renderModelState(){
  const dirty=keys.some(key=>form[key].value!==voiceBase[key]);
  const pending=models&&keys.some(key=>models[key]!==voiceBase[key]);
  if(modelSaving){pill('model-update-state','正在保存','amber');text('model-config-state','正在保存模型与音色，当前播报继续');return;}
+ if(modelSaveFailed){pill('model-update-state','保存未确认','red');text('model-config-state','尚未确认保存结果，请重新读取设置后核对');return;}
  pill('model-update-state',dirty?'有未保存修改':!health?'等待语音服务':pending?'下一轮生效':'已生效',dirty||!health||pending?'amber':'green');
  text('model-config-state',dirty?'所选内容尚未保存；试听不会保存设置':!health?'已保存的配置将在语音服务恢复后使用，尚未确认生效':pending?'已保存，等待下一轮对话；当前播报继续':'已保存配置与设备运行值一致，后续对话将使用以上配置');
 }
@@ -205,7 +216,7 @@ async function previewVoice(){
    response=await fetch('/api/preview',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(chosen),signal:controller.signal,credentials:'same-origin'});
    if(response.status!==403||attempt)break;csrf=(await api('/api/session')).csrf;
   }
-  if(!response.ok){const error=await response.json();throw new Error(error.error||'试听生成失败');}
+  if(!response.ok){let error=null;try{error=await response.json();}catch{}throw new Error(error?.error||`试听生成失败（HTTP ${response.status}）`);}
   const blob=await response.blob();if(sequence!==previewSequence)return;
   previewUrl=URL.createObjectURL(blob);const audio=$('voice-audio');audio.src=previewUrl;audio.hidden=false;
   text('preview-state',`试听：${voiceName(chosen.model,chosen.voice)} · 未保存`);
@@ -223,7 +234,6 @@ function fillSettings(data){
   form.elements[name].value=value;
  }
  for(const name of ['mic','thinking'])form.elements[name].checked=!!prefsBase[name];
- form.elements.night_enabled.checked=!!prefsBase.night.enabled;form.elements.night_start.value=hhmm(prefsBase.night.start);form.elements.night_end.value=hhmm(prefsBase.night.end);
  const voiceForm=$('voice-form');for(const key of [...numericVoice,'asr_model'])voiceForm.elements[key].value=voiceBase[key]??'';
  fillModels();
  $('wake-word').value=latest?.wake_word||'';settingsLoaded=true;
@@ -246,15 +256,20 @@ $('volume').addEventListener('input',event=>text('volume-output',`${event.target
 $('volume').addEventListener('change',()=>mutate('/api/action',{action:'volume',value:Number($('volume').value)}));
 $('preferences-form').addEventListener('submit',async event=>{
  event.preventDefault();if(!prefsBase)return;const f=event.currentTarget.elements;
- const values={speech_rate:Number(f.speech_rate.value),brightness:Number(f.brightness.value),dim_after:Number(f.dim_after.value),mic:f.mic.checked,thinking:f.thinking.checked,night:{enabled:f.night_enabled.checked,start:minutes(f.night_start.value),end:minutes(f.night_end.value)}};
+ const values={speech_rate:Number(f.speech_rate.value),brightness:Number(f.brightness.value),dim_after:Number(f.dim_after.value),mic:f.mic.checked,thinking:f.thinking.checked};
+ if(!Number.isFinite(values.brightness))return toast('请填写有效的屏幕亮度',true);
  const changed=Object.fromEntries(Object.entries(values).filter(([k,v])=>prefsTouched.has(k)&&JSON.stringify(v)!==JSON.stringify(prefsBase[k])));
  if(!Object.keys(changed).length)return toast('设置没有变化');
  const result=await mutate('/api/preferences',changed,event.submitter);if(result){prefsBase=result.preferences;prefsTouched.clear();text('preferences-state',result.status==='applied'?'已保存并应用':'已保存，等待语音服务恢复');}
 });
-for(const eventName of ['input','change'])$('preferences-form').addEventListener(eventName,event=>{const key=event.target.name;if(key)prefsTouched.add(key.startsWith('night_')?'night':key);});
+for(const eventName of ['input','change'])$('preferences-form').addEventListener(eventName,event=>{const key=event.target.name;if(key)prefsTouched.add(key);});
 $('voice-form').addEventListener('submit',async event=>{
  event.preventDefault();if(!voiceBase)return;const form=event.currentTarget;const values={};
- for(const key of [...numericVoice,'asr_model']){const value=numericVoice.includes(key)?Number(form.elements[key].value):form.elements[key].value.trim();if(value!==voiceBase[key])values[key]=value;}
+ for(const key of [...numericVoice,'asr_model']){
+  const raw=form.elements[key].value.trim();
+  if(numericVoice.includes(key)){if(!raw||!Number.isFinite(Number(raw)))return toast('请填写有效的数字参数',true);const value=Number(raw);if(value!==voiceBase[key])values[key]=value;}
+  else if(raw!==voiceBase[key])values[key]=raw;
+ }
  if(!Object.keys(values).length)return toast('语音配置没有变化');
  text('voice-config-state','正在应用配置并等待语音服务就绪…');
  const result=await mutate('/api/configure',values,event.submitter);text('voice-config-state',result?'识别与唤醒参数已生效，语音服务已就绪':'未确认配置生效，请查看提示');if(result){for(const key of Object.keys(values))voiceBase[key]=result.voice[key];renderModelState();}
@@ -263,12 +278,13 @@ $('model-form').addEventListener('submit',async event=>{
  event.preventDefault();if(!voiceBase||busy)return;const form=event.currentTarget.elements;const values={};
  for(const key of modelFields)if(!form[key].disabled&&form[key].value!==voiceBase[key])values[key]=form[key].value;
  if(!Object.keys(values).length)return toast('模型与音色没有变化');
- modelSaving=true;renderModelState();
+ modelSaveFailed=false;modelSaving=true;renderModelState();
  const result=await mutate('/api/configure',values,event.submitter);modelSaving=false;
- if(result){voiceBase=result.voice;modelNotes();renderModelState();}else{pill('model-update-state','保存未确认','red');text('model-config-state','尚未确认保存结果，请重新读取设置后核对');}
+ if(result){voiceBase=result.voice;modelNotes();renderModelState();}else{modelSaveFailed=true;renderModelState();}
 });
 $('model-form').addEventListener('change',event=>{
  if(!voiceBase||!modelFields.includes(event.target.name))return;
+ modelSaveFailed=false;
  if(['tts_model','tts_voice'].includes(event.target.name))stopPreview();
  if(event.target.name==='tts_model')syncVoices();
  if(event.target.name==='tts_voice')text('voice-compatibility',`兼容音色 · ${event.target.value}`);

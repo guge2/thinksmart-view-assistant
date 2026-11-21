@@ -230,22 +230,21 @@ SKILLS = (
         kind=None, phrases=(_farewell,),
     ),
     Skill(
-        "control_device", "调节屏幕亮度、播报语速，开关夜间免打扰和深度思考，修改默认天气城市，切换触屏页面或息屏",
-        "调节或切换设备本地设置与触屏界面：屏幕亮度、播报语速、夜间免打扰模式、深度思考模式、"
-        "默认天气城市、切换触屏页面（主页/天气/闹钟/设置/音乐/夜间设置）或息屏。"
+        "control_device", "调节屏幕亮度、播报语速，开关深度思考，修改默认天气城市，切换触屏页面或息屏",
+        "调节或切换设备本地设置与触屏界面：屏幕亮度、播报语速、深度思考模式、"
+        "默认天气城市、切换触屏页面（主页/天气/闹钟/设置/音乐）或息屏。"
         "当用户要求修改这些设置，或抱怨屏幕太亮/太暗、说话太快/太慢时直接调用。",
         {"type": "object", "properties": {
             "brightness": {"type": "integer", "description": "目标屏幕亮度百分比1到100；不设具体数值时填-1"},
             "brightness_change": {"type": "integer", "description": "相对调节屏幕亮度百分比，调亮为正（如20），调暗为负（如-20）；不用时填0"},
             "speech_rate": {"type": "number", "description": "目标播报语速倍率0.5到2.0（默认1.5）；不用时填0"},
             "speech_rate_change": {"type": "number", "description": "相对调节播报语速，加快为正（如0.2），放慢为负（如-0.2）；不用时填0"},
-            "night_mode": {"type": "string", "enum": ["", "on", "off"], "description": "开启夜间免打扰填on，关闭填off，不改填空字符串"},
             "thinking_mode": {"type": "string", "enum": ["", "on", "off"], "description": "开启深度思考填on，关闭填off，不改填空字符串"},
             "weather_city": {"type": "string", "description": "修改设备默认天气城市名称；不改填空字符串"},
             "screen": {
                 "type": "string",
-                "enum": ["", "home", "weather", "alarms", "settings", "music", "night", "off"],
-                "description": "切换触屏页面：home主页、weather天气页、alarms闹钟页、settings设置页、music音乐页、night夜间设置页、off息屏；不切换填空字符串",
+                "enum": ["", "home", "weather", "alarms", "settings", "music", "off"],
+                "description": "切换触屏页面：home主页、weather天气页、alarms闹钟页、settings设置页、music音乐页、off息屏；不切换填空字符串",
             },
         }},
     ),

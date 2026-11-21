@@ -26,6 +26,7 @@ def mic_state(fd):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     devices = {}
     last_mic = None
     next_scan = 0.0
@@ -50,18 +51,23 @@ def main():
                 continue
             try:
                 enabled = mic_state(fd)
-                if enabled != last_mic or not os.path.exists(STATE):
+            except OSError:
+                os.close(fd)
+                devices.pop(fd, None)
+                continue
+            if enabled != last_mic or not os.path.exists(STATE):
+                try:
                     with open(STATE + ".new", "w") as target:
                         target.write("1\n" if enabled else "0\n")
                     os.replace(STATE + ".new", STATE)
                     last_mic = enabled
-                    try:
-                        sock.sendto(b'{"c":"hardware_mic"}', CONTROL)
-                    except OSError:
-                        pass
-            except OSError:
-                os.close(fd)
-                devices.pop(fd, None)
+                except OSError as error:
+                    logging.warning("麦克风开关状态写入失败：%s", error)
+                    continue
+                try:
+                    sock.sendto(b'{"c":"hardware_mic"}', CONTROL)
+                except OSError:
+                    pass
         readable, _, _ = select.select(list(devices), [], [], 2)
         for fd in readable:
             try:
@@ -78,14 +84,14 @@ def main():
                 _, _, etype, code, value = EVENT.unpack_from(data, i)
                 if etype == 1 and code in STEP and value in (1, 2):
                     try:
-                        subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", STEP[code]],
+                        subprocess.run(["/usr/bin/wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", STEP[code]],
                                        timeout=3, check=True, stdout=subprocess.DEVNULL)
                         try:
                             sock.sendto(b'{"e":"hw_volume"}', UI_EVENT)
                         except OSError:
                             pass
-                    except (OSError, subprocess.SubprocessError):
-                        logging.warning("硬件音量调整失败")
+                    except (OSError, subprocess.SubprocessError) as error:
+                        logging.warning("硬件音量调整失败：%s", error)
 
 
 if __name__ == "__main__":

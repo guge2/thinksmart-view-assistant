@@ -1,7 +1,9 @@
 #!/usr/bin/python3
 import json
+import logging
 import os
 from pathlib import Path
+import pwd
 import re
 import socket
 import stat
@@ -13,8 +15,17 @@ from schema import SERVICES, VOICE_FIELDS, MODEL_FIELDS, voice_values, model_val
 
 ROOT = Path('/etc/thinksmart-voice')
 RUNTIME = Path('/run/thinksmart-gateway')
+HELPER_RUNTIME = Path('/run/thinksmart-gateway-helper')
 REQUEST = RUNTIME / 'request.json'
 OVERRIDES = ROOT / 'gateway.conf'
+
+
+def service_uid():
+    try:
+        pw = pwd.getpwnam('thinksmart')
+        return pw.pw_uid, pw.pw_gid
+    except KeyError:
+        return 1000, 1000
 
 
 def atomic(path, data, mode=0o600, owner=None):
@@ -22,13 +33,17 @@ def atomic(path, data, mode=0o600, owner=None):
     try:
         os.fchmod(fd, mode)
         if owner is not None:
-            os.fchown(fd, owner, owner)
+            uid, gid = owner if isinstance(owner, tuple) else (owner, owner)
+            os.fchown(fd, uid, gid)
         with os.fdopen(fd, 'wb') as output:
+            fd = None
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
         os.replace(name, path)
     finally:
+        if fd is not None:
+            os.close(fd)
         if os.path.exists(name):
             os.unlink(name)
 
@@ -73,20 +88,23 @@ def safe_config():
 
 def publish_config():
     config = safe_config()
-    atomic(RUNTIME / 'config-view.json', json.dumps(config).encode(), owner=1000)
+    atomic(RUNTIME / 'config-view.json', json.dumps(config).encode(), owner=service_uid())
     return config
 
 
-def run(*args):
-    subprocess.run(args, check=True, capture_output=True, timeout=35)
+def run(*args, timeout=35):
+    subprocess.run(args, check=True, capture_output=True, timeout=timeout)
 
 
 def ready_voice():
-    path = str(RUNTIME / ('health-' + str(os.getpid()) + '.sock'))
+    uid, gid = service_uid()
+    HELPER_RUNTIME.mkdir(mode=0o755, exist_ok=True)
+    os.chmod(HELPER_RUNTIME, 0o755)
+    path = str(HELPER_RUNTIME / ('health-' + str(os.getpid()) + '.sock'))
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         sock.bind(path)
-        os.chown(path, 1000, 1000)
+        os.chown(path, uid, gid)
         os.chmod(path, 0o600)
         sock.settimeout(1)
         deadline = time.monotonic() + 35
@@ -128,21 +146,29 @@ def configure(values):
         if any(effective.get(key) != value for key, value in wanted.items()):
             raise RuntimeError('运行进程没有加载全部新配置')
     except Exception:
+        logging.exception('应用语音配置失败，正在恢复原配置')
         for path, old in backups.items():
             if old is None:
                 path.unlink(missing_ok=True)
             else:
                 atomic(path, old[0], old[1])
         if not deferred:
-            run('/usr/bin/systemctl', 'restart', SERVICES['voice'])
+            try:
+                run('/usr/bin/systemctl', 'restart', SERVICES['voice'])
+            except Exception:
+                logging.exception('恢复原配置后重启语音服务失败')
         raise RuntimeError('配置保存失败，已恢复原配置' if deferred else '配置未能启动，已恢复原配置') from None
     return publish_config()
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     ident = None
     try:
-        fd = os.open(REQUEST, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            fd = os.open(REQUEST, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ValueError('请求文件无效')
@@ -165,7 +191,7 @@ def main():
             phrase = request.get('phrase')
             if not isinstance(phrase, str) or not re.fullmatch(r'[\u4e00-\u9fff]{2,8}', phrase):
                 raise ValueError('唤醒词需要2到8个汉字')
-            run('/usr/local/sbin/thinksmart-set-wake-word', phrase)
+            run('/usr/local/sbin/thinksmart-set-wake-word', phrase, timeout=60)
             ready_voice()
             result = {'phrase': phrase}
         elif action == 'restart' and request.get('target') in SERVICES:
@@ -180,9 +206,11 @@ def main():
         response = {'id': ident, 'ok': True, 'result': result}
     except Exception as error:
         REQUEST.unlink(missing_ok=True)
+        if not isinstance(error, (ValueError, RuntimeError)):
+            logging.exception('维护操作异常')
         message = str(error) if isinstance(error, (ValueError, RuntimeError)) else '维护操作失败，请查看服务状态'
         response = {'id': ident, 'ok': False, 'error': message[:200]}
-    atomic(RUNTIME / 'result.json', json.dumps(response, ensure_ascii=False).encode(), owner=1000)
+    atomic(RUNTIME / 'result.json', json.dumps(response, ensure_ascii=False).encode(), owner=service_uid())
 
 
 if __name__ == '__main__':

@@ -5,14 +5,43 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+
+
+def atomic_write(path, content, mode):
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            fd = None
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def main():
     if os.geteuid() != 0:
         raise SystemExit("must run as root")
-    payload = json.loads(sys.stdin.buffer.readline(16385))
+    raw = sys.stdin.buffer.read(16385)
+    if not raw or len(raw) > 16384:
+        raise SystemExit("invalid credential payload")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SystemExit("invalid credential payload") from None
+    if not isinstance(payload, dict):
+        raise SystemExit("invalid credential payload")
     key = str(payload.get("api_key", "")).strip()
     if not key.startswith("sk-") or any(c.isspace() for c in key):
         raise SystemExit("invalid OpenAI API key")
@@ -26,6 +55,8 @@ def main():
             pass
     except urllib.error.HTTPError as error:
         raise SystemExit(f"OpenAI model access failed (HTTP {error.code}); credential not changed") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise SystemExit(f"OpenAI model access request failed ({type(error).__name__}); credential not changed") from None
     config = {
         "provider": "openai", "api": "openai-responses",
         "base_url": "https://api.openai.com/v1", "model": model,
@@ -34,18 +65,14 @@ def main():
     }
     root = Path("/etc/thinksmart-voice")
     root.mkdir(mode=0o755, exist_ok=True)
-    temporary = root / "expert.json.new"
-    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as out:
-        json.dump(config, out)
-    os.chmod(temporary, 0o600)
-    os.chown(temporary, 0, 0)
-    os.replace(temporary, root / "expert.json")
+    atomic_write(root / "expert.json", json.dumps(config, ensure_ascii=False), 0o600)
     dropin = Path("/etc/systemd/system/thinksmart-voice.service.d")
     dropin.mkdir(parents=True, exist_ok=True)
-    (dropin / "expert.conf").write_text(
+    atomic_write(
+        dropin / "expert.conf",
         "[Unit]\nWants=mihomo.service\nAfter=mihomo.service\n\n"
         "[Service]\nLoadCredential=expert.json:/etc/thinksmart-voice/expert.json\n",
-        encoding="utf-8",
+        0o644,
     )
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     print("Difficult-task credential stored for " + model + " (high)")

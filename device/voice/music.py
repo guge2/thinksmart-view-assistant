@@ -11,6 +11,7 @@ import re
 import socket
 import struct
 import subprocess
+import tempfile
 import termios
 import threading
 import time
@@ -45,6 +46,7 @@ QQ_HEADERS = {"User-Agent": BROWSER_UA}
 NETEASE_HEADERS = {"User-Agent": BROWSER_UA, "Referer": "https://music.163.com/"}
 NETEASE_FREE = (0, 8)
 CHUNK = 65536
+MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024
 URL_LIFETIME = 600
 LYRIC_LIMIT = 15000
 FAVORITE_WORDS = ("我喜欢", "我喜欢的", "我的收藏", "收藏", "我收藏的", "红心", "我的红心", "我的歌单")
@@ -67,13 +69,24 @@ def clean_query(text):
 
 
 def write_private(path, data):
-    temporary = f"{path}.tmp"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "wb") as target:
-        target.write(data)
-        target.flush()
-        os.fsync(target.fileno())
-    os.replace(temporary, path)
+    directory = os.path.dirname(path) or "."
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as target:
+            fd = None
+            target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def read_volume_status():
@@ -100,7 +113,7 @@ def notify_ui_volume():
 
 def set_mute(muted):
     subprocess.run(["/usr/bin/wpctl", "set-mute", SINK, "1" if muted else "0"],
-                   capture_output=True, timeout=3, check=False)
+                   capture_output=True, timeout=3, check=True)
     notify_ui_volume()
 
 
@@ -113,9 +126,9 @@ def change_volume(level=None, change=None):
             return read_volume()
         value = f"{min(100, abs(step))}%{'+' if step > 0 else '-'}"
     subprocess.run(["/usr/bin/wpctl", "set-volume", "-l", "1.0", SINK, value],
-                   capture_output=True, timeout=3, check=False)
+                   capture_output=True, timeout=3, check=True)
     subprocess.run(["/usr/bin/wpctl", "set-mute", SINK, "0"],
-                   capture_output=True, timeout=3, check=False)
+                   capture_output=True, timeout=3, check=True)
     notify_ui_volume()
     return read_volume()
 
@@ -139,28 +152,32 @@ def unique_titles(tracks):
 class Mpg123:
     OK, NEED_MORE, NEW_FORMAT, DONE = 0, -10, -11, -12
     _lib = None
+    _lib_lock = threading.Lock()
 
     @classmethod
     def library(cls):
-        if cls._lib is None:
-            lib = ctypes.CDLL("libmpg123.so.0")
-            lib.mpg123_new.restype = ctypes.c_void_p
-            lib.mpg123_new.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
-            lib.mpg123_open_feed.argtypes = [ctypes.c_void_p]
-            lib.mpg123_feed.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-            lib.mpg123_read.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
-            ]
-            lib.mpg123_getformat.argtypes = [
-                ctypes.c_void_p, ctypes.POINTER(ctypes.c_long),
-                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-            ]
-            lib.mpg123_volume.argtypes = [ctypes.c_void_p, ctypes.c_double]
-            lib.mpg123_delete.argtypes = [ctypes.c_void_p]
-            lib.mpg123_delete.restype = None
-            lib.mpg123_init()
-            cls._lib = lib
-        return cls._lib
+        if cls._lib is not None:
+            return cls._lib
+        with cls._lib_lock:
+            if cls._lib is None:
+                lib = ctypes.CDLL("libmpg123.so.0")
+                lib.mpg123_new.restype = ctypes.c_void_p
+                lib.mpg123_new.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+                lib.mpg123_open_feed.argtypes = [ctypes.c_void_p]
+                lib.mpg123_feed.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+                lib.mpg123_read.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+                ]
+                lib.mpg123_getformat.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_long),
+                    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ]
+                lib.mpg123_volume.argtypes = [ctypes.c_void_p, ctypes.c_double]
+                lib.mpg123_delete.argtypes = [ctypes.c_void_p]
+                lib.mpg123_delete.restype = None
+                lib.mpg123_init()
+                cls._lib = lib
+            return cls._lib
 
     def __init__(self):
         self.lib = self.library()
@@ -206,15 +223,23 @@ class Download:
 
     def run(self, url, headers):
         try:
+            if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+                raise ValueError("unsupported stream scheme")
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=15) as response:
+                if urllib.parse.urlsplit(response.url).scheme not in ("http", "https"):
+                    raise ValueError("unsupported redirected stream scheme")
                 content_type = (response.headers.get("Content-Type") or "").lower()
                 if response.url.rstrip("/").endswith("/404") or "text/html" in content_type:
                     raise RuntimeError("stream redirected to non-audio page")
+                total = 0
                 while not self.cancelled:
                     data = response.read(CHUNK)
                     if not data:
                         break
+                    total += len(data)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError("stream exceeds memory limit")
                     with self.cond:
                         self.chunks.append(data)
                         self.cond.notify_all()
@@ -241,6 +266,7 @@ class Player:
         self.notify = notify
         self.duck_level = duck_level
         self.ducked = False
+        self.voice_quiet_until = 0.0
         self.lock = threading.Condition()
         self.mode = mode
         self.queue = []
@@ -256,6 +282,15 @@ class Player:
         self.position = 0.0
         self.fade = None  # [start, seconds, floor] while the volume ramps up
         threading.Thread(target=self.run, name="music-player", daemon=True).start()
+
+    def make_room_for_voice(self):
+        self.voice_quiet_until = time.monotonic() + 2.0
+
+    def playback_gain(self):
+        normal = self.duck_level if self.ducked else 1.0
+        # Leave two seconds for the name, then fade back over 300 ms.
+        recovery = min(1.0, max(0.0, (time.monotonic() - self.voice_quiet_until) / 0.3))
+        return min(normal, 0.12 + 0.88 * recovery)
 
     def fade_in(self, seconds, floor):
         """Starts the next audio at floor of full volume, reaching full volume after seconds."""
@@ -299,6 +334,7 @@ class Player:
 
     def interrupt_locked(self, state):
         self.generation += 1
+        self.voice_quiet_until = 0.0
         self.state = state
         self.position = 0.0
         if self.output is not None and self.output.poll() is None:
@@ -502,7 +538,7 @@ class Player:
                         self.changed()
                         return "interrupted"
                     continue
-                wanted = self.duck_level if self.ducked else 1.0
+                wanted = self.playback_gain()
                 fade = self.fade
                 if fade is not None:
                     fade[0] = fade[0] or time.monotonic()
@@ -570,23 +606,31 @@ class Player:
                 self.close_output()
 
     def write(self, pcm, rate, channels, generation):
+        stale = None
         with self.lock:
             if self.generation != generation or self.paused:
                 return False
             output = self.output
             if output is None or output.poll() is not None:
+                stale = output
                 output = self.output = subprocess.Popen(
                     [
                         "/usr/bin/pw-cat", "--playback", "--media-role", MUSIC_ROLE,
                         "--rate", str(rate), "--channels", str(channels),
-                        "--format", "s16", "--latency", "200ms", "-",
+                        "--format", "s16", "--latency", "100ms", "-",
                     ],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     bufsize=0,
+                    pipesize=4096,  # Bound already-decoded loud audio ahead of a wake hint.
                 )
                 self.history.clear()
+        if stale is not None and stale.stdin:
+            try:
+                stale.stdin.close()
+            except OSError:
+                pass
         try:
             output.stdin.write(pcm)
         except (OSError, ValueError):
@@ -1086,16 +1130,19 @@ class MusicService:
             parts.append("QQ音乐登录已过期。")
         else:
             parts.append("QQ音乐未登录。")
-        track = self.player.current()
-        state = self.player.state
+        with self.player.lock:
+            track = self.player.queue[self.player.index] if 0 <= self.player.index < len(self.player.queue) else None
+            state = self.player.state
+            mode_key = self.player.mode
+            sleep_mono = self.player.sleep_mono
         if track is None or state == "stopped":
             parts.append("当前没有播放音乐。")
             return "".join(parts)
         name = f"{track['artist']}的《{track['title']}》"
-        mode = f"播放模式为{MODE_NAMES[self.player.mode]}。"
+        mode = f"播放模式为{MODE_NAMES[mode_key]}。"
         sleep_info = ""
-        if self.player.sleep_until is not None:
-            rem = max(1, math.ceil((self.player.sleep_until - time.monotonic()) / 60))
+        if sleep_mono is not None:
+            rem = max(1, math.ceil((sleep_mono - time.monotonic()) / 60))
             sleep_info = f"已设置伴睡定时，剩余约{rem}分钟停止。"
         if self.held:
             parts.append(f"当前正在播放{name}，对话期间已自动暂停，对话结束后会自动继续。{mode}{sleep_info}")
@@ -1150,8 +1197,10 @@ class MusicService:
             return []
 
     def extend(self, last):
-        played = {track_key(track) for track in self.player.queue}
+        with self.player.lock:
+            played = {track_key(track) for track in self.player.queue}
         return [track for track in self.recommendations() if track_key(track) not in played]
+
     def cancel_pending(self):
         with self.request_lock:
             self.request_serial += 1
@@ -1315,14 +1364,22 @@ class MusicService:
             return "音量调节失败"
         return f"音量已调到百分之{value}" if value is not None else "音量已调整"
 
+    def defer_to_turn_end(self, started):
+        # Music asked for in a conversation starts once the reply is over, not under it;
+        # the turn's end releases it.
+        if started and self.player.ducked:
+            self.hold()
+
     def play_music(self, args):
         reply, started = self.play_query(clean_query(args.get("query")), self.check_turn)
+        self.defer_to_turn_end(started)
         return Result(reply, started, started)
 
     def control_music(self, args):
         minutes = args.get("minutes")
         reply, started = self.control(str(args.get("action") or ""), self.check_turn,
                                       minutes=minutes if type(minutes) is int and minutes > 0 else None)
+        self.defer_to_turn_end(started)
         return Result(reply, not reply.startswith(("现在没有", "不支持", "当前没有")), started)
 
     def set_volume(self, args):
@@ -1332,14 +1389,22 @@ class MusicService:
 
         mute, level, change = args.get("mute"), number("level"), number("change")
         if mute in (True, "mute"):
-            set_mute(True)
+            try:
+                set_mute(True)
+            except (OSError, subprocess.SubprocessError) as error:
+                logging.warning("静音失败：%s", error)
+                return Result("静音失败", False)
             return Result("已静音", True)
         if level is not None and level > 0:
             reply = self.volume(level=level)
         elif change:
             reply = self.volume(change=change)
         elif mute in (False, "unmute"):
-            set_mute(False)
+            try:
+                set_mute(False)
+            except (OSError, subprocess.SubprocessError) as error:
+                logging.warning("取消静音失败：%s", error)
+                return Result("取消静音失败", False)
             return Result(f"已取消静音，当前音量百分之{read_volume() or 0}", True)
         elif level == 0:
             reply = self.volume(level=0)

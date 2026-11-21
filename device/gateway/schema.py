@@ -19,21 +19,41 @@ VOICE_FIELDS = {
 MODEL_FIELDS = frozenset(('chat_model', 'chat_provider', 'expert_model', 'tts_model', 'tts_voice'))
 PROVIDER_NAMES = {'bailian': '阿里云百炼', 'openrouter': 'OpenRouter', 'openai': 'OpenAI'}
 CHAT_MODELS = {
-    'openrouter': [('google/gemini-3.8-flash', 'Google · Gemini 3.8 Flash'),
+    'openrouter': [('google/gemini-4-hydrogen', 'Google · Gemini 4 Hydrogen'),
+                   ('deepseek/deepseek-v4.1-flash-1017', 'DeepSeek V4.1 Flash 1017'),
+                   ('minimax/minimax-m3.1-flash', 'MiniMax M3.1 Flash'),
+                   ('z-ai/glm-5.3-flash', 'GLM 5.3 Flash'),
+                   ('google/gemini-4-neon', 'Google · Gemini 4 Neon'),
+                   ('moonshotai/kimi-k3.1-pro', 'Kimi K3.1 Pro'),
+                   ('qwen/qwen4-max', 'Qwen4 Max'),
+                   ('google/gemini-3.8-flash', 'Google · Gemini 3.8 Flash'),
                    ('deepseek/deepseek-v4.1-flash', 'DeepSeek V4.1 Flash'),
                    ('deepseek/deepseek-v4-flash', 'DeepSeek V4 Flash'),
                    ('qwen/qwen3.8-flash', 'Qwen3.8 Flash'),
                    ('minimax/minimax-m2.7', 'MiniMax M2.7'),
                    ('moonshotai/kimi-k2.6', 'Kimi K2.6')],
-    'openai': [('gpt-6.1-terra', 'GPT-6.1 Terra'), ('gpt-6.1-sol', 'GPT-6.1 Sol'), ('gpt-6-astra', 'GPT-6 Astra'),
+    'openai': [('gpt-6.2-sol', 'GPT-6.2 Sol'), ('gpt-6.2-astra', 'GPT-6.2 Astra'),
+               ('gpt-6.1-terra', 'GPT-6.1 Terra'), ('gpt-6.1-sol', 'GPT-6.1 Sol'), ('gpt-6-astra', 'GPT-6 Astra'),
                ('gpt-6-sol', 'GPT-6 Sol'), ('gpt-6-luna', 'GPT-6 Luna')],
-    'bailian': [('qwen3.8-flash', 'Qwen3.8 Flash')],
+    'bailian': [('qwen3.8-flash', 'Qwen3.8 Flash'), ('qwen3.7-plus', 'Qwen3.7 Plus')],
 }
 # Chinese system voices, grouped by model as published in the official voice list:
 # https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list
 PLUS_VOICES = [('longanlingxin_v3.1', '龙安灵心 · 女声'), ('xunanchuan_v3.1', '许南川 · 男声'),
                ('longanhuan_v3.1', '龙安欢 · 女声'), ('longanfengyue_v3.1', '龙安风悦 · 女声')]
 FLASH_VOICES = [('longxiaocheng_v3.1', '龙小诚 · 磁性低音'),
+                ('yezhiqing_v3.1', '叶知晴 · 轻快自然女声'),
+                ('xieshurou_v3.1', '谢舒柔 · 柔和自然女声'),
+                ('anmingyuan_v3.1', '安明远 · 清亮自然男声'),
+                ('longze_v3.1', '龙泽 · 温暖自然男声'),
+                ('yeqinghe_v3.1', '叶清禾 · 亲切温柔女声'),
+                ('wenhuaiqing_v3.1', '温怀清 · 清亮柔和女声'),
+                ('yuxiaoyun_v3.1', '于小云 · 元气亲切女声'),
+                ('guyunshu_v3.1', '顾云舒 · 成熟稳重女声'),
+                ('anruorou_v3.1', '安若柔 · 知性气声女声'),
+                ('longyan_v3.1', '龙颜 · 温暖亲切女声'),
+                ('longcheng_v3.1', '龙橙 · 磁性男声'),
+                ('longsanshu_v3.1', '龙三叔 · 沉稳男声'),
                 ('longanwen_v3.1', '龙安温 · 知性女声'), ('longanlang_v3.1', '龙安朗 · 清爽男声'),
                 ('longyingtao_v3.1', '龙应桃 · 温柔女声'), ('longanyang_v3.1', '龙安洋 · 阳光男声'),
                 ('longxiaoxia_v3.1', '龙小夏 · 沉稳女声')] + PLUS_VOICES
@@ -49,7 +69,7 @@ def model_catalog(current):
         providers = sorted(set(providers), key=lambda p: (p != 'openai', p))
         choices = [{'id': ident, 'name': name, 'provider': service,
                     'service': PROVIDER_NAMES.get(service, service),
-                    'group': '日常低价' if service == 'openrouter' else 'GPT 模型' if service == 'openai' else ''}
+                    'group': '对话模型' if service == 'openrouter' else 'GPT 模型' if service == 'openai' else ''}
                    for service in providers for ident, name in CHAT_MODELS.get(service, [])]
         model = current.get(slot + '_model')
         if model and not any(c['id'] == model and c['provider'] == provider for c in choices):
@@ -126,7 +146,7 @@ def voice_values(values):
 
 
 def preferences(values):
-    allowed = {"speech_rate", "thinking", "mic", "night", "brightness", "dim_after"}
+    allowed = {"speech_rate", "thinking", "mic", "brightness", "dim_after"}
     if not isinstance(values, dict) or not values or set(values) - allowed:
         raise ValueError("设置字段无效")
     result = dict(values)
@@ -139,10 +159,4 @@ def preferences(values):
         result["brightness"] = round(number(result["brightness"], 1, 100))
     if "dim_after" in result and (type(result["dim_after"]) is not int or result["dim_after"] not in (0, 60, 300, 900, 1800)):
         raise ValueError("自动调暗时间无效")
-    if "night" in result:
-        night = result["night"]
-        if not isinstance(night, dict) or set(night) != {"enabled", "start", "end"} or type(night["enabled"]) is not bool:
-            raise ValueError("夜间模式设置无效")
-        if any(type(night[k]) is not int or not 0 <= night[k] < 1440 for k in ("start", "end")):
-            raise ValueError("夜间时间无效")
     return result

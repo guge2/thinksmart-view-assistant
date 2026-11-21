@@ -52,14 +52,17 @@ def main():
     temporary = f"{CREDENTIAL_FILE}.new-{os.getpid()}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as target:
+            descriptor = None
             target.write(credentials)
             target.flush()
             os.fsync(target.fileno())
         os.replace(temporary, CREDENTIAL_FILE)
-        os.chown(CREDENTIAL_FILE, 0, 0)
-        os.chmod(CREDENTIAL_FILE, 0o600)
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         try:
             os.unlink(temporary)
         except FileNotFoundError:

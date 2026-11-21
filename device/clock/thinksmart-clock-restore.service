@@ -10,6 +10,18 @@ Type=oneshot
 StateDirectory=thinksmart-clock
 StateDirectoryMode=0700
 ExecStart=/usr/bin/python3 /usr/local/lib/thinksmart-clock/thinksmart-clock.py restore
+NoNewPrivileges=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_SYS_TIME
 
 [Install]
 WantedBy=sysinit.target

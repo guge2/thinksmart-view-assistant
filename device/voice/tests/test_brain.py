@@ -98,6 +98,30 @@ class BrainTest(unittest.TestCase):
         self.brain.forget_if_idle(7200)
         self.assertEqual(self.brain.messages, [])
 
+    def test_configure_models_without_expert_and_redact_all_profiles(self):
+        brain = Brain({
+            "provider": "openrouter",
+            "model": "m1",
+            "api": "openai-completions",
+            "apiKey": "sk-or-secret-1",
+            "bailian": {"provider": "bailian", "apiKey": "sk-bailian-2", "api": "openai-completions"},
+        })
+        brain.configure_models("qwen-plus", "gpt-6.1-sol", "bailian")
+        self.assertEqual(brain.config["model"], "qwen-plus")
+        redacted = brain._describe_error("leaked sk-or-secret-1 and sk-bailian-2")
+        self.assertNotIn("sk-or-secret-1", redacted)
+        self.assertNotIn("sk-bailian-2", redacted)
+
+    def test_stream_completions_rejects_truncated_stream(self):
+        self.brain._iter_sse = lambda *args, **kwargs: iter([
+            {"choices": [{"delta": {"content": "半截"}}]},
+        ])
+        with self.assertRaises(RuntimeError):
+            list(self.brain._stream_completions(
+                {"baseUrl": "https://example.com/v1", "apiKey": "sk-secret", "model": "m", "provider": "bailian"},
+                "ctx", False, False, None, 10, lambda: None,
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

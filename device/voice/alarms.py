@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
 
 from skills import Result
 
@@ -314,7 +315,7 @@ class AlarmService:
             return "；".join(f"{dt.datetime.fromtimestamp(i['due']).strftime('%H:%M')}{NAMES[i['kind']]}"
                             + (f"：{i['label']}" if i.get("label") else "") for i in items)
 
-    def snooze(self, minutes=5):
+    def snooze(self, minutes=5, *, announce=True):
         minutes = max(1, min(60, int(minutes or 5)))
         with self.lock:
             now_mono = time.monotonic()
@@ -343,49 +344,57 @@ class AlarmService:
                 self._save()
             except OSError:
                 logging.warning("保存贪睡闹钟失败")
-        self.announce()
+        if announce:
+            self.announce()
         return f"好的，{minutes}分钟后再提醒"
 
     def ui_command(self, action, **kwargs):
+        if action == "snooze":
+            return self.snooze(kwargs.get("minutes") or 5)
+        changed = False
+        result = None
         with self.lock:
-            if action == "snooze":
-                return self.snooze(kwargs.get("minutes") or 5)
             if action == "cancel":
                 ident = kwargs.get("id")
                 if not ident:
                     return None
-                return self._command({"action": "cancel", "id": str(ident)})
-            if action == "timer":
+                result, changed = self._command({"action": "cancel", "id": str(ident)})
+            elif action == "timer":
                 minutes = int(kwargs.get("minutes") or 5)
                 label = str(kwargs.get("label") or "").strip()[:60]
-                return self._command({"action": "create", "kind": "timer", "minutes": minutes, "label": label})
-        return None
+                result, changed = self._command({"action": "create", "kind": "timer", "minutes": minutes, "label": label})
+        if changed:
+            self.announce()
+        return result
 
     def manage_alarm(self, args):
         try:
             with self.lock:
-                return self._command(args)
+                result, changed = self._command(args)
         except (ValueError, TypeError, OverflowError, OSError) as error:
             logging.warning("闹钟操作失败：%s", error)
             return Result(f"操作失败：{error}", False)
+        if changed:
+            self.announce()
+        return result
 
     def _command(self, args):
         action = args.get("action")
         if action == "dismiss":
             if self.dismiss():
-                return Result("已停止提示音", True)
+                return Result("已停止提示音", True), False
             # The wake word already silenced it; "关闭闹钟" right after is a confirmation, not a failure.
             if self.last_rang and time.monotonic() - self.last_rang[1] < 60:
-                return Result("闹钟已经关了", True)
-            return Result(NOTHING_RINGING, False)
+                return Result("闹钟已经关了", True), False
+            return Result(NOTHING_RINGING, False), False
         if action == "snooze":
             minutes = args.get("minutes")
-            reply = self.snooze(minutes if type(minutes) is int and 1 <= minutes <= 60 else 5)
-            return Result(reply, True) if reply else Result(NOTHING_RINGING, False)
+            reply = self.snooze(minutes if type(minutes) is int and 1 <= minutes <= 60 else 5, announce=False)
+            return (Result(reply, True), True) if reply else (Result(NOTHING_RINGING, False), False)
         if action == "list":
             if not self.items:
-                return Result("目前没有待响的闹钟、计时器或提醒", True)
-            return Result("当前有：" + "；".join(_describe(i) for i in sorted(self.items, key=lambda i: i["due"])), True)
+                return Result("目前没有待响的闹钟、计时器或提醒", True), False
+            return Result("当前有：" + "；".join(_describe(i) for i in sorted(self.items, key=lambda i: i["due"])), True), False
         if action == "cancel":
             ident = args.get("id")
             matches = [item for item in self.items if item["id"] == ident]
@@ -404,8 +413,7 @@ class AlarmService:
             self.retry_after.pop(item["id"], None)
             if self.ringing_id == item["id"]:
                 self.silence.set()
-            self.announce()
-            return Result(f"已取消{_describe(item, with_id=False)}", True)
+            return Result(f"已取消{_describe(item, with_id=False)}", True), True
         if action != "create":
             raise ValueError("不支持这个操作")
         if len(self.items) >= MAX_ITEMS:
@@ -434,7 +442,6 @@ class AlarmService:
             raise
         if seconds is not None:
             self.monotonic_due[ident] = time.monotonic() + seconds
-        self.announce()
         result = f"已设置{_describe(item, with_id=False)}"
         if seconds is None:
             synchronized = os.path.exists("/run/systemd/timesync/synchronized")
@@ -449,7 +456,7 @@ class AlarmService:
                     synchronized = False
             if not synchronized:
                 result += "。设备时间尚未与网络同步，到时可能不准确"
-        return Result(result, True)
+        return Result(result, True), True
 
     def _run(self):
         while not self.stopped.wait(0.5):
@@ -473,20 +480,20 @@ class AlarmService:
                 try:
                     self.on_ring(True)
                 except Exception:
-                    pass
+                    logging.exception("闹钟响铃回调失败")
             try:
                 if self.emit:
                     self.emit("alarm", text=(due.get("label") or NAMES[due["kind"]]) + "时间到了")
                 if due["kind"] in MUSIC_KINDS and self.music is not None:
                     if due.get("label"):
-                        self._announce(due["label"] + "时间到了")
+                        self._announce(due["label"] + "，时间到了")
                     if not self._ring_music():
                         self._ring(cycles=100)
                 elif due.get("label"):
                     for _ in range(3):
                         if self.silence.is_set() or self.stopped.is_set():
                             break
-                        self._announce(due["label"] + "时间到了")
+                        self._announce(due["label"] + "，时间到了")
                         self._ring(cycles=30)
                 else:
                     self._ring(cycles=100)
@@ -530,7 +537,7 @@ class AlarmService:
                     try:
                         self.on_ring(False)
                     except Exception:
-                        pass
+                        logging.exception("闹钟结束回调失败")
 
     def _ring_music(self):
         """False when no music could start; the caller beeps instead."""
@@ -609,16 +616,18 @@ class AlarmService:
             # pw-play reads stdin as raw 48 kHz stereo; a file keeps espeak's WAV header and rate.
             with tempfile.NamedTemporaryFile(suffix=".wav") as sound:
                 subprocess.run(
-                    ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "160", "-w", sound.name, text],
+                    ["/usr/bin/espeak-ng", "-v", "cmn", "-s", "125", "-w", sound.name, "--", text],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True,
                 )
                 if self.silence.is_set() or self.stopped.is_set():
                     return
+                with wave.open(sound.name, "rb") as wav:
+                    duration = wav.getnframes() / wav.getframerate()
                 process = subprocess.Popen(
                     ["/usr/bin/pw-play", "--media-role", "Notification", sound.name],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-                deadline = time.monotonic() + 30
+                deadline = time.monotonic() + max(30, duration + 3)
                 try:
                     while process.poll() is None and time.monotonic() < deadline:
                         if self.silence.wait(0.2) or self.stopped.is_set():
@@ -631,5 +640,5 @@ class AlarmService:
                         except subprocess.TimeoutExpired:
                             process.kill()
                             process.wait()
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, wave.Error, EOFError):
             logging.exception("提醒内容播报失败")

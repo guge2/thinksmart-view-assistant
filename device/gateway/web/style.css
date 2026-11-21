@@ -173,9 +173,6 @@ input:not([type=checkbox]):not([type=range]), select {
 input:not([type=checkbox]):not([type=range]):focus, select:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 label.toggle { flex-direction: row; align-items: center; gap: 10px; }
 .toggles { display: flex; flex-direction: column; gap: 14px; justify-content: center; }
-.night-row { display: flex; align-items: center; gap: 14px; margin-top: 22px; border-top: 1px solid var(--line); padding-top: 20px; }
-.night-row .toggle { margin-right: auto; }
-.night-row > label:not(.toggle) { width: 130px; }
 .form-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
 .form-footer > span { color: var(--muted); font-size: 12px; }
 .compact { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
@@ -266,9 +263,6 @@ footer { display: flex; gap: 8px; justify-content: center; color: var(--faint); 
   .small-stats .panel { padding: 14px 12px; }
   .small-stats h3 { font-size: 20px; }
   .form-grid, .effective-models dl { grid-template-columns: 1fr; }
-  .night-row { flex-wrap: wrap; }
-  .night-row .toggle { width: 100%; }
-  .night-row > label:not(.toggle) { width: 42%; }
   .form-footer, .compact { align-items: stretch; flex-direction: column; }
   .form-footer button, .voice-preview button { width: 100%; }
   .inline-form { width: 100%; }
