@@ -25,6 +25,13 @@ class WakeTests(unittest.TestCase):
             self.assertEqual("".join(s for _, s in parts), text)
             self.assertEqual([s for guarded, s in parts if guarded], ["小度 小度", "小度小度"])
 
+    def test_recorded_wake_word_is_removed_only_from_the_start(self):
+        strip = A.strip_wake_prefix
+        phrase = self.a.wake_phrase
+        self.assertEqual(strip("小度，小度。小度小度，下一首吧。", phrase), "下一首吧。")
+        self.assertEqual(strip("小度小度。", phrase), "")
+        self.assertEqual(strip("播放小度小度这首歌", phrase), "播放小度小度这首歌")
+
     def test_only_the_played_word_guards_raw(self):
         segments = []
 
@@ -120,6 +127,14 @@ class WakeTests(unittest.TestCase):
         self.assertEqual(detector.poll(aec), (None, "小度小度", "raw"))
         os.write(aec_write, bytes(A.FRAME_BYTES - 2))
         self.assertEqual(detector.poll(aec)[0], bytes(A.FRAME_BYTES))
+        for phase in ("wake", "listen"):
+            a.phase = phase
+            os.write(aec_write, bytes(A.FRAME_BYTES))
+            os.write(raw_write, bytes(A.FRAME_BYTES))
+            self.assertEqual(detector.poll(aec), (bytes(A.FRAME_BYTES), "", "raw"))
+        a.phase = "speak"
+        os.write(raw_write, bytes(A.FRAME_BYTES))
+        self.assertEqual(detector.poll(aec), (None, "小度小度", "raw"))
 
     def enter_pipe(self, fd):
         pipe = os.fdopen(fd, "rb", buffering=0)

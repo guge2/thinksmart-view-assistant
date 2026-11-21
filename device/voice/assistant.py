@@ -68,6 +68,8 @@ ASSISTANT_ROLE = "Assistant"
 # user has been quiet this long after a sentence that sounds finished, or after one ending in a
 # comma or connective.
 SPEECH_PAUSE_SECONDS = 1.0
+PLAYBACK_COMMAND_PAUSE_SECONDS = 0.45
+PLAYBACK_ASR_SILENCE_MS = 380
 UNFINISHED_PAUSE_SECONDS = 2.0
 UNFINISHED = re.compile(
     r"(?:[，、,：:；;]|然后|还有|而且|并且|或者|以及|另外|接着|因为|所以|但是|不过|如果|要是|比如|就是|还是"
@@ -122,6 +124,14 @@ EMPTY_ASIDE = re.compile(r"[（(]\s*(?:(?:来源|参考|出处|引自)[:：]?)?[
 MARKDOWN = re.compile(r"\*\*|__|`|(?<=\n)[ \t]*(?:#+|>)[ \t]*")
 URL_START = re.compile(r"(?:https?:/{0,2}|https?|htt|ht|h|www\.?|ww|w)$")
 MARKDOWN_START = re.compile(r"(?:\n[ \t]*[#>]*[ \t]*|[*_]+)$")
+
+
+def strip_wake_prefix(text, phrase):
+    if not text or not phrase:
+        return text
+    punctuation = r"[\s，。！？、,.!?~～…`]*"
+    word = punctuation.join(re.escape(char) for char in phrase)
+    return re.sub(r"^(?:" + punctuation + word + r")+" + punctuation, "", text)
 
 
 def spoken_text(text, line_start=True):
@@ -263,9 +273,11 @@ class MusicWake:
     def feed(self, samples, player):
         self.frames += 1
         full = self.full.feed(samples, gain=4.0)
+        if full:
+            return full
         partial = self.prefix.feed(samples, gain=4.0) if self.prefix else ""
-        if full or partial != "music-prefix":
-            return full or partial
+        if partial != "music-prefix":
+            return partial
         gap = (self.frames - self.last_prefix) * FRAME_BYTES / (2 * SAMPLE_RATE)
         self.last_prefix = self.frames
         player.make_room_for_voice()
@@ -285,11 +297,11 @@ class MusicWake:
         if len(phrase) >= 4:
             words.append(phrase[:2])
         tokens = sherpa_onnx.text2token(words, tokens=f"{KWS_MODEL}/tokens.txt", tokens_type="ppinyin")
-        score = float(os.getenv("THINKSMART_KWS_SCORE", "1")) + 2
-        threshold = float(os.getenv("THINKSMART_KWS_THRESHOLD", "0.25")) * 0.72
-        params = f":{score:g} #{threshold:g}"
-        full = f"{' '.join(tokens[0])} {params} @{phrase}"
-        prefix = f"{' '.join(tokens[1])} {params} @music-prefix" if len(tokens) > 1 else None
+        score = float(os.getenv("THINKSMART_KWS_SCORE", "1"))
+        threshold = float(os.getenv("THINKSMART_KWS_THRESHOLD", "0.25"))
+        full = f"{' '.join(tokens[0])} :{score + 1:g} #{threshold * .64:g} @{phrase}"
+        prefix = (f"{' '.join(tokens[1])} :{score + 2:g} #{threshold * .72:g} @music-prefix"
+                  if len(tokens) > 1 else None)
         return full, prefix
 
 
@@ -332,6 +344,7 @@ class WakeDetector:
         self.raw_retry_at = 0.0
         self.raw_started = 0.0
         self.raw_enabled = True
+        self.aec_enabled = True
 
     def __enter__(self):
         return self
@@ -446,10 +459,17 @@ class WakeDetector:
         if frame is None and time.monotonic() - assistant.capture_progress > 4:
             raise RuntimeError("microphone stream timed out")
 
-        raw = self.read_raw(time.monotonic() >= assistant.raw_muted_until)
-        aec = self.decode(self.stream, frame, gain=2.0) if frame and assistant.mic_enabled.is_set() else ""
-        if aec and (not raw or assistant.music.player.state == "playing"
-                    or assistant.phase == "speak" or assistant.alarms.ringing):
+        wake_enabled = assistant.mic_enabled.is_set() and assistant.phase not in ("wake", "listen")
+        if self.aec_enabled and not wake_enabled:
+            self.stream = WakeStream(self.spotter)
+        self.aec_enabled = wake_enabled
+        aec = self.decode(self.stream, frame, gain=2.0) if frame and wake_enabled else ""
+        if aec and (assistant.music.player.state == "playing" or assistant.phase == "speak"
+                    or assistant.alarms.ringing):
+            self.read_raw(False)
+            return frame, aec, "AEC"
+        raw = self.read_raw(wake_enabled and time.monotonic() >= assistant.raw_muted_until)
+        if aec and not raw:
             return frame, aec, "AEC"
         return frame, raw, "raw"
 
@@ -1628,14 +1648,15 @@ class ThinkSmartAssistant:
             self.drop_link()
         return factory(None).start()
 
-    def transcribe_live(self, wait_seconds=None):
+    def transcribe_live(self, wait_seconds=None, *, playback_active=False):
         """Recognizes one utterance, which may span several sentences when the user pauses mid-thought."""
         state = {"sentences": [], "partial": ""}
 
-        def heard():
+        def heard(include_partial=True):
             # A sentence the user went on from ends in a comma, not a full stop.
-            parts = [text.rstrip("。.") + ("" if text[-1] in "？?！!，," else "，") for text in state["sentences"][:-1]]
-            return "".join(parts + state["sentences"][-1:]) + state["partial"]
+            sentences = state["sentences"][:]
+            parts = [text.rstrip("。.") + ("" if text[-1] in "？?！!，," else "，") for text in sentences[:-1]]
+            return "".join(parts + sentences[-1:]) + (state["partial"] if include_partial else "")
 
         def receive_events(recognition):
             for event in recognition.events():
@@ -1655,10 +1676,14 @@ class ThinkSmartAssistant:
         if wait_seconds is None:
             wait_seconds = float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8"))
         max_seconds = float(os.getenv("THINKSMART_MAX_SPEECH_SECONDS", "25"))
+        # The server can segment early while the local silence check still allows longer utterances.
+        parameters = ({"max_sentence_silence": PLAYBACK_ASR_SILENCE_MS}
+                      if playback_active and self.asr_model.startswith("qwen-audio-3.1-asr-") else {})
         with closing(self.open_audio_task(lambda link: self.client.audio.asr.recognize(
             model=self.asr_model,
             format="pcm",
             sample_rate=SAMPLE_RATE,
+            parameters=parameters,
             timeout=max(10.0, wait_seconds + 5),
             connection=link,
         ))) as recognition:
@@ -1667,6 +1692,7 @@ class ThinkSmartAssistant:
                 self.turn_timing["asr_ready_ms"] = round((started - self.wake_started) * 1000)
             voice = VoiceActivity()
             judged, pause, ended_at = 0, None, 0.0
+            quick_command = False
             with ThreadPoolExecutor(max_workers=1) as pool:
                 receiver = pool.submit(receive_events, recognition)
                 stopped = False
@@ -1685,15 +1711,24 @@ class ThinkSmartAssistant:
                         voice.feed(frame, now)
                         if len(state["sentences"]) > judged:
                             judged, ended_at = len(state["sentences"]), now
-                            pause = UNFINISHED_PAUSE_SECONDS if UNFINISHED.search(heard()) else SPEECH_PAUSE_SECONDS
+                            final_text = heard(include_partial=False)
+                            command = strip_wake_prefix(final_text, self.wake_phrase) if playback_active else final_text
+                            pause = None
+                            quick_command = False
+                            if command:
+                                pause = UNFINISHED_PAUSE_SECONDS if UNFINISHED.search(command) else SPEECH_PAUSE_SECONDS
+                                quick_command = playback_active and skills.is_quick_playback_command(
+                                    skills.match(command, True, self.wake_phrase))
                         # Talking on resets the pause; noise taken for speech brings no new sentence.
-                        if judged and (now - voice.speech_at >= pause or now - ended_at > 10):
-                            break
+                        if pause is not None:
+                            silence = PLAYBACK_COMMAND_PAUSE_SECONDS if quick_command and not state["partial"] else pause
+                            if now - voice.speech_at >= silence or now - ended_at > 10:
+                                break
                         # Text comes only with a finished sentence, so once the user has been heard
                         # the wait for it lasts until they have been quiet long enough for it to arrive.
                         # The first half second is the wake word's tail, queued before listening.
                         talked = voice.speech_at > started + 0.5
-                        if (not judged and now - started >= wait_seconds
+                        if (pause is None and now - started >= wait_seconds
                                 and now - voice.speech_at > (UNFINISHED_PAUSE_SECONDS if talked else 0)):
                             break
                         if now - started >= wait_seconds + max_seconds:
@@ -1716,7 +1751,8 @@ class ThinkSmartAssistant:
             raise RuntimeError("microphone command buffer overflow")
         if len(state["sentences"]) > 1:
             logging.info("合并了%d句：%s", len(state["sentences"]), heard())
-        return heard().strip()
+        text = heard().strip()
+        return strip_wake_prefix(text, self.wake_phrase) if playback_active else text
 
     def device_status_summary(self):
         volume, muted = read_volume_status()
@@ -1950,8 +1986,8 @@ class ThinkSmartAssistant:
 
     def answer_turn(self, user_text, shown=True):
         logging.info("用户：%s", user_text)
-        compact = re.sub(r"[\s，。！？、,.!?~～…]+", "", user_text or "")
-        if self.wake_phrase and compact == self.wake_phrase:
+        stripped_text = strip_wake_prefix(user_text, self.wake_phrase)
+        if self.wake_phrase and user_text and not stripped_text:
             if self.alarms.ringing:
                 self.alarms.dismiss()
             self.play_listen_tone()
@@ -1959,13 +1995,6 @@ class ThinkSmartAssistant:
             self.next_followup = (BRIEFING_WAIT_SECONDS if self.alarms.briefing_at is not None
                                   else float(os.getenv("THINKSMART_SPEECH_WAIT_SECONDS", "8")))
             return
-        stripped_text = user_text
-        if self.wake_phrase and compact.startswith(self.wake_phrase):
-            stripped_text = re.sub(
-                r"^[\s，。！？、,.!?~～`]*" + re.escape(self.wake_phrase) + r"[\s，。！？、,.!?~～`]*",
-                "",
-                user_text,
-            ).strip() or user_text
         if shown:
             self.ui.emit("user", text=user_text)
         self.set_phase("think")
@@ -1980,7 +2009,7 @@ class ThinkSmartAssistant:
             reply, ok, _ = self.call_tool(*local, False)
             action = local[1].get("action")
             quiet = ("mute" not in local[1] if local[0] == "set_volume"
-                     else local[0] == "control_music" and (action in ("pause", "next", "previous")
+                     else local[0] == "control_music" and (action in ("pause", "next", "previous", "stop")
                                                            or action == "resume" and self.music_started))
             if ok and quiet:
                 self.local_result = self.heard_reply = reply
@@ -2254,7 +2283,9 @@ class ThinkSmartAssistant:
         self.set_cloud("busy")
         try:
             # Waking only to turn off an alarm should not keep the briefing waiting long.
-            text = self.transcribe_live(BRIEFING_WAIT_SECONDS if self.alarms.briefing_at is not None else None)
+            briefing = self.alarms.briefing_at is not None
+            text = self.transcribe_live(BRIEFING_WAIT_SECONDS if briefing else None,
+                                        playback_active=self.music.active() and not briefing)
         except TurnCancelled:
             raise
         except Exception as error:

@@ -27,6 +27,8 @@ CREDENTIAL_FILE = f"{MUSIC_ROOT}/qq-credential.json"
 DEVICE_FILE = f"{MUSIC_ROOT}/qq-device.json"
 SETTINGS_FILE = f"{MUSIC_ROOT}/settings.json"
 MUSIC_ROLE = "Music"
+# Keep each PCM write within PIPE_BUF so stopping pw-cat cannot split a block.
+PCM_BLOCK_BYTES = 4096
 # Audio pw-cat has taken from the pipe but not yet played: the PipeWire quantum
 # plus the speaker's 4096-frame ALSA headroom at 48 kHz, with some margin.
 RESUME_REWIND = 0.15
@@ -45,7 +47,7 @@ BROWSER_UA = (
 QQ_HEADERS = {"User-Agent": BROWSER_UA}
 NETEASE_HEADERS = {"User-Agent": BROWSER_UA, "Referer": "https://music.163.com/"}
 NETEASE_FREE = (0, 8)
-CHUNK = 65536
+DOWNLOAD_CHUNK_BYTES = 8192
 MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024
 URL_LIFETIME = 600
 LYRIC_LIMIT = 15000
@@ -186,7 +188,7 @@ class Mpg123:
         if not self.handle or self.lib.mpg123_open_feed(self.handle) != 0:
             self.close()
             raise RuntimeError(f"mpg123 init failed ({error.value})")
-        self.buffer = ctypes.create_string_buffer(16384)
+        self.buffer = ctypes.create_string_buffer(PCM_BLOCK_BYTES)
         self.done = ctypes.c_size_t()
 
     def feed(self, data):
@@ -213,12 +215,13 @@ class Mpg123:
 class Download:
     """Keeps the whole file in memory so pausing never stalls on the network."""
 
-    def __init__(self, url, headers):
+    def __init__(self, url, headers, condition):
         self.chunks = []
         self.finished = False
         self.error = None
         self.cancelled = False
-        self.cond = threading.Condition()
+        # Player state changes and new audio can both wake a blocked decoder.
+        self.cond = condition
         threading.Thread(target=self.run, args=(url, headers), name="music-download", daemon=True).start()
 
     def run(self, url, headers):
@@ -234,8 +237,8 @@ class Download:
                     raise RuntimeError("stream redirected to non-audio page")
                 total = 0
                 while not self.cancelled:
-                    data = response.read(CHUNK)
-                    if not data:
+                    data = response.read(DOWNLOAD_CHUNK_BYTES)
+                    if not data or self.cancelled:
                         break
                     total += len(data)
                     if total > MAX_DOWNLOAD_BYTES:
@@ -252,11 +255,8 @@ class Download:
 
     def get(self, index, alive):
         with self.cond:
-            while index >= len(self.chunks) and not self.finished:
-                if not alive():
-                    return None
-                self.cond.wait(0.5)
-            return self.chunks[index] if index < len(self.chunks) else None
+            self.cond.wait_for(lambda: index < len(self.chunks) or self.finished or not alive())
+            return self.chunks[index] if alive() and index < len(self.chunks) else None
 
 
 class Player:
@@ -382,6 +382,7 @@ class Player:
                 return False
             self.paused = True
             self.state = "paused"
+            self.voice_quiet_until = 0.0
             if self.output is not None and self.output.poll() is None:
                 self.output.terminate()
             self.lock.notify_all()
@@ -506,7 +507,7 @@ class Player:
             logging.info("歌曲无法播放：%s - %s", track["artist"], track["title"])
             return "failed"
         logging.info("开始播放：%s - %s（%s）", track["artist"], track["title"], track.get("via") or track["src"])
-        download = Download(url, headers)
+        download = Download(url, headers, self.lock)
         decoder = Mpg123()
         fed = 0
         rate, channels = 44100, 2
@@ -551,7 +552,8 @@ class Player:
                     decoder.volume(wanted)
                     gain = wanted
                 if pending:
-                    code, pcm, pending = Mpg123.OK, pending, b""
+                    code = Mpg123.OK
+                    pcm, pending = pending[:PCM_BLOCK_BYTES], pending[PCM_BLOCK_BYTES:]
                 else:
                     code, pcm = decoder.read()
                 if code == Mpg123.NEW_FORMAT:
@@ -560,13 +562,16 @@ class Player:
                     continue
                 if pcm:
                     if not self.write(pcm, rate, channels, generation):
-                        pending = pcm
+                        if not alive():
+                            break
+                        pending = pcm + pending
                         if self.paused:
                             continue
                         broken += 1
                         if broken >= 3 and not written:
                             return "failed"
-                        time.sleep(0.2)
+                        with self.lock:
+                            self.lock.wait_for(lambda: self.paused or not alive(), timeout=0.2)
                         continue
                     if not written:
                         written = True
@@ -623,7 +628,7 @@ class Player:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     bufsize=0,
-                    pipesize=4096,  # Bound already-decoded loud audio ahead of a wake hint.
+                    pipesize=PCM_BLOCK_BYTES,
                 )
                 self.history.clear()
         if stale is not None and stale.stdin:

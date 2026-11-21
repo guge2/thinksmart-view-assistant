@@ -21,9 +21,11 @@ Said = namedtuple("Said", "text clean command music_active wake_phrase offline")
 
 PUNCT = re.compile(r"[\s，。！？、；：,.!?;:~～…“”\"'‘’]+")
 _CLEAN = re.compile(r"[\s，。！？、,.!?~～…]+")
+_REPEATED_COMMAND = re.compile(r"(.{2,16}?)\1{1,3}")
 _POLITE = re.compile(r"^(?:请你?|麻烦你?|帮我|给我|你|再)+")
 _CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 MODES = ("shuffle", "order", "repeat_one")
+QUICK_MUSIC_ACTIONS = frozenset(("pause", "resume", "next", "previous", "stop"))
 OFFLINE_HINT = "离线时请说音量调大、音量调小、暂停播放、继续播放、上一首、下一首或现在几点。"
 
 
@@ -107,11 +109,11 @@ def _sleep_timer(said):
 
 
 _MUSIC_CONTROL = _fixed(
-    (r"^(?:停止|停止播放|停止音乐|关闭音乐|关掉音乐|关闭播放|别放了|不听了|不要放了)$", {"action": "stop"}),
-    (r"^(?:暂停|暂停播放|暂停音乐|暂停一下|停一下|先停一下|停)$", {"action": "pause"}),
-    (r"^(?:继续|继续播放|继续放|接着放|接着播放|恢复播放|继续音乐)$", {"action": "resume"}),
-    (r"^(?:下一首|下一曲|下一首歌|换一首|换首歌|换一首歌|切歌|换一个|下首)$", {"action": "next"}),
-    (r"^(?:上一首|上一曲|上一首歌|上首)$", {"action": "previous"}),
+    (r"^(?:停止|停止播放|停止音乐|关闭音乐|关掉音乐|把音乐关掉|关闭播放|别放了|不听了|不要放了)[吧呀啊]?$", {"action": "stop"}),
+    (r"^(?:暂停|暂停播放|暂停音乐|暂停一下|停一下|先停一下|停)[吧呀啊]?$", {"action": "pause"}),
+    (r"^(?:继续|继续播放|继续放|接着放|接着播放|恢复播放|继续音乐)[吧呀啊]?$", {"action": "resume"}),
+    (r"^(?:下一首|下一曲|下一首歌|换一首|换首歌|换一首歌|切歌|换歌|换一个|下首)[吧呀啊]?$", {"action": "next"}),
+    (r"^(?:上一首|上一曲|上一首歌|上首)[吧呀啊]?$", {"action": "previous"}),
     music_only=True,
 )
 _MUSIC_MODE = _fixed(
@@ -370,6 +372,27 @@ def forced(text):
 def match(text, music_active, wake_phrase="", offline=False):
     """Returns (skill name, arguments) for a phrase handled without the model, else None."""
     text = text or ""
+    local = _match(text, music_active, wake_phrase, offline)
+    if local or not music_active:
+        return local
+    repetition = _REPEATED_COMMAND.fullmatch(PUNCT.sub("", text))
+    if repetition:
+        command = _match(repetition.group(1), music_active, wake_phrase, offline)
+        if is_quick_playback_command(command):
+            return command
+    return None
+
+
+def is_quick_playback_command(local):
+    if local is None:
+        return False
+    name, args = local
+    return (name == "control_music" and args.get("action") in QUICK_MUSIC_ACTIONS
+            or name == "set_volume"
+            or name == "end_conversation" and args.get("stop_music"))
+
+
+def _match(text, music_active, wake_phrase, offline):
     command = _POLITE.sub("", PUNCT.sub("", text))
     said = Said(text, _CLEAN.sub("", text), command if len(command) <= 30 else "", music_active, wake_phrase, offline)
     for skill in SKILLS:
