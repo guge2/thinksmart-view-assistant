@@ -29,7 +29,6 @@ from playback import PCMPlayer, SpeechProgress, AudioStalled
 from music import (
     MUSIC_ROLE,
     MusicService,
-    read_volume_status,
     CommandCancelled as TurnCancelled,
 )
 import information
@@ -37,6 +36,7 @@ import memory
 import offline
 import skills
 from alarms import AlarmService
+from shared import system
 from skills import Result
 
 
@@ -48,7 +48,6 @@ VOICE_ROOT = "/data/thinksmart/voice"
 MODEL_NAME = "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
 KWS_MODEL = f"{VOICE_ROOT}/models/{MODEL_NAME}"
 KEYWORDS_FILE = f"{VOICE_ROOT}/keywords.txt"
-WAKE_PHRASE_FILE = "/etc/thinksmart-voice/wake-phrase"
 UI_EVENT_SOCKET = "/run/thinksmart-ui/events.sock"
 CONTROL_SOCKET = "/run/thinksmart-voice/control.sock"
 ECHO_CANCEL_SOURCE = "thinksmart.echo-cancel-source"
@@ -809,7 +808,7 @@ class ThinkSmartAssistant:
         self.link_lock = threading.Lock()
         self.speech_player = None
         self.heard_reply = ""
-        self.wake_phrase = self.read_wake_phrase()
+        self.wake_phrase = system.read_wake_phrase()
         self.keyword_spotter = self.create_keyword_spotter()
         self.music_wake_keywords = MusicWake.keywords(self.wake_phrase)
         self.phase = "idle"
@@ -1245,17 +1244,6 @@ class ThinkSmartAssistant:
         if not credentials.get("api_key") or not credentials.get("workspace_id"):
             raise RuntimeError("Aliyun credentials are incomplete")
         return credentials
-
-    @staticmethod
-    def read_wake_phrase():
-        try:
-            with open(WAKE_PHRASE_FILE, encoding="utf-8") as source:
-                phrase = source.read().strip()
-                if phrase:
-                    return phrase
-        except OSError:
-            pass
-        return "小爱同学"
 
     @staticmethod
     def audio_command(mode, rate):
@@ -1755,7 +1743,7 @@ class ThinkSmartAssistant:
         return strip_wake_prefix(text, self.wake_phrase) if playback_active else text
 
     def device_status_summary(self):
-        volume, muted = read_volume_status()
+        volume, muted = system.read_volume()
         volume_text = f"{volume}%（{'已静音' if muted else '未静音'}）" if volume is not None else "未知"
         brightness = f"{self.brightness}%" if self.brightness else "未知"
         return (

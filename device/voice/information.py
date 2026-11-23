@@ -2,12 +2,10 @@ import datetime
 import logging
 import os
 import subprocess
-import sys
 
 from skills import Result
 
-sys.path.insert(0, "/usr/local/lib/thinksmart-ui")
-import system as ui_system
+from shared import system as ui_system
 
 
 def current_time(*, clock_only=False):

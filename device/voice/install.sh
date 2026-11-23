@@ -201,10 +201,14 @@ install -m 0644 "$STAGE/offline-keywords.txt" "$DATA_ROOT/offline-keywords.txt"
 
 install -d -m 0755 "$APP_ROOT" "$DATA_ROOT" "$MODEL_ROOT" "$CACHE_ROOT"
 install -d -m 0755 /etc/thinksmart-voice
-install -m 0755 "$BASE/assistant.py" "$APP_ROOT/assistant.py"
-install -m 0644 "$BASE/music.py" "$APP_ROOT/music.py"
-install -m 0644 "$BASE/alarms.py" "$APP_ROOT/alarms.py"
-install -m 0644 "$BASE/offline.py" "$BASE/information.py" "$BASE/memory.py" "$BASE/brain.py" "$BASE/playback.py" "$BASE/skills.py" "$APP_ROOT/"
+# Every module but the configure_* tools, which go to /usr/local/sbin; modules no longer shipped are removed.
+rm -f "$APP_ROOT"/*.py
+rm -rf "$APP_ROOT/__pycache__"
+for module in "$BASE"/*.py; do
+    case "$(basename -- "$module")" in configure_*) continue ;; esac
+    install -m 0644 "$module" "$APP_ROOT/"
+done
+chmod 0755 "$APP_ROOT/assistant.py"
 install -d -o thinksmart -g thinksmart -m 0700 /data/thinksmart/music
 install -m 0755 "$BASE/configure_voice.py" /usr/local/sbin/thinksmart-configure-voice
 install -m 0755 "$BASE/configure_chat.py" /usr/local/sbin/thinksmart-configure-chat

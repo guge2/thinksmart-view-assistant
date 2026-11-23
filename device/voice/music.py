@@ -11,7 +11,6 @@ import re
 import socket
 import struct
 import subprocess
-import tempfile
 import termios
 import threading
 import time
@@ -19,6 +18,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
+from shared import system
 from skills import MODES, PUNCT, Result
 
 
@@ -38,7 +38,7 @@ class CommandCancelled(Exception):
     pass
 
 
-SINK = "@DEFAULT_AUDIO_SINK@"
+SINK = system.SINK
 QQ_STREAM = "https://isure.stream.qqmusic.qq.com/"
 BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
@@ -70,39 +70,8 @@ def clean_query(text):
     return "" if compact in GENERIC_WORDS else query
 
 
-def write_private(path, data):
-    directory = os.path.dirname(path) or "."
-    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=directory)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as target:
-            fd = None
-            target.write(data)
-            target.flush()
-            os.fsync(target.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        if fd is not None:
-            os.close(fd)
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
-
-
-def read_volume_status():
-    result = subprocess.run(
-        ["/usr/bin/wpctl", "get-volume", SINK],
-        capture_output=True, text=True, timeout=3, check=False,
-    )
-    match = re.search(r"Volume:\s*([0-9.]+)", result.stdout)
-    vol = round(float(match.group(1)) * 100) if match else None
-    return vol, "MUTED" in result.stdout
-
-
 def read_volume():
-    return read_volume_status()[0]
+    return system.read_volume()[0]
 
 
 def notify_ui_volume():
@@ -902,7 +871,7 @@ class QQMusic(Source):
 
     def save_credential(self, credential):
         try:
-            write_private(
+            system.write_atomic(
                 CREDENTIAL_FILE,
                 json.dumps(credential.model_dump(by_alias=True), ensure_ascii=False).encode("utf-8"),
             )
@@ -1054,7 +1023,7 @@ class MusicService:
     def set_mode(self, mode):
         self.player.set_mode(mode)
         try:
-            write_private(SETTINGS_FILE, json.dumps({"mode": mode}).encode("utf-8"))
+            system.write_atomic(SETTINGS_FILE, json.dumps({"mode": mode}).encode("utf-8"))
         except OSError as error:
             logging.warning("音乐设置保存失败：%s", error)
 
@@ -1419,7 +1388,7 @@ class MusicService:
 
     def playback_status(self, args):
         if args.get("item") == "volume":
-            vol, muted = read_volume_status()
+            vol, muted = system.read_volume()
             if vol is None:
                 return Result("暂时无法读取当前音量", False)
             return Result(f"当前已静音，音量设为百分之{vol}" if muted else f"当前音量是百分之{vol}", True)
