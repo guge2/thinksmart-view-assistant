@@ -94,7 +94,7 @@ def plan_time(args, kind, now):
     duration = [args.get(k) for k in ("hours", "minutes", "seconds")]
     if any(v is not None and (type(v) is not int or v < 0) for v in duration):
         raise ValueError("相对时长必须是非负整数")
-    seconds = sum((v or 0) * scale for v, scale in zip(duration, (3600, 60, 1)))
+    seconds = sum((v or 0) * scale for v, scale in zip(duration, (3600, 60, 1), strict=True))
     if seconds > 0 or (clock_str is None and legacy is None and any(v is not None for v in duration)):
         if repeating or any(v is not None for v in (legacy, clock_str, date)) or (args.get("days_from_today") not in (None, 0)):
             raise ValueError("多久以后不能与钟点、日期或重复规则同时使用")

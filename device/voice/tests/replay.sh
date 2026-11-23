@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2029 # remote paths are quoted with quote_sh and expand locally on purpose
 # 在设备上用当前工作区代码和真实对话模型回放 replay.py 的用例；参数为用例名关键字，留空跑全部。
 set -eu
 voice=$(cd "$(dirname "$0")/.." && pwd)

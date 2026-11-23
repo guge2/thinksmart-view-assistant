@@ -2,7 +2,6 @@ import http.client
 import json
 import logging
 import select
-import socket
 import ssl
 import time
 import urllib.parse

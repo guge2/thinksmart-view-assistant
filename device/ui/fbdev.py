@@ -79,7 +79,7 @@ TRANSPOSE = {
 
 def sysfs_int(device, attribute):
     try:
-        with open(f"/sys/class/graphics/{device}/{attribute}", "r") as source:
+        with open(f"/sys/class/graphics/{device}/{attribute}") as source:
             return int(source.read().strip().split(",")[0])
     except (OSError, ValueError):
         return 0

@@ -148,13 +148,13 @@ class Gateway:
                     health = await voice('ping', seq=1)
                     snapshot = await voice('snapshot')
                     return health, snapshot
-                except (OSError, ValueError, asyncio.TimeoutError, RuntimeError):
+                except (TimeoutError, OSError, ValueError, RuntimeError):
                     return None, {}
 
             async def fetch_services():
                 try:
                     return await self.service_status()
-                except (OSError, RuntimeError, asyncio.TimeoutError):
+                except (TimeoutError, OSError, RuntimeError):
                     return self.services
 
             async def fetch_volume():
@@ -216,7 +216,7 @@ async def guard(request, handler):
         response = web.json_response({'ok': False, 'error': error.text}, status=error.status)
     except (ValueError, TypeError) as error:
         response = web.json_response({'ok': False, 'error': str(error)}, status=400)
-    except (OSError, RuntimeError, asyncio.TimeoutError):
+    except (TimeoutError, OSError, RuntimeError):
         response = web.json_response({'ok': False, 'error': '设备暂时没有响应，请查看服务状态'}, status=503)
     except Exception:
         logging.exception('网关请求处理失败')
@@ -264,7 +264,7 @@ def make_app():
             await voice('prefs', rate=saved_prefs['speech_rate'], think=saved_prefs['thinking'])
             await voice('mic', on=int(saved_prefs['mic']))
             applied = True
-        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
+        except (TimeoutError, OSError, ValueError, RuntimeError):
             pass
         gateway.cache_at = 0
         return web.json_response({'ok': True, 'status': 'applied' if applied else 'saved',

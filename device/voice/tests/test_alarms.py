@@ -97,8 +97,8 @@ class Service(unittest.TestCase):
                 rang = []
                 service = AlarmService(state_file=self.path, music=object())
                 service.items = [{"id": kind, "kind": kind, "due": time.time(), "label": "", "weekdays": []}]
-                service._ring_music = lambda: rang.append("music") or service.stopped.set() or True
-                service._ring = lambda cycles=100: rang.append("beep") or service.stopped.set()
+                service._ring_music = lambda rang=rang, service=service: rang.append("music") or service.stopped.set() or True
+                service._ring = lambda cycles=100, rang=rang, service=service: rang.append("beep") or service.stopped.set()
                 with mock.patch.object(service, "_save"):
                     service._run()
                 self.assertEqual(rang, [expected])

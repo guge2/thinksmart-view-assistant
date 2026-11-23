@@ -72,7 +72,7 @@ def write_atomic(path, data):
 
 def read_wake_phrase():
     try:
-        with open(WAKE_PHRASE_FILE, "r", encoding="utf-8") as source:
+        with open(WAKE_PHRASE_FILE, encoding="utf-8") as source:
             phrase = source.read().strip()
             if phrase:
                 return phrase
@@ -130,7 +130,7 @@ class Settings:
             },
         }
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as source:
+            with open(SETTINGS_FILE, encoding="utf-8") as source:
                 saved = json.load(source)
         except (OSError, ValueError):
             saved = {}
@@ -179,7 +179,7 @@ class Backlight:
         candidates = [preferred] if preferred else sorted(glob.glob("/sys/class/backlight/*"))
         for candidate in candidates:
             try:
-                with open(os.path.join(candidate, "max_brightness"), "r") as source:
+                with open(os.path.join(candidate, "max_brightness")) as source:
                     maximum = int(source.read().strip())
             except (OSError, ValueError):
                 continue
@@ -195,7 +195,7 @@ class Backlight:
         if not self.path:
             return None
         try:
-            with open(os.path.join(self.path, "brightness"), "r") as source:
+            with open(os.path.join(self.path, "brightness")) as source:
                 return max(1, min(100, round(int(source.read().strip()) * 100 / self.max)))
         except (OSError, ValueError):
             return None
@@ -239,7 +239,7 @@ def write_volume(percent):
 
 def default_interface():
     try:
-        with open("/proc/net/route", "r") as source:
+        with open("/proc/net/route") as source:
             for line in source.readlines()[1:]:
                 fields = line.split()
                 if len(fields) > 3 and fields[1] == "00000000" and int(fields[3], 16) & 2:
@@ -260,7 +260,7 @@ def local_address():
 
 def wifi_signal(interface):
     try:
-        with open("/proc/net/wireless", "r") as source:
+        with open("/proc/net/wireless") as source:
             for line in source:
                 if line.strip().startswith(interface + ":"):
                     quality = float(line.split()[2].rstrip("."))
@@ -388,7 +388,7 @@ class SystemStatus:
 
     def load_weather_cache(self):
         try:
-            with open(WEATHER_FILE, "r", encoding="utf-8") as source:
+            with open(WEATHER_FILE, encoding="utf-8") as source:
                 cached = json.load(source)
         except (OSError, ValueError):
             return None

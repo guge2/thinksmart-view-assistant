@@ -14,6 +14,7 @@ for name in alsa-pcm.c alsa-pcm.h alsa-pcm-sink.c alsa-pcm-source.c alsa.h; do
 done
 patch --directory "$BUILD" -p1 < "$ROOT/device/audio/alsa-pcm-watchdog.patch"
 # CPPFLAGS/LDFLAGS may supply the target's ALSA headers and libraries when cross compiling.
+# shellcheck disable=SC2086 # the flag variables are split into words on purpose
 "${CC:-cc}" ${CPPFLAGS:-} ${CFLAGS:--O2} -shared -fPIC -fvisibility=hidden \
     -I"$BUILD" -I"$SRC/spa/include" \
     "$ROOT/device/audio/alsa-pcm-plugin.c" "$BUILD/alsa-pcm.c" "$BUILD/alsa-pcm-sink.c" "$BUILD/alsa-pcm-source.c" \

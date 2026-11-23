@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 130
+extend-exclude = ["tools", "work", "outputs", "backups"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "E7", "W6", "B", "UP"]
+# Exceptions are re-raised bare where the original traceback is the useful one.
+ignore = ["B904"]

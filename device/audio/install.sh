@@ -5,7 +5,7 @@ if [ "$(id -u)" -ne 0 ]; then
 	exec sudo -n "$0" "$@"
 fi
 
-BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BASE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 KERNEL=$(uname -r)
 AEC_PLUGIN=${AEC_PLUGIN:-"$BASE/../../outputs/audio/libspa-aec-thinksmart.so"}
 ALSA_PLUGIN=${ALSA_PLUGIN:-"$BASE/../../outputs/audio/libspa-alsa-thinksmart.so"}

@@ -51,7 +51,7 @@ def find_touch_device():
     hints = (wanted,) if wanted else NAME_HINTS
     for node in sorted(glob.glob("/sys/class/input/event*")):
         try:
-            with open(os.path.join(node, "device", "name"), "r") as source:
+            with open(os.path.join(node, "device", "name")) as source:
                 name = source.read().strip().lower()
         except OSError:
             continue

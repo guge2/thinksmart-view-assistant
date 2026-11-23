@@ -816,7 +816,7 @@ class QQMusic(Source):
             from qqmusic_api import Client, Credential
             credential = Credential()
             try:
-                with open(CREDENTIAL_FILE, "r", encoding="utf-8") as source:
+                with open(CREDENTIAL_FILE, encoding="utf-8") as source:
                     credential = Credential.model_validate(json.load(source))
             except FileNotFoundError:
                 pass
@@ -1042,7 +1042,7 @@ class MusicService:
     @staticmethod
     def load_mode():
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as source:
+            with open(SETTINGS_FILE, encoding="utf-8") as source:
                 mode = json.load(source).get("mode")
         except FileNotFoundError:
             mode = None

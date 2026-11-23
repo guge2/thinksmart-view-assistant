@@ -951,7 +951,7 @@ class ThinkSmartAssistant:
 
     def load_ui_prefs(self):
         try:
-            with open(UI_SETTINGS_FILE, "r", encoding="utf-8") as source:
+            with open(UI_SETTINGS_FILE, encoding="utf-8") as source:
                 saved = json.load(source)
         except (OSError, ValueError):
             return
@@ -1240,7 +1240,7 @@ class ThinkSmartAssistant:
         if not credential_dir:
             raise RuntimeError("systemd credential directory is unavailable")
         path = os.path.join(credential_dir, "aliyun.json")
-        with open(path, "r", encoding="utf-8") as source:
+        with open(path, encoding="utf-8") as source:
             credentials = json.load(source)
         if not credentials.get("api_key") or not credentials.get("workspace_id"):
             raise RuntimeError("Aliyun credentials are incomplete")
@@ -1249,7 +1249,7 @@ class ThinkSmartAssistant:
     @staticmethod
     def read_wake_phrase():
         try:
-            with open(WAKE_PHRASE_FILE, "r", encoding="utf-8") as source:
+            with open(WAKE_PHRASE_FILE, encoding="utf-8") as source:
                 phrase = source.read().strip()
                 if phrase:
                     return phrase

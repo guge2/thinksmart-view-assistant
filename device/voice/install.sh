@@ -5,7 +5,7 @@ if [ "$(id -u)" -ne 0 ]; then
 	exec sudo -n "$0" "$@"
 fi
 
-BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BASE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 APP_ROOT=/usr/local/lib/thinksmart-voice
 DATA_ROOT=/data/thinksmart/voice
 VENV="$DATA_ROOT/venv"

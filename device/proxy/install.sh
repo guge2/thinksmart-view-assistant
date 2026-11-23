@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
-BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BASE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 PAYLOAD=${1:?Path to the exported proxy directory is required}
-PAYLOAD=$(CDPATH= cd -- "$PAYLOAD" && pwd)
+PAYLOAD=$(CDPATH='' cd -- "$PAYLOAD" && pwd)
 ROOT=/data/thinksmart/proxy
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -n "$0" "$PAYLOAD"

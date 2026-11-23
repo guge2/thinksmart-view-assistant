@@ -37,6 +37,7 @@ qq-device*.json
 /tools/webrtc-audio-processing/
 /tools/pipewire/
 /tools/zig/
+/tools/dev/
 /tools/extfs/
 /outputs/
 

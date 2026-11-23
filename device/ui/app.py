@@ -902,7 +902,7 @@ class App:
         """Draws (text, font, colour) runs, or (None, radius, colour) dots, centred as one line."""
         widths = [font.getlength(text) if text is not None else font * 2 for text, font, _ in runs]
         x = (W - sum(widths)) / 2
-        for (text, font, color), width in zip(runs, widths):
+        for (text, font, color), width in zip(runs, widths, strict=True):
             if text is None:
                 d.ellipse((x, cy - font, x + width, cy + font), fill=color)
             else:
