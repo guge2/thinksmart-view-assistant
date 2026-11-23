@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 from fbdev import Console, Framebuffer  # noqa: E402
+from gold import STALE, GoldPrice  # noqa: E402
 from ime import PinyinInput  # noqa: E402
 from insights import Routine, bedtime_tip, night_of, weather_tip  # noqa: E402
 from recipe_view import RecipeView  # noqa: E402
@@ -55,6 +56,8 @@ from theme import (  # noqa: E402
 )
 from touch import Touchscreen  # noqa: E402
 
+# Gold coin, and the domestic convention for quotes: rising red, falling green.
+GOLD, RISE, FALL = (226, 182, 84), (255, 96, 84), (84, 196, 132)
 ORB_COLORS = {"idle": (196, 193, 188), "muted": FAINT, "offline": FAINT, "error": BAD}
 ACTIVE = {"wake", "listen", "think", "answer", "speak"}
 CLOUD_STATES = {"ready", "busy", "offline", "auth", "error"}
@@ -384,6 +387,10 @@ class App:
         self.status = SystemStatus(self.settings)
         self.link = VoiceLink()
         self.touch = Touchscreen(W, H)
+        self.gold = GoldPrice(lambda: self.status.network)
+        self.gold.start()
+        self.gold_version = -1
+        self.gold_clock = None
         self.touch_retry = 0.0
         self.touch_warned = False
 
@@ -570,16 +577,16 @@ class App:
     def status_widget(self):
         return Widget("status", (0, 0, W, 52), self.paint_status)
 
-    def bottom_buttons(self):
+    def home_top(self):
+        # The home screen's status bar ends in the settings gear; other pages keep the full bar.
         return [
-            Widget("mic", (32, 1180, 212, 1252), self.paint_mic_button, tap=self.toggle_mic),
-            Widget("settings", (588, 1180, 768, 1252), self.paint_settings_button, tap=self.open_settings),
+            Widget("status", (0, 0, W - 80, 52), self.paint_status),
+            Widget("settings", (W - 80, 0, W, 72), self.paint_settings_button, tap=self.open_settings),
         ]
 
     def build_idle(self):
         # A centred stack: the clock leads, date and weather follow beneath it.
-        widgets = [
-            self.status_widget(),
+        widgets = self.home_top() + [
             Widget("clock", (40, 60, 760, 268), self.paint_clock, tap=lambda x, y: self.set_screen("alarms")),
             Widget("date", (40, 268, 760, 320), self.paint_date, tap=lambda x, y: self.set_screen("alarms")),
             Widget("weather", (40, 320, 760, 400), self.paint_weather, tap=lambda x, y: self.set_screen("weather")),
@@ -601,8 +608,8 @@ class App:
         else:
             widgets.append(Widget("hint", (40, 890, 760, 960), self.paint_hint))
         if self.layout_has("tips"):
-            widgets.append(Widget("tips", (40, 984, 760, 1156), self.paint_tips, tap=self.dismiss_tips))
-        return widgets + self.bottom_buttons()
+            widgets.append(Widget("tips", (40, 976, 760, 1136), self.paint_tips, tap=self.dismiss_tips))
+        return widgets + [Widget("gold", (40, 1160, 760, 1248), self.paint_gold)]
 
     def card_widgets(self):
         x0, y0, x1, y1 = self.card_rect()
@@ -898,7 +905,7 @@ class App:
         volume = self.current_volume()
         muted = self.status.muted or volume == 0
         volume_text = "静音" if muted else ("--" if volume is None else f"{volume}%")
-        right = x1 - 40
+        right = x1 - (40 if x1 == W else 8)
         d.text((right, cy), volume_text, font=font, fill=FAINT, anchor="rm")
         speaker_x = right - font.getlength(volume_text) - 34
         draw_speaker(d, speaker_x, cy, DIM, -1 if muted else (0 if volume is None else 1 if volume < 50 else 2))
@@ -981,7 +988,7 @@ class App:
         if not self.mic_on:
             if self.hardware_mic is False:
                 return "机身麦克风已关闭，请拨开侧面开关", WARN
-            return "麦克风已关闭，轻触左下角开启", WARN
+            return "语音唤醒已关闭，可在右上角设置中开启", WARN
         return f"说“{self.wake_phrase}”，或轻触圆环", FAINT
 
     def paint_hint(self, d, rect, pressed):
@@ -1025,19 +1032,52 @@ class App:
             self.tips = tips
             self.dirty.add("tips")
 
-    def paint_mic_button(self, d, rect, pressed):
-        self.panel(d, rect, pressed)
-        cy = (rect[1] + rect[3]) // 2
-        color = DIM if self.mic_on else BAD
-        draw_mic(d, rect[0] + 40, cy - 2, 17, color, not self.mic_on)
-        d.text((rect[0] + 70, cy), "麦克风" if self.mic_on else "已静音",
-               font=self.fonts.ui(24), fill=color, anchor="lm")
-
     def paint_settings_button(self, d, rect, pressed):
-        self.panel(d, rect, pressed)
+        # Sits on the status bar's centre line; the circle only shows while pressed.
+        cx, cy = rect[2] - 44, 26
+        if pressed:
+            d.ellipse((cx - 30, cy - 30, cx + 30, cy + 30), fill=CARD_PRESSED)
+        draw_gear(d, cx, cy, 16, DIM, CARD_PRESSED if pressed else BG)
+
+    def paint_gold(self, d, rect, pressed):
+        """One centred line like the weather: coin, 元/克 price, 24-hour change, age when stale."""
         cy = (rect[1] + rect[3]) // 2
-        draw_gear(d, rect[2] - 40, cy, 17, DIM, CARD_PRESSED if pressed else BG)
-        d.text((rect[2] - 70, cy), "设置", font=self.fonts.ui(24), fill=DIM, anchor="rm")
+        if not self.layout_has("music"):
+            d.line((rect[0] + 8, rect[1], rect[2] - 8, rect[1]), fill=LINE, width=2)
+        quote = self.gold.quote
+        small = self.fonts.ui(28)
+        if not quote:
+            text = "金价暂不可用" if self.gold.failed or self.status.network["kind"] == "none" else "正在获取金价…"
+            d.text((W // 2, cy), text, font=small, fill=FAINT, anchor="mm")
+            return
+        age = self.gold.age()
+        expired = age > 86400
+        digits = self.fonts.digits(40)
+        price = f"{quote['price']:,.2f}"
+        runs = [("黄金  ", small, DIM), (price, digits, FAINT if expired else TEXT), (" 元/克", small, DIM)]
+        change = quote.get("change")
+        arrow = None
+        if change is not None and not expired:
+            color = RISE if change > 0 else FALL if change < 0 else DIM
+            arrow = (color, change > 0) if change else None
+            runs.append(("        " if arrow else "   ", small, DIM))
+            runs.append((f"{abs(change):.2f}%" if arrow else "持平", small, color))
+        if age > STALE:
+            minutes = int(age // 60)
+            label = f"{minutes} 分钟前" if minutes < 60 else f"{minutes // 60} 小时前" if minutes < 1440 else f"{minutes // 1440} 天前"
+            runs.append(("  ·  " + label, small, FAINT))
+        coin = 15
+        widths = [font.getlength(text) for text, font, _ in runs]
+        x = (W - coin * 2 - 18 - sum(widths)) / 2
+        d.ellipse((x, cy - coin, x + coin * 2, cy + coin), fill=FAINT if expired else GOLD)
+        d.ellipse((x + 5, cy - coin + 5, x + coin * 2 - 5, cy + coin - 5), outline=BG, width=2)
+        x += coin * 2 + 18
+        for index, ((text, font, color), width) in enumerate(zip(runs, widths, strict=True)):
+            if arrow and index == 4:
+                tip, base = (cy - 13, cy + 7) if arrow[1] else (cy + 13, cy - 7)
+                d.polygon([(x - 26, base), (x - 4, base), (x - 15, tip)], fill=arrow[0])
+            d.text((x, cy), text, font=font, fill=color, anchor="lm")
+            x += width
 
     def paint_stop(self, d, rect, pressed):
         # Outside a conversation the same button closes the lingering card.
@@ -2236,6 +2276,12 @@ class App:
         if self.status.version != self.status_version:
             self.status_version = self.status.version
             self.dirty |= {"status", "weather", "info", "volume", "city"}
+        if self.gold.version != self.gold_version:
+            self.gold_version = self.gold.version
+            self.dirty.add("gold")
+        if self.gold.quote and self.gold.age() > STALE and self.clock_key != self.gold_clock:
+            self.gold_clock = self.clock_key
+            self.dirty.add("gold")
         if self.error_code and now >= self.error_until:
             self.error_code = None
             self.dirty |= {"hint", "phase"}
