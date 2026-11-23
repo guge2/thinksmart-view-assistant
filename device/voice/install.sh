@@ -21,7 +21,8 @@ MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/$M
 UI_SRC="$BASE/../ui"
 UI_ROOT=/usr/local/lib/thinksmart-ui
 UI_DATA=/data/thinksmart/ui
-UI_MODULES="app.py fbdev.py ime.py system.py touch.py"
+# The display entry point; every module next to it is installed with it.
+UI_MODULES="app.py system.py"
 CLOCK_SRC="$BASE/../clock"
 AUDIO_SRC="$BASE/../audio"
 GATEWAY_SRC="$BASE/../gateway"
@@ -232,8 +233,10 @@ for unit in thinksmart-clock-restore.service thinksmart-clock-save.service think
 done
 
 install -d -m 0755 "$UI_ROOT"
-for module in $UI_MODULES; do
-	install -m 0644 "$UI_SRC/$module" "$UI_ROOT/$module"
+rm -f "$UI_ROOT"/*.py
+rm -rf "$UI_ROOT/__pycache__"
+for module in "$UI_SRC"/*.py; do
+	install -m 0644 "$module" "$UI_ROOT/"
 done
 install -m 0644 "$UI_SRC/thinksmart-ui.service" /etc/systemd/system/thinksmart-ui.service
 install -m 0644 "$UI_SRC/thinksmart-wake-request.path" /etc/systemd/system/thinksmart-wake-request.path

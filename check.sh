@@ -8,6 +8,6 @@ fi
 
 ruff check device device/audio/thinksmart-volume-keys
 git ls-files '*.sh' | xargs shellcheck
-for suite in device/voice device/gateway; do
+for suite in device/voice device/gateway device/ui; do
     (cd "$suite" && python -m unittest discover -s tests -q)
 done

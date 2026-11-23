@@ -294,12 +294,19 @@ def http_json(url, timeout=10):
         return json.loads(response.read(262144).decode("utf-8"))
 
 
+def _optional_int(values, index):
+    try:
+        return int(values[index])
+    except (TypeError, IndexError, ValueError):
+        return None
+
+
 def fetch_weather(location):
     query = urllib.parse.urlencode({
         "latitude": f"{location['lat']:.4f}",
         "longitude": f"{location['lon']:.4f}",
         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day",
-        "daily": "weather_code,temperature_2m_max,temperature_2m_min",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
         "timezone": "auto",
         "forecast_days": 3,
     })
@@ -314,6 +321,7 @@ def fetch_weather(location):
                 "code": int(daily["weather_code"][index]),
                 "max": float(daily["temperature_2m_max"][index]),
                 "min": float(daily["temperature_2m_min"][index]),
+                "rain": _optional_int(daily.get("precipitation_probability_max"), index),
             })
         except (KeyError, IndexError, TypeError, ValueError):
             break
