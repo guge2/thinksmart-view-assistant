@@ -2023,13 +2023,13 @@ class App:
                 self.cancel_login()
                 self.screen = "home"
             self.activity(now)
-            self.dirty |= {"recipe_title", "recipe_progress", "recipe_body", "recipe_toggle", "recipe_timers"}
+            self.dirty |= {"recipe_title", "recipe_progress", "recipe_body", "recipe_toggle"} | self.recipe_view.chip_names()
             return
         if event == "alarms":
             self.next_alarm = message.get("next") if isinstance(message.get("next"), dict) else None
             if isinstance(message.get("items"), list):
                 self.alarm_items = message["items"]
-            self.dirty |= {"date", "recipe_timers"} | {f"alarm_row:{i}" for i in range(5)}
+            self.dirty |= {"date"} | self.recipe_view.chip_names() | {f"alarm_row:{i}" for i in range(5)}
             self.next_tips = 0.0
             return
         if event == "alarm":

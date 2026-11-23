@@ -129,9 +129,11 @@ class RecipeTimerTests(unittest.TestCase):
                  {"kind": "timer", "label": "番茄炒蛋·第1步", "due": now + 60},
                  {"kind": "alarm", "label": "红烧肉·第1步", "due": now + 60},
                  {"kind": "timer", "label": "", "due": now + 10}]
+        for number, item in enumerate(items):
+            item["id"] = str(number)
         timers = recipe_timers({"title": "红烧肉"}, items)
-        self.assertEqual([step for step, _ in timers], [2, 5])
-        self.assertAlmostEqual(timers[0][1], 30, delta=1)
+        self.assertEqual([(t["step"], t["id"]) for t in timers], [(2, "1"), (5, "0")])
+        self.assertAlmostEqual(timers[0]["seconds"], 30, delta=1)
 
 
 if __name__ == "__main__":
