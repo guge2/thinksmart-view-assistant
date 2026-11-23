@@ -276,12 +276,15 @@ systemctl enable thinksmart-ui.service
 systemctl restart thinksmart-ui.service
 systemctl is-active --quiet thinksmart-ui.service
 if [ -f /etc/thinksmart-voice/aliyun.json ]; then
-    timeout 20 sh -c 'until [ -S /run/thinksmart-voice/control.sock ]; do sleep 1; done'
+    # A cold start loads the wake word model and takes about 20 seconds.
+    timeout 60 sh -c 'until [ -S /run/thinksmart-voice/control.sock ]; do sleep 1; done'
     systemctl is-active --quiet thinksmart-voice.service
 fi
 systemctl disable --now thinksmart-llm.service >/dev/null 2>&1 || true
 systemctl enable --now thinksmart-gateway-maintenance.path thinksmart-gateway.service
-curl --fail --silent --max-time 30 http://127.0.0.1:8787/api/settings >/dev/null
+# The gateway was just started and listens a few seconds later.
+curl --fail --silent --max-time 30 --retry 20 --retry-delay 1 --retry-connrefused \
+    http://127.0.0.1:8787/api/settings >/dev/null
 rm -rf "$STAGE/backup" "$STAGE/previous-venv"
 if [ -n "$PREV_INSTALL" ] && [ "$PREV_INSTALL" != "$STAGE" ]; then
     rm -rf -- "$PREV_INSTALL"
