@@ -1,0 +1,4 @@
+# 开发机与 CI 的检查依赖；设备上的运行依赖见 device/voice/install.sh。
+ruff==0.17.6
+shellcheck-py==0.11.0.1
+aiohttp>=3.12,<4
