@@ -48,20 +48,17 @@ class RecipeTests(unittest.TestCase):
         self.assertFalse(self.service.active())
         self.assertFalse(self.say("next").ok)
 
-    def test_walk_through_with_one_timer(self):
+    def test_walk_through_without_starting_timers(self):
         self.service.manage_recipe(ARGS)
         self.assertEqual(self.say("next").message, "第1步，番茄切块，鸡蛋打散。")
         self.assertEqual(self.say("previous").message, "已经是第一步了")
         self.say("next")
         third = self.say("next").message
-        self.assertEqual(third, "第3步，番茄炒软后焖一会儿。已开始3分钟计时。")
+        self.assertEqual(third, "第3步，番茄炒软后焖一会儿。这一步要等3分钟，下锅后说“开始计时”。")
+        self.alarms.manage_alarm.assert_not_called()  # only asked for, never started by reaching the step
+        self.assertEqual(self.say("timer").message, "已开始3分钟计时")
         self.alarms.manage_alarm.assert_called_once_with(
             {"action": "create", "kind": "timer", "minutes": 3, "label": "番茄炒蛋·第3步"})
-        self.say("previous")
-        self.say("next")
-        self.assertEqual(self.alarms.manage_alarm.call_count, 1)  # coming back does not start it again
-        self.assertTrue(self.say("timer").ok)
-        self.assertEqual(self.alarms.manage_alarm.call_count, 2)  # unless asked
         self.assertIn("这是最后一步", self.say("next").message)
         self.assertIn("全部完成", self.say("next").message)
         self.assertFalse(self.service.active())
@@ -82,8 +79,10 @@ class RecipeTests(unittest.TestCase):
     def test_failed_timer_is_said(self):
         self.alarms.manage_alarm.return_value = Result("已达到数量上限，请先取消一些", False)
         self.service.manage_recipe(ARGS)
-        self.assertIn("计时器没能启动", self.say("goto", step=3).message)
-        self.assertFalse(self.say("timer").ok)
+        self.say("goto", step=3)
+        result = self.say("timer")
+        self.assertFalse(result.ok)
+        self.assertIn("计时器没能启动", result.message)
 
     def test_screen_taps_are_silent(self):
         self.service.manage_recipe(ARGS)
@@ -103,7 +102,6 @@ class RecipeTests(unittest.TestCase):
         self.say("goto", step=3)
         again = R.RecipeService(None, self.alarms, self.path)
         self.assertEqual(again.snapshot()["index"], 2)
-        self.assertEqual(again.recipe["timers"], [2])
         with open(self.path) as source:
             saved = json.load(source)
         saved["at"] = time.time() - R.EXPIRE_SECONDS - 1

@@ -1,6 +1,7 @@
 """Kitchen recipe mode. The model writes a recipe as an ingredient list and short steps; the user then
 goes through it by voice ("下一步", "上一步", "再说一遍", "第三步") or on the screen. A step that waits
-("小火炖40分钟") starts a timer named after the dish and step when it is reached."""
+("小火炖40分钟") offers a timer named after the dish and step; it starts only when asked ("开始计时" or a
+tap), since the user knows when the pot is actually on."""
 
 import json
 import logging
@@ -58,7 +59,7 @@ def parse_recipe(args):
 
 class RecipeService:
     """The recipe being cooked: its steps, where the user is (index -1 is the ingredient overview
-    before the first step), which steps already started their timer, and what the screen shows."""
+    before the first step), and what the screen shows."""
 
     def __init__(self, emit=None, alarms=None, state_file=STATE_FILE):
         self.emit = emit
@@ -74,7 +75,7 @@ class RecipeService:
             if saved is None:
                 return None
             recipe = dict(parse_recipe(saved), index=int(saved["index"]), view=saved.get("view", "steps"),
-                          timers=[i for i in saved.get("timers", []) if type(i) is int], at=float(saved["at"]))
+                          at=float(saved["at"]))
         except FileNotFoundError:
             return None
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
@@ -136,7 +137,7 @@ class RecipeService:
                     recipe = parse_recipe(args)
                 except ValueError as error:
                     return Result(str(error), False)
-                self.recipe = dict(recipe, index=-1, view="ingredients", timers=[], at=time.time())
+                self.recipe = dict(recipe, index=-1, view="ingredients", at=time.time())
                 self._changed()
                 logging.info("开始菜谱：%s，%d步", recipe["title"], len(recipe["steps"]))
                 return Result(f"好的，{recipe['title']}一共{len(recipe['steps'])}步，食材已经显示在屏幕上。"
@@ -178,7 +179,7 @@ class RecipeService:
         if action == "previous":
             if index <= 0:
                 return Result("已经是第一步了" if index == 0 else "还没开始，说“下一步”开始第一步", index == 0)
-            return self._go(index - 1, speak, start_timer=False)
+            return self._go(index - 1, speak)
         if action == "goto":
             if isinstance(step, bool) or not isinstance(step, int) or not 1 <= step <= len(steps):
                 return Result(f"这道菜只有{len(steps)}步", False)
@@ -186,35 +187,26 @@ class RecipeService:
         if index < 0:
             return Result("还没开始，说“下一步”开始第一步", False)
         if action == "repeat":
-            return self._go(index, speak, start_timer=False)
-        # "timer": start (again) the timer of the current step.
-        if not steps[index]["minutes"]:
+            return self._go(index, speak)
+        # "timer": start a timer for the current step.
+        minutes = steps[index]["minutes"]
+        if not minutes:
             return Result("这一步不需要计时", False)
-        started, text = self._start_timer(index, force=True)
-        self._changed()
-        return Result(text, started)
+        if self.alarms is None:
+            return Result("计时器暂时不可用", False)
+        result = self.alarms.manage_alarm({"action": "create", "kind": "timer", "minutes": minutes,
+                                           "label": timer_label(recipe["title"], index)})
+        if not result.ok:
+            return Result(f"计时器没能启动：{result.message}", False)
+        return Result(f"已开始{minutes}分钟计时", True)
 
-    def _go(self, index, speak, start_timer=True):
+    def _go(self, index, speak):
         recipe = self.recipe
         recipe["index"] = index
         recipe["view"] = "steps"
         step = recipe["steps"][index]
-        timer = self._start_timer(index)[1] if start_timer and step["minutes"] else ""
         self._changed()
         last = "这是最后一步。" if index == len(recipe["steps"]) - 1 else ""
+        wait = f"这一步要等{step['minutes']}分钟，下锅后说“开始计时”。" if step["minutes"] else ""
         text = step["text"].rstrip("。.") + "。"
-        return Result(f"第{index + 1}步，{text}{last}{timer}" if speak else text, True)
-
-    def _start_timer(self, index, force=False):
-        """Returns (started, what to say). A step starts its timer once unless asked again."""
-        recipe = self.recipe
-        if (index in recipe["timers"] and not force) or self.alarms is None:
-            return False, ""
-        minutes = recipe["steps"][index]["minutes"]
-        result = self.alarms.manage_alarm({"action": "create", "kind": "timer", "minutes": minutes,
-                                           "label": timer_label(recipe["title"], index)})
-        if not result.ok:
-            return False, f"计时器没能启动：{result.message}。"
-        if index not in recipe["timers"]:
-            recipe["timers"].append(index)
-        return True, f"已开始{minutes}分钟计时。"
+        return Result(f"第{index + 1}步，{text}{last}{wait}" if speak else text, True)
