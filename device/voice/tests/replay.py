@@ -9,6 +9,7 @@ Each step either says something and checks the outcome, or moves time forward:
   not_tool / reply / not_reply: a skill it must not call, patterns the reply must or must not match
   gap: minutes since the last turn ended, as if the user woke the device again"""
 
+import dataclasses
 import logging
 import os
 import re
@@ -16,10 +17,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import assistant as A
-from skills import Result
+import assistant as A  # noqa: E402
+from config import Settings  # noqa: E402
+from conversation import BRIEFING_TEXT  # noqa: E402
+from skills import Result  # noqa: E402
 
-A.THINKING_CUE_SECONDS = 0
 DEVICE_SKILLS = ("control_device", "play_music", "control_music", "set_volume", "end_conversation")
 DAUGHTER = [{"id": "a1b2", "text": "我女儿叫小米"}]
 
@@ -38,7 +40,7 @@ CASES = [
     ]),
     ("早安简报", [], [
         {"say": "早上好", "tool": "daily_briefing", "reply": "度|℃|雨|晴|阴|云"},
-        {"say": A.BRIEFING_TEXT, "tool": "daily_briefing"},
+        {"say": BRIEFING_TEXT, "tool": "daily_briefing"},
     ]),
     ("天气", [], [
         {"say": "明天杭州会下雨吗", "tool": "get_weather", "args": {"day": 1}},
@@ -70,23 +72,26 @@ CASES = [
 
 
 def build():
-    a = A.ThinkSmartAssistant(A.UiPublisher("/run/thinksmart-replay.sock"))
-    a.play_cue = lambda pcm: None
-    a.memory._save = a.alarms._save = lambda: None
+    settings = dataclasses.replace(Settings.from_env(), thinking_cue_seconds=0)
+    a = A.ThinkSmartAssistant(A.UiPublisher("/run/thinksmart-replay.sock"), settings)
+    conversation = a.conversation
+    conversation.cue = lambda pcm: None
+    conversation.memory._save = a.alarms._save = lambda: None
 
     def speak(fragments):
-        a.heard_reply = "".join(fragments).strip()
-        return a.heard_reply
-    a.speak_stream = speak
+        a.speaker.heard = "".join(fragments).strip()
+        return a.speaker.heard
+    a.speaker.stream = speak
+    registry = conversation.skills
     for name in DEVICE_SKILLS:
-        a.skills.handlers[name] = lambda args: Result("好的", True)
+        registry.handlers[name] = lambda args: Result("好的", True)
     calls = []
-    run = a.skills.run
+    run = registry.run
 
     def recording(name, args, has_reply=False):
         calls.append((name, args if isinstance(args, dict) else {}))
         return run(name, args, has_reply)
-    a.skills.run = recording
+    registry.run = recording
     return a, calls
 
 
@@ -121,7 +126,7 @@ def main(filters):
         if filters and not any(word in title for word in filters):
             continue
         print(f"== {title}")
-        a.memory.items = [dict(item) for item in memory]
+        a.conversation.memory.items = [dict(item) for item in memory]
         a.alarms.items = []
         a.brain.messages = []
         for step in steps:
@@ -129,12 +134,12 @@ def main(filters):
                 a.brain.last_active -= step["gap"] * 60
                 print(f"   （{step['gap']}分钟后再次唤醒）")
                 continue
-            a.brain.forget_if_idle(A.CONTEXT_IDLE_SECONDS)
+            a.brain.forget_if_idle(a.settings.context_idle_seconds)
             calls.clear()
             started = time.monotonic()
             try:
-                a.handle_turn(step["say"])
-                problems = check(step, calls, a.heard_reply, not a.model_turn)
+                a.conversation.handle_turn(step["say"])
+                problems = check(step, calls, a.conversation.heard_reply, not a.conversation.model_turn)
             except Exception as error:
                 problems = [f"出错：{error}"]
             total += 1
@@ -142,7 +147,7 @@ def main(filters):
             print(f"{'✗' if problems else '✓'} 用户：{step['say']}  （{time.monotonic() - started:.1f}秒）")
             for name, args in calls:
                 print(f"   工具：{name} {args}")
-            print(f"   助手：{a.heard_reply}")
+            print(f"   助手：{a.conversation.heard_reply}")
             for problem in problems:
                 print(f"   ！{problem}")
     print(f"\n{total - failed}/{total} 通过")

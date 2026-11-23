@@ -8,6 +8,8 @@ import time
 
 import sherpa_onnx
 
+from audio import frame_level, pcm_to_floats
+
 
 def model_paths(model_dir):
     prefix = "epoch-13-avg-2-chunk-16-left-64"
@@ -22,11 +24,7 @@ def model_paths(model_dir):
 
 
 class OfflineCommands:
-    def __init__(self, model_dir, keywords_file):
-        try:
-            threads = max(1, int(os.getenv("THINKSMART_KWS_THREADS", "1")))
-        except ValueError:
-            threads = 1
+    def __init__(self, model_dir, keywords_file, threads=1):
         self.spotter = sherpa_onnx.KeywordSpotter(
             **model_paths(model_dir),
             keywords_file=keywords_file,
@@ -39,16 +37,16 @@ class OfflineCommands:
             provider="cpu",
         )
 
-    def listen(self, assistant, wait_seconds=8):
+    def listen(self, session, mic, ui, wait_seconds=8):
         """Capture one command; caller owns the already-open microphone."""
         stream = self.spotter.create_stream()
         deadline = time.monotonic() + wait_seconds
-        while not assistant.stop_requested and time.monotonic() < deadline:
-            if assistant.cancel_requested.is_set() or not assistant.mic_enabled.is_set():
+        while not session.stop_requested and time.monotonic() < deadline:
+            if session.cancel_requested.is_set() or not session.mic_enabled.is_set():
                 return ""
-            frame = assistant.read_audio_bytes()
-            assistant.ui.emit("level", v=assistant.frame_level(frame))
-            stream.accept_waveform(16000, assistant.pcm_to_floats(frame))
+            frame = mic.read()
+            ui.emit("level", v=frame_level(frame))
+            stream.accept_waveform(16000, pcm_to_floats(frame))
             while self.spotter.is_ready(stream):
                 self.spotter.decode_stream(stream)
                 result = self.spotter.get_result(stream)

@@ -7,7 +7,8 @@ import sys
 
 _INSTALLED = "/usr/local/lib/thinksmart-ui"
 _CHECKOUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ui")
-sys.path.insert(0, _INSTALLED if os.path.isdir(_INSTALLED) else _CHECKOUT)
+# Appended, so the display's modules (app.py among them) never shadow the voice service's own.
+sys.path.append(_INSTALLED if os.path.isdir(_INSTALLED) else _CHECKOUT)
 
 import system  # noqa: E402
 
