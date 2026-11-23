@@ -12,6 +12,7 @@ from audio import LISTEN_TONE, OK_TONE
 from config import Preferences, Settings
 from memory import Memory
 from music import MusicService
+from recipe import RecipeService
 from session import Session
 from skills import OFFLINE_HINT, Result
 
@@ -51,7 +52,8 @@ def make_conversation():
                           SimpleNamespace(chat_model="chat", chat_provider="bailian", expert_model=None,
                                           expert_provider=None),
                           prefs, settings, SimpleNamespace(phrase="小度小度"), music, alarms,
-                          Memory(os.path.join(directory.name, "memory.json")), device, Mock())
+                          Memory(os.path.join(directory.name, "memory.json")), device,
+                          RecipeService(None, alarms, os.path.join(directory.name, "recipe.json")), Mock())
     conv.cue = Mock()
     conv.context = lambda: "设备状态"
     conv._directory = directory

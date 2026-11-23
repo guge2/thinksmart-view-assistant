@@ -64,7 +64,7 @@ class UiPublisher:
         elif event == "mic":
             state.update(mic=bool(fields.get("on")), requested_mic=fields.get("requested_mic", True),
                          hardware_mic=fields.get("hardware_mic"))
-        elif event in ("music", "lyric"):
+        elif event in ("music", "lyric", "recipe"):
             state[event] = dict(fields)
         elif event == "mlogin":
             if fields.get("s") in ("ok", "none", "expired"):

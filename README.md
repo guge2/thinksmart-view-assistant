@@ -1,6 +1,6 @@
 # ThinkSmart View Assistant
 
-把刷了 Ubuntu 的 Lenovo ThinkSmart View（CD-18781Y，msm8953）改成中文语音助手：离线唤醒、大模型对话、点歌、闹钟、天气和触屏界面。
+把刷了 Ubuntu 的 Lenovo ThinkSmart View（CD-18781Y，msm8953）改成中文语音助手：离线唤醒、大模型对话、点歌、闹钟、天气、厨房菜谱和触屏界面。
 
 ## 目录
 

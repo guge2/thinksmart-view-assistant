@@ -17,7 +17,7 @@ Skill = namedtuple("Skill", "name summary description parameters kind retry forc
                    defaults=("", None, "action", False, None, (), ()))
 # What phrase parsers see: the utterance without the wake phrase, that text without punctuation,
 # the same without polite openers (empty when too long for a command), and the device state.
-Said = namedtuple("Said", "text clean command music_active wake_phrase offline")
+Said = namedtuple("Said", "text clean command music_active wake_phrase offline recipe_active", defaults=(False,))
 
 PUNCT = re.compile(r"[\s，。！？、；：,.!?;:~～…“”\"'‘’]+")
 _CLEAN = re.compile(r"[\s，。！？、,.!?~～…]+")
@@ -51,12 +51,13 @@ def parse_cn_number(text):
     return _CN_DIGITS.get(text)
 
 
-def _fixed(*rows, music_only=False):
-    """Whole-command phrases with fixed arguments; music_only ones apply only while music is on."""
+def _fixed(*rows, music_only=False, recipe_only=False):
+    """Whole-command phrases with fixed arguments; music_only ones apply only while music is on,
+    recipe_only ones only while a recipe is being cooked."""
     table = [(re.compile(pattern), args) for pattern, args in rows]
 
     def parse(said):
-        if music_only and not said.music_active:
+        if music_only and not said.music_active or recipe_only and not said.recipe_active:
             return None
         for pattern, args in table:
             if pattern.match(said.command):
@@ -82,6 +83,30 @@ def _farewell(said):
     return None
 
 
+_RECIPE_NAV = _fixed(
+    (r"^(?:下一步|下一个步骤|然后呢|接下来呢?|接着呢|然后怎么做|接下来怎么做|做好了|好了下一步)[吧呀啊呢了]?$",
+     {"action": "next"}),
+    (r"^(?:上一步|上一个步骤|回到上一步|退回上一步)[吧呀啊呢]?$", {"action": "previous"}),
+    # The polite-opener filter has already dropped a leading 再 or 帮我.
+    (r"^(?:再?说一遍|再?说一次|重复一遍|重复一下|这一步是什么|这一步怎么做|刚才说什么|没听清)[吧呀啊呢]?$",
+     {"action": "repeat"}),
+    (r"^(?:要|需要)?(?:准备)?(?:哪些|什么)?(?:食材|材料|配料|原料)(?:有哪些|是什么|都有什么|有什么)?[吧呀啊呢]?$|"
+     r"^(?:要|需要)准备(?:什么|哪些)(?:东西)?[吧呀啊呢]?$", {"action": "ingredients"}),
+    (r"^(?:开始计时|开始倒计时|计时开始|计时|这一步计时)[吧呀啊]?$", {"action": "timer"}),
+    (r"^(?:退出菜谱|关闭菜谱|结束菜谱|菜谱结束|不做了|做完了)[吧呀啊了]?$", {"action": "stop"}),
+    recipe_only=True,
+)
+_RECIPE_STEP = re.compile(r"^(?:跳到|回到|去|看)?第(\d{1,2}|[一二两三四五六七八九十]+)步[吧呀啊]?$")
+
+
+def _recipe_step(said):
+    match = _RECIPE_STEP.match(said.command) if said.recipe_active else None
+    step = parse_cn_number(match.group(1)) if match else None
+    return {"action": "goto", "step": int(step)} if step else None
+
+
+# Asking to be taught a dish starts recipe mode; asking only how it is made is left to the model.
+_COOK = re.compile(r"(?:教|带)我(?:做|煮|炒|烤|炖|蒸|煎|包)|跟着你做|一步一步.{0,4}(?:做|教)")
 _PLAY = re.compile(r"^(?:播放|我想听听?|我要听|想听|来一首|来首|放一首|放首|唱一首|唱首|搜索)(.*)$")
 
 
@@ -222,6 +247,28 @@ _MEMORY = re.compile(
 _BRIEFING = re.compile(r"(?:早安|早间|今日|每日)简报|今天(?:有什么|有啥|的)安排|早上好|早安")
 
 SKILLS = (
+    Skill(
+        "manage_recipe", "厨房菜谱模式：逐步显示和播报做菜步骤，到点自动计时",
+        "用户想做一道菜、让你教他做菜或问某道菜具体怎么做时，调用start进入菜谱模式：屏幕逐步显示，用户说“下一步”翻页。"
+        "start时把菜谱整理成ingredients（每项带用量，如“五花肉 500克”）和steps（不超过12步，每步一句口语化的动作，"
+        "需要等待的步骤在minutes填等待分钟数，如“小火炖40分钟”填40，其余填0），按家常做法给出。"
+        "做菜过程中用户说下一步、上一步、再说一遍、第几步、要准备什么、开始计时、不做了时调用对应action。"
+        "工具返回的内容会直接播报，不要再复述步骤。",
+        {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["start", "next", "previous", "repeat", "goto", "ingredients", "timer", "stop"],
+                       "description": "start开始新菜谱；next下一步；previous上一步；repeat重说当前步骤；goto跳到第step步；"
+                                      "ingredients列出食材；timer为当前步骤开始计时；stop退出菜谱"},
+            "title": {"type": "string", "description": "start时的菜名，如“红烧肉”"},
+            "ingredients": {"type": "array", "items": {"type": "string"}, "description": "start时的食材和用量"},
+            "steps": {"type": "array", "items": {"type": "object", "properties": {
+                "text": {"type": "string", "description": "这一步做什么，一句话"},
+                "minutes": {"type": "integer", "description": "这一步需要等待的分钟数，不需要等待填0"},
+            }, "required": ["text", "minutes"]}, "description": "start时的操作步骤"},
+            "step": {"type": "integer", "description": "goto时跳到的步骤序号，从1开始"},
+        }, "required": ["action"]},
+        retry=True, force=_COOK, phrases=(_RECIPE_NAV, _recipe_step),
+        offline=("下一步", "上一步", "再说一遍"),
+    ),
     Skill(
         "end_conversation", "结束对话，可同时关屏或停止音乐",
         "用户想结束对话时调用，例如让你退下、说没事了、不用了、你去忙吧。调用后不再继续聆听。你无法关闭设备电源。",
@@ -369,15 +416,15 @@ def forced(text):
     return next((skill.name for skill in SKILLS if skill.force and skill.force.search(text or "")), None)
 
 
-def match(text, music_active, wake_phrase="", offline=False):
+def match(text, music_active, wake_phrase="", offline=False, recipe_active=False):
     """Returns (skill name, arguments) for a phrase handled without the model, else None."""
     text = text or ""
-    local = _match(text, music_active, wake_phrase, offline)
+    local = _match(text, music_active, wake_phrase, offline, recipe_active)
     if local or not music_active:
         return local
     repetition = _REPEATED_COMMAND.fullmatch(PUNCT.sub("", text))
     if repetition:
-        command = _match(repetition.group(1), music_active, wake_phrase, offline)
+        command = _match(repetition.group(1), music_active, wake_phrase, offline, recipe_active)
         if is_quick_playback_command(command):
             return command
     return None
@@ -389,12 +436,14 @@ def is_quick_playback_command(local):
     name, args = local
     return (name == "control_music" and args.get("action") in QUICK_MUSIC_ACTIONS
             or name == "set_volume"
+            or name == "manage_recipe"
             or name == "end_conversation" and args.get("stop_music"))
 
 
-def _match(text, music_active, wake_phrase, offline):
+def _match(text, music_active, wake_phrase, offline, recipe_active=False):
     command = _POLITE.sub("", PUNCT.sub("", text))
-    said = Said(text, _CLEAN.sub("", text), command if len(command) <= 30 else "", music_active, wake_phrase, offline)
+    said = Said(text, _CLEAN.sub("", text), command if len(command) <= 30 else "", music_active, wake_phrase, offline,
+                recipe_active)
     for skill in SKILLS:
         for phrase in skill.phrases:
             args = phrase(said)

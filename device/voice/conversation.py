@@ -112,7 +112,7 @@ class Conversation:
     lives here; it is also the provider of the end_conversation skill."""
 
     def __init__(self, session, ui, brain, speaker, models, prefs, settings, wake_word,
-                 music, alarms, memory, device, set_phase):
+                 music, alarms, memory, device, recipe, set_phase):
         self.session = session
         self.ui = ui
         self.brain = brain
@@ -125,8 +125,9 @@ class Conversation:
         self.alarms = alarms
         self.memory = memory
         self.device = device
+        self.recipe = recipe
         self.set_phase = set_phase
-        self.skills = skills.Skills(device, self, music, alarms, information, memory)
+        self.skills = skills.Skills(device, self, music, alarms, information, memory, recipe)
         self.cue = play_cue
         self.offline_mode = False
         self.over = False
@@ -185,7 +186,7 @@ class Conversation:
         self.effects = []
         self.failed_tools = set()
         self.next_followup = 0.0
-        local = skills.match(stripped_text, self.music.active(), phrase, self.offline_mode)
+        local = skills.match(stripped_text, self.music.active(), phrase, self.offline_mode, self.recipe.active())
         if local:
             name, args = local
             logging.info("本地指令：%s %s", name, json.dumps(args, ensure_ascii=False))
@@ -274,6 +275,7 @@ class Conversation:
             f"当前闹钟与计时计划：{scheduled}。"
             + self.music.describe()
             + self.memory.describe()
+            + self.recipe.describe()
             + self.gap()
         )
 

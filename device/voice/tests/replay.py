@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,6 +55,12 @@ CASES = [
         {"say": "我想听周杰伦", "local": True, "tool": "play_music"},
         {"say": "放点适合写作业听的歌", "local": False, "tool": "play_music"},
     ]),
+    ("菜谱", [], [
+        {"say": "教我做番茄炒蛋", "tool": "manage_recipe", "args": {"action": "start"}},
+        {"say": "下一步", "local": True, "tool": "manage_recipe", "reply": "第1步"},
+        {"say": "这一步火要开多大", "local": False, "not_tool": "end_conversation"},
+        {"say": "不做了", "local": True, "tool": "manage_recipe"},
+    ]),
     ("设备设置", [], [
         {"say": "屏幕太亮了", "tool": "control_device"},
     ]),
@@ -77,6 +84,7 @@ def build():
     conversation = a.conversation
     conversation.cue = lambda pcm: None
     conversation.memory._save = a.alarms._save = lambda: None
+    a.recipe.state_file = os.path.join(tempfile.mkdtemp(prefix="thinksmart-replay-"), "recipe.json")
 
     def speak(fragments):
         a.speaker.heard = "".join(fragments).strip()
@@ -128,6 +136,7 @@ def main(filters):
         print(f"== {title}")
         a.conversation.memory.items = [dict(item) for item in memory]
         a.alarms.items = []
+        a.recipe.recipe = None
         a.brain.messages = []
         for step in steps:
             if "gap" in step:

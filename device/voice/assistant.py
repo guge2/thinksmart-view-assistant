@@ -32,6 +32,7 @@ from errors import apology, classify_error
 from listen import Listener
 from music import MusicService
 from playback import AudioStalled
+from recipe import RecipeService
 from session import Session, TurnCancelled
 from shared import system
 from speak import Speaker
@@ -70,6 +71,7 @@ class ThinkSmartAssistant:
         self.ducker = Ducker(settings.duck_level)
         self.music = MusicService(ui.emit, settings.music_duck_level, session.check_cancel)
         self.alarms = AlarmService(ui.emit, on_ring=self.on_alarm_ring, music=self.music)
+        self.recipe = RecipeService(ui.emit, self.alarms)
         self.offline_commands = offline.OfflineCommands(KWS_MODEL, OFFLINE_KEYWORDS_FILE, settings.kws_threads)
         phrase = system.read_wake_phrase()
         self.wake_word = WakeWord(phrase, create_keyword_spotter(settings), music_keywords(phrase, settings))
@@ -88,7 +90,7 @@ class ThinkSmartAssistant:
         self.conversation = Conversation(
             session, ui, self.brain, self.speaker, self.models, self.prefs, settings, self.wake_word,
             self.music, self.alarms, memory.Memory(), DeviceSkills(self.prefs, ui, self.alarms, session),
-            self.set_phase)
+            self.recipe, self.set_phase)
         self.control = ControlServer(self.control_handlers(), lambda: session.stop_requested)
 
     # State shown on the display
@@ -122,6 +124,7 @@ class ThinkSmartAssistant:
         self.ui.emit("cloud", s=self.cloud_state)
         self.music.announce()
         self.alarms.announce()
+        self.recipe.announce()
         self.ui.snapshot()
 
     def report_error(self, error):
@@ -309,6 +312,7 @@ class ThinkSmartAssistant:
             "prefs": prefs,
             "music": accepted(lambda m: music.ui_command(m.get("a"), minutes=m.get("minutes"))),
             "login": accepted(lambda m: music.login_command(m.get("t"))),
+            "recipe": accepted(lambda m: self.recipe.ui_command(m.get("a"), step=m.get("step"))),
         }
 
     def health(self):
