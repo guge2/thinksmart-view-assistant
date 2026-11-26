@@ -90,7 +90,7 @@ function render(data){
  latest=data;const h=data.health;const s=data.snapshot||{};const services=data.services||{};
  $('connection-error').hidden=true;
  pill('connection',h?.healthy?({idle:'待机 · 已连接',wake:'唤醒成功',listen:'正在聆听',think:'正在思考',answer:'正在回答',speak:'正在播报'}[h.phase]||'设备已连接'):h?.control_healthy?(h.audio_recovery?.status==='recovering'?'音频正在恢复':'等待音频就绪'):h?'语音响应异常':'语音服务离线',h?.healthy?'green':'amber');
- text('refreshed',`${clock(data.time)} 更新`);text('footer-time',clock(data.time));text('version',`网关 v${data.version}`);text('art-time',clock(data.time).slice(0,5));
+ text('refreshed',`${clock(data.time)} 更新`);text('version',`网关 v${data.version}`);
  text('phase-title',h?(phaseNames[h.phase]||'设备正在工作'):'语音服务暂时离线');
  text('phase-detail',!h?'可在服务维护中尝试重新启动语音服务。':h.mic?'可以直接对设备说话，或在这里手动唤醒。':h.hardware_mic===false?'机身麦克风开关已关闭，请先拨开设备侧面的开关。':'软件麦克风已关闭，可通过下方按钮重新开启。');
  text('wake-label',`唤醒词「${data.wake_word}」`);text('hardware-label',`硬件麦克风 ${h?.hardware_mic===true?'开启':h?.hardware_mic===false?'关闭':'未知'}`);

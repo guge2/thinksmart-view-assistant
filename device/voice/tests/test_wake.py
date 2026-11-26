@@ -1,4 +1,5 @@
 import os
+import struct
 import time
 import unittest
 from types import SimpleNamespace
@@ -55,6 +56,13 @@ class WakeGuardTests(unittest.TestCase):
 
 
 class MusicWakeTests(unittest.TestCase):
+    def test_gain_matches_the_original_for_every_s16_sample(self):
+        values = range(-32768, 32768)
+        data = struct.pack("<65536h", *values)
+        for gain in (1, wake.AEC_GAIN, wake.RAW_GAIN):
+            expected = [max(-1.0, min(1.0, value / 32768 * gain)) for value in values]
+            self.assertEqual(wake.pcm_to_floats(data, gain), expected)
+
     def test_music_prefix_quiets_song_but_needs_confirmation(self):
         player = Mock()
         stream = wake.MusicWake(Mock(), ("full", "prefix"), "小度小度")
@@ -102,7 +110,6 @@ class DetectorTests(unittest.TestCase):
         raw = self.enter_pipe(raw)
         detector = wake.WakeDetector(mic, session, wake.WakeWord("小度小度", spotter), music, alarms,
                                      open_raw=lambda _: raw)
-        detector.decode = lambda stream, data, gain: "小度小度" if stream is detector.raw_stream else ""
         os.write(aec_write, b"\0\0")
         os.write(raw_write, bytes(FRAME_BYTES))
         self.assertEqual(detector.poll(aec), (None, "小度小度", "raw"))

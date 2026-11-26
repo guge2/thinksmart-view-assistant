@@ -19,10 +19,9 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 from fbdev import Console, Framebuffer  # noqa: E402
 from gold import STALE, GoldPrice  # noqa: E402
 from ime import PinyinInput  # noqa: E402
-from insights import Routine, bedtime_tip, night_of, weather_tip  # noqa: E402
+from insights import weather_tip  # noqa: E402
 from recipe_view import RecipeView  # noqa: E402
 from system import (  # noqa: E402
-    DATA_DIR,
     DIM_CHOICES,
     SETTINGS_FILE,
     WAKE_PATTERN,
@@ -404,7 +403,6 @@ class App:
         self.pressed = None
         self.active = None
         self.swallow = False
-        self.drag_value = None
         self.rate_drag = None
         self.wrap_cache = {}
 
@@ -417,6 +415,7 @@ class App:
         self.error_code = None
         self.error_until = 0.0
         self.notice = None
+        self.timer_request = None
         self.alarm_active = False
         self.next_alarm = None
         self.alarm_items = []
@@ -462,17 +461,14 @@ class App:
         saved = self.settings["brightness"]
         self.brightness = saved or self.status.backlight.read_percent() or 80
         if saved and self.status.backlight.writable():
-            self.status.set_brightness(saved)
+            self.status.request_controls(brightness=saved)
 
         self.recipe = None
         self.recipe_view = RecipeView(self)
-        self.routine = Routine(f"{DATA_DIR}/routine.json")
-        self.next_routine_save = now + 300
-        # Quiet tips on the home screen: (key, text, colour); a tapped tip stays away while its key holds.
-        self.tips = []
-        self.dismissed_tips = set()
-        self.next_tips = 0.0
+        self.weather_tip = None
+        self.tip_dismissed = False
 
+        self.kb_loading = False
         self.kb_purpose = "wake"
         self.kb_return = "settings"
         self.kb_text = ""
@@ -513,7 +509,8 @@ class App:
         if self.screen == "alarms":
             sleep_on = int(bool(self.music.get("sleep") and self.music.get("sleep") > time.time()))
             music_on = int(self.music.get("s") in MUSIC_ACTIVE)
-            return f"alarms:{len(self.alarm_items[:5])}:{sleep_on}:{music_on}"
+            ids = ",".join(item["id"] for item in self.alarm_items[:5])
+            return f"alarms:{ids}:{sleep_on}:{music_on}"
         if self.screen != "home":
             return self.screen
         assist = self.phase in ACTIVE or now < self.conv_until
@@ -525,7 +522,7 @@ class App:
             base = "idle:music:lyrics" if self.has_lyrics() else "idle:music"
         if assist:
             return base + (":assist:alarm" if self.alarm_active else ":assist") + f":card{self.card_top()}"
-        return base + (":tips" if self.tips and base == "idle" else "")
+        return base + (":tip" if base == "idle" and self.weather_tip and not self.tip_dismissed else "")
 
     def layout_has(self, flag):
         return flag in (self.layout or "").split(":")
@@ -549,7 +546,6 @@ class App:
         self.layout = layout
         self.pressed = None
         self.active = None
-        self.drag_value = None
         self.orb_rect = None
         card = self.card_rect()
         if card not in self.backgrounds:
@@ -607,8 +603,8 @@ class App:
             widgets.append(Widget("player", (40, 1032, 760, 1142), self.paint_player, tap=self.tap_player))
         else:
             widgets.append(Widget("hint", (40, 890, 760, 960), self.paint_hint))
-        if self.layout_has("tips"):
-            widgets.append(Widget("tips", (40, 976, 760, 1136), self.paint_tips, tap=self.dismiss_tips))
+        if self.layout_has("tip"):
+            widgets.append(Widget("tip", (40, 1008, 760, 1104), self.paint_weather_tip, tap=self.dismiss_weather_tip))
         return widgets + [Widget("gold", (40, 1160, 760, 1248), self.paint_gold)]
 
     def card_widgets(self):
@@ -827,9 +823,9 @@ class App:
     def fit(self, text, font, width):
         if font.getlength(text) <= width:
             return text
-        while text and font.getlength(text + "…") > width:
-            text = text[:-1]
-        return text + "…"
+        # Find the longest fitting prefix without measuring every discarded suffix.
+        end = bisect.bisect_right(range(len(text)), width, key=lambda n: font.getlength(text[:n] + "…"))
+        return text[:max(0, end - 1)] + "…"
 
     def wrap(self, font, text, width):
         key = (id(font), width, text)
@@ -876,12 +872,6 @@ class App:
             "error": ("云端 异常", WARN),
         }.get(self.cloud, ("云端 连接中", DIM))
 
-    def current_volume(self):
-        if self.drag_value is not None and self.active is self.named.get("volume"):
-            return self.drag_value
-        pending = self.status.pending_volume
-        return pending if pending is not None else self.status.volume
-
     def paint_status(self, d, rect, pressed):
         x1 = rect[2]
         cy = (rect[1] + rect[3]) // 2
@@ -902,7 +892,7 @@ class App:
             label, color = "未联网", BAD
         d.text((76, cy), self.fit(label, font, 220), font=font, fill=color, anchor="lm")
 
-        volume = self.current_volume()
+        volume = self.status.volume
         muted = self.status.muted or volume == 0
         volume_text = "静音" if muted else ("--" if volume is None else f"{volume}%")
         right = x1 - (40 if x1 == W else 8)
@@ -997,40 +987,15 @@ class App:
         d.text((W // 2, (rect[1] + rect[3]) // 2), self.fit(text, font, rect[2] - rect[0]),
                font=font, fill=color, anchor="mm")
 
-    def paint_tips(self, d, rect, pressed):
-        tips = self.tips[:2]
-        if not tips:
-            return
+    def paint_weather_tip(self, d, rect, pressed):
         d.rounded_rectangle(rect, radius=32, fill=CARD_PRESSED if pressed else CARD)
         x0, y0, x1, y1 = rect
         font = self.fonts.ui(28)
-        row = (y1 - y0) / len(tips)
-        for index, (_key, text, color) in enumerate(tips):
-            cy = round(y0 + row * (index + 0.5))
-            d.ellipse((x0 + 32, cy - 6, x0 + 44, cy + 6), fill=ACCENT if color == WARN else FAINT)
-            d.text((x0 + 64, cy), self.fit(text, font, x1 - x0 - 96), font=font, fill=color, anchor="lm")
+        d.text(((x0 + x1) // 2, (y0 + y1) // 2), self.fit(self.weather_tip, font, x1 - x0 - 64),
+               font=font, fill=TEXT, anchor="mm")
 
-    def dismiss_tips(self, *_args):
-        self.dismissed_tips |= {key for key, _text, _color in self.tips}
-        self.tips = []
-
-    def update_tips(self):
-        """Weather and bedtime tips; recomputed every half minute, never spoken."""
-        now = dt.datetime.now()
-        tips = []
-        weather = weather_tip(self.status.weather, now)
-        if weather:
-            tips.append((("weather", weather), weather, TEXT))
-        recap = self.routine.last_night_tip(now)
-        if recap:
-            tips.append((("recap", now.date()), recap, DIM))
-        bedtime = bedtime_tip(self.alarm_items, self.routine.usual(now), now)
-        if bedtime:
-            tips.append((("bedtime", night_of(now)[0]), bedtime[0], WARN if bedtime[1] else DIM))
-        tips = [tip for tip in tips if tip[0] not in self.dismissed_tips][:2]
-        if tips != self.tips:
-            self.tips = tips
-            self.dirty.add("tips")
+    def dismiss_weather_tip(self, *_args):
+        self.tip_dismissed = True
 
     def paint_settings_button(self, d, rect, pressed):
         # Sits on the status bar's centre line; the circle only shows while pressed.
@@ -1330,7 +1295,7 @@ class App:
         return round(min(1.0, max(0.0, (x - left) / (right - left))) * 100)
 
     def paint_volume(self, d, rect, pressed):
-        self.paint_slider(d, rect, "音量", self.current_volume(), True)
+        self.paint_slider(d, rect, "音量", self.status.volume, True)
 
     def paint_brightness(self, d, rect, pressed):
         self.paint_slider(d, rect, "屏幕亮度", self.brightness, self.status.backlight.writable())
@@ -1458,8 +1423,9 @@ class App:
         cy = (y0 + y1) // 2
         d.line((x0, y0, x1, y0), fill=LINE, width=2)
         d.line((x0, y1 - 1, x1, y1 - 1), fill=LINE, width=2)
-        if self.kb_latin:
-            d.text((W // 2, cy), "字母输入", font=self.fonts.ui(28), fill=FAINT, anchor="mm")
+        if self.kb_loading or self.kb_latin:
+            label = "正在加载拼音词典…" if self.kb_loading else "字母输入"
+            d.text((W // 2, cy), label, font=self.fonts.ui(28), fill=FAINT, anchor="mm")
             return
         if not self.kb_buffer:
             d.text((W // 2, cy), "输入拼音后在这里选择汉字", font=self.fonts.ui(28), fill=FAINT, anchor="mm")
@@ -1636,22 +1602,27 @@ class App:
         if zone >= 0:
             self.link.send("music", a=("mode", "prev", "toggle", "next")[min(3, zone)])
 
+    def send_timer(self, command, confirmation, **fields):
+        ident = str(time.monotonic_ns())
+        if self.link.send(command, id=ident, **fields):
+            self.timer_request = (ident, confirmation, time.monotonic() + 3)
+            self.set_notice("正在更新定时…", DIM, 3)
+        else:
+            self.timer_request = None
+            self.set_notice("操作未送达，请稍后重试", BAD, 4)
+
     def start_quick_timer(self, minutes):
-        self.link.send("alarm_cmd", a="timer", minutes=minutes)
-        self.set_notice(f"已开启 {minutes} 分钟倒计时", GOOD, 4)
+        self.send_timer("alarm_cmd", f"已开启 {minutes} 分钟倒计时", a="timer", minutes=minutes)
 
     def cancel_alarm_item(self, ident):
-        self.link.send("alarm_cmd", a="cancel", id=ident)
-        self.set_notice("已取消该项提醒", DIM, 3)
+        self.send_timer("alarm_cmd", "已取消该项提醒", a="cancel", alarm_id=ident)
 
     def toggle_sleep_timer(self, *_args):
         sleep_until = self.music.get("sleep")
         if sleep_until and sleep_until > time.time():
-            self.link.send("music", a="sleep", minutes=0)
-            self.set_notice("已取消音乐伴睡定时", DIM, 4)
+            self.send_timer("music", "已取消音乐伴睡定时", a="sleep", minutes=0)
         else:
-            self.link.send("music", a="sleep", minutes=30)
-            self.set_notice("已开启 30 分钟伴睡定时", GOOD, 4)
+            self.send_timer("music", "已开启 30 分钟伴睡定时", a="sleep", minutes=30)
 
     def open_music(self, *_args):
         self.screen = "music"
@@ -1795,8 +1766,7 @@ class App:
 
     def drag_volume(self, x, y, phase):
         value = self.slider_value("volume", x)
-        self.drag_value = None if phase == "up" else value
-        self.status.set_volume(value)
+        self.status.request_controls(volume=value)
         self.dirty |= {"volume", "status"}
 
     def drag_brightness(self, x, y, phase):
@@ -1809,7 +1779,7 @@ class App:
             self.update_dim(time.monotonic())
         else:
             self.applied_brightness = self.brightness
-            self.status.set_brightness(self.brightness)
+            self.status.request_controls(brightness=self.brightness)
         self.dirty.add("brightness")
 
     def open_keyboard(self, purpose, back="settings"):
@@ -1817,16 +1787,28 @@ class App:
         self.kb_return = back
         self.kb_text = ""
         self.kb_buffer = ""
-        available = self.ime.available()
-        self.kb_latin = purpose == "city" and not available
+        self.ime.prepare()
+        self.kb_loading = True
+        self.kb_latin = False
         self.kb_message = ("", DIM)
-        if not available:
-            if purpose == "wake":
+        self.screen = "keyboard"
+        self.update_candidates()
+        self.keyboard_ready()
+
+    def keyboard_ready(self):
+        if self.ime.loader.is_alive():
+            return
+        self.kb_loading = False
+        if not self.ime.keys:
+            if self.kb_purpose == "wake":
                 self.kb_message = ("拼音词典不可用，无法输入汉字", BAD)
             else:
+                self.kb_latin = True
+                self.kb_text += self.kb_buffer
+                self.kb_buffer = ""
                 self.kb_message = ("拼音词典不可用，请用拼音字母输入城市名", WARN)
         self.update_candidates()
-        self.screen = "keyboard"
+        self.dirty |= {"cands", "message", "field", "key:mode"}
 
     def close_keyboard(self, *_args):
         self.screen = self.kb_return
@@ -1869,7 +1851,7 @@ class App:
             else:
                 self.kb_text = self.kb_text[:-1]
         elif name == "mode":
-            if self.kb_purpose == "city" and self.ime.available():
+            if self.kb_purpose == "city" and not self.kb_loading and self.ime.keys:
                 self.kb_latin = not self.kb_latin
                 self.kb_text += self.kb_buffer
                 self.kb_buffer = ""
@@ -1958,6 +1940,13 @@ class App:
             if sequence <= self.voice_event_seq:
                 return
             self.voice_event_seq = sequence
+        if event == "ack":
+            if self.timer_request and message.get("id") == self.timer_request[0]:
+                success = message.get("ok")
+                text = self.timer_request[1] if success else message.get("status") or "操作失败"
+                self.set_notice(text, GOOD if success else BAD, 4)
+                self.timer_request = None
+            return
         if event == "snapshot":
             self.conv_until = 0.0
             phase = message.get("phase", "idle")
@@ -2032,8 +2021,7 @@ class App:
             self.dirty |= {"mic", "microw", "hint"}
             return
         if event == "hw_volume":
-            self.status.next_volume = 0.0
-            self.status.jobs.put(None)
+            self.status.request_controls(read_volume=True)
             self.next_tick = min(self.next_tick, now + 0.08)
             self.activity(now)
             return
@@ -2070,7 +2058,6 @@ class App:
             if isinstance(message.get("items"), list):
                 self.alarm_items = message["items"]
             self.dirty |= {"date"} | self.recipe_view.chip_names() | {f"alarm_row:{i}" for i in range(5)}
-            self.next_tips = 0.0
             return
         if event == "alarm":
             self.activity(now)
@@ -2098,7 +2085,6 @@ class App:
             return
         self.activity(now)
         if event == "wake":
-            self.routine.record(dt.datetime.now())
             if self.screen != "home":
                 self.cancel_login()
                 self.screen = "home"
@@ -2149,7 +2135,7 @@ class App:
         self.conv_until = 0.0
         self.asleep = self.dimmed = True
         self.applied_brightness = 0
-        self.status.set_brightness(0)
+        self.status.request_controls(brightness=0)
 
     def update_dim(self, now):
         if self.asleep:
@@ -2168,11 +2154,9 @@ class App:
         brightness = max(1.0, self.brightness * 0.12) if wanted else self.brightness
         if brightness != self.applied_brightness:
             self.applied_brightness = brightness
-            self.status.set_brightness(brightness)
+            self.status.request_controls(brightness=brightness)
 
     def on_touch(self, kind, x, y, now):
-        if kind == "down":
-            self.routine.record(dt.datetime.now())
         was_dimmed = self.dimmed
         self.activity(now)
         if kind == "down" and was_dimmed:
@@ -2217,6 +2201,8 @@ class App:
             widget.tap(x, y)
 
     def tick(self, now):
+        if self.screen == "keyboard" and self.kb_loading:
+            self.keyboard_ready()
         if now >= self.next_settings_check:
             self.next_settings_check = now + 2
             try:
@@ -2241,6 +2227,12 @@ class App:
                     self.send_prefs()
                     self.full_redraw = True
         clock = time.strftime("%H:%M")
+        if clock != self.clock_key or self.status.version != self.status_version:
+            tip = weather_tip(self.status.weather, dt.datetime.now())
+            if tip != self.weather_tip:
+                self.weather_tip = tip
+                self.tip_dismissed = False
+                self.dirty.add("tip")
         if clock != self.clock_key:
             self.clock_key = clock
             self.dirty |= {"clock", "date", "recipe_title"}
@@ -2285,6 +2277,9 @@ class App:
         if self.error_code and now >= self.error_until:
             self.error_code = None
             self.dirty |= {"hint", "phase"}
+        if self.timer_request and now >= self.timer_request[2]:
+            self.timer_request = None
+            self.set_notice("未收到确认，请查看定时状态", WARN, 5)
         if self.notice and now >= self.notice[2]:
             self.notice = None
             self.dirty |= {"notice", "hint"}
@@ -2304,12 +2299,6 @@ class App:
             self.dirty.add("player")
         if self.recipe and (self.layout or "").startswith("recipe"):
             self.dirty |= self.recipe_view.tick(now)
-        if now >= self.next_tips:
-            self.next_tips = now + 30
-            self.update_tips()
-        if now >= self.next_routine_save:
-            self.next_routine_save = now + 300
-            self.routine.save()
         logging_in = self.screen == "music" and (self.login or {}).get("s") in LOGIN_FLOW
         if self.screen != "home" and now - self.last_activity > (300 if logging_in else 120):
             self.cancel_login()
@@ -2396,7 +2385,6 @@ class App:
                 time.sleep(0.5)
 
     def shutdown(self):
-        self.routine.save()
         try:
             self.fb.clear()
         finally:

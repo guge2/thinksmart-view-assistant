@@ -13,7 +13,7 @@ dir=$(ssh "$host" 'mktemp -d /tmp/thinksmart-replay.XXXXXX')
 trap 'ssh "$host" "rm -rf -- $(quote_sh "$dir")" >/dev/null 2>&1 || true' EXIT HUP INT TERM
 
 ssh "$host" "mkdir -p -- $(quote_sh "$dir/tests")"
-scp -q "$voice"/*.py "$host:$dir/"
+scp -q "$voice"/*.py "$voice/../ui/system.py" "$host:$dir/"
 scp -q "$voice/tests/replay.py" "$host:$dir/tests/"
 
 args=""

@@ -42,7 +42,6 @@ def make_conversation():
     music.active.return_value = False
     alarms = Mock(spec=AlarmService)
     alarms.ringing = False
-    alarms.briefing_at = None
     settings = Settings()
     prefs = Preferences(speech_rate=1.5, thinking=True)
     brain = Mock(messages=[], last_active=0.0)
@@ -89,9 +88,6 @@ class TurnTests(unittest.TestCase):
         conv.handle_turn("小度小度。")
         conv.cue.assert_called_once_with(LISTEN_TONE)
         self.assertEqual(conv.next_followup, conv.settings.speech_wait_seconds)
-        conv.alarms.briefing_at = 123
-        conv.handle_turn("小度小度")
-        self.assertEqual(conv.next_followup, C.BRIEFING_WAIT_SECONDS)
 
     def test_offline_turn_explains_what_works(self):
         conv = self.conv

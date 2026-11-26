@@ -88,11 +88,9 @@ class RecipeService:
     def _changed(self):
         recipe = self.recipe
         try:
-            if recipe is None:
-                system.write_atomic(self.state_file, b"null")
-            else:
+            if recipe is not None:
                 recipe["at"] = time.time()
-                system.write_atomic(self.state_file, json.dumps(recipe, ensure_ascii=False).encode("utf-8"))
+            system.write_json(self.state_file, recipe)
         except OSError as error:
             logging.warning("菜谱保存失败：%s", error)
         self.announce()

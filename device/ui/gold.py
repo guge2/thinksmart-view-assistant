@@ -9,7 +9,7 @@ import os
 import threading
 import time
 
-from system import DATA_DIR, env_float, http_json, write_atomic
+from system import DATA_DIR, env_float, http_json, write_json
 
 GOLD_FILE = f"{DATA_DIR}/gold.json"
 TROY_OUNCE_GRAMS = 31.1034768
@@ -154,7 +154,7 @@ class GoldPrice:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             payload = {"quote": self.quote, "samples": samples}
-            write_atomic(self.path, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            write_json(self.path, payload)
         except OSError as error:
             logging.warning("金价缓存保存失败：%s", error)
         return True

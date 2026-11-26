@@ -13,6 +13,7 @@ from collections import deque
 from audio import frame_level, open_recorder, stop_process
 from config import ECHO_CANCEL_SOURCE, RECOVERY_STATE_FILE, SAMPLE_RATE
 from playback import AudioStalled
+from shared import system
 from wake import WakeDetector
 
 QUEUE_FRAMES = 200  # 8 s of 40 ms frames
@@ -238,12 +239,7 @@ class AudioRecovery:
 
     def _save(self):
         try:
-            temporary = self.state_file + ".new"
-            with open(temporary, "w", encoding="utf-8") as target:
-                json.dump({"boot": self.boot, "attempts": list(self.attempts)}, target)
-                target.flush()
-                os.fsync(target.fileno())
-            os.replace(temporary, self.state_file)
+            system.write_json(self.state_file, {"boot": self.boot, "attempts": list(self.attempts)})
         except OSError:
             logging.warning("未能保存音频恢复次数")
 

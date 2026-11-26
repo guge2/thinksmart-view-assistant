@@ -871,10 +871,7 @@ class QQMusic(Source):
 
     def save_credential(self, credential):
         try:
-            system.write_atomic(
-                CREDENTIAL_FILE,
-                json.dumps(credential.model_dump(by_alias=True), ensure_ascii=False).encode("utf-8"),
-            )
+            system.write_json(CREDENTIAL_FILE, credential.model_dump(by_alias=True))
         except OSError as error:
             logging.warning("QQ音乐凭证保存失败：%s", error)
 
@@ -1023,7 +1020,7 @@ class MusicService:
     def set_mode(self, mode):
         self.player.set_mode(mode)
         try:
-            system.write_atomic(SETTINGS_FILE, json.dumps({"mode": mode}).encode("utf-8"))
+            system.write_json(SETTINGS_FILE, {"mode": mode})
         except OSError as error:
             logging.warning("音乐设置保存失败：%s", error)
 
@@ -1401,7 +1398,10 @@ class MusicService:
     def ui_command(self, action, **kwargs):
         self.cancel_pending()
         if action == "sleep":
-            self.player.set_sleep(int(kwargs.get("minutes") or 0))
+            minutes = int(kwargs.get("minutes") or 0)
+            message, applied = self.set_sleep_timer(minutes)
+            if minutes > 0 and not applied:
+                raise ValueError(message)
             return
         if action == "mode":
             self.set_mode(MODES[(MODES.index(self.player.mode) + 1) % len(MODES)])

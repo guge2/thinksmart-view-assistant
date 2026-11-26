@@ -16,8 +16,7 @@
  <header class="topbar"><div><span class="eyebrow">ThinkSmart View · CD-18781Y</span><h1 id="page-title">设备概览</h1></div><div class="connection"><span id="connection" class="pill neutral">正在连接</span><small id="refreshed">等待设备响应</small></div></header>
  <div id="connection-error" class="banner" role="status" hidden>暂时无法连接设备。请确认设备已开机，管理入口保持连接。</div>
  <section data-section="overview">
-  <div class="hero panel"><div class="hero-copy"><h2 id="phase-title">正在读取设备状态</h2><p id="phase-detail">连接后，可在这里查看状态、唤醒设备和控制播放。</p><div class="actions"><button class="primary" data-action="talk" id="wake-button">唤醒设备</button><button data-action="stop">结束对话</button><button id="mic-button">麦克风</button></div><div class="hero-meta"><span id="wake-label">唤醒词 —</span><span id="hardware-label">硬件麦克风 —</span></div></div>
-  <div class="hero-clock" aria-hidden="true"><span id="art-time">—</span><small>设备时间</small></div></div>
+  <div class="hero panel"><h2 id="phase-title">正在读取设备状态</h2><p id="phase-detail">连接后，可在这里查看状态、唤醒设备和控制播放。</p><div class="actions"><button class="primary" data-action="talk" id="wake-button">唤醒设备</button><button data-action="stop">结束对话</button><button id="mic-button">麦克风</button></div><div class="hero-meta"><span id="wake-label">唤醒词 —</span><span id="hardware-label">硬件麦克风 —</span></div></div>
   <div class="grid three status-cards">
    <article class="panel"><div class="card-label">收音状态</div><h3 id="mic-title">—</h3><div class="meter"><i id="overview-level"></i></div><p id="capture-note">等待采集状态</p></article>
    <article class="panel"><div class="card-label">对话模型</div><h3 class="model-value" id="model-name">—</h3><p id="model-provider">读取当前运行配置</p></article>
@@ -73,7 +72,6 @@
   <div id="service-cards" class="grid two"></div>
   <article class="panel architecture"><div><h3>设备独立运行</h3><p>语音、音乐和闹钟仍在 ThinkSmart 上执行。管理网页由你的浏览器渲染，网关按需读取状态。</p></div><div class="connection-path"><span>你的浏览器</span><i>→</i><span>管理网关</span><i>→</i><span>设备服务</span></div><p class="muted">模型凭据保留在设备上，管理页面不读取或显示密钥。</p></article>
  </section>
- <footer>ThinkSmart View <span>·</span> 设备管理 <span>·</span> <span id="footer-time">等待同步</span></footer>
 </main>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 </body></html>

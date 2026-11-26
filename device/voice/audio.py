@@ -37,8 +37,17 @@ def frame_rms(data):
     return math.sqrt(sum(v * v for v in samples) / max(1, len(samples)))
 
 
-def pcm_to_floats(data):
-    return [sample / 32768.0 for sample in _samples(data)]
+def pcm_to_floats(data, gain=1.0):
+    """Normalize one s16 frame for recognition, clipping amplified samples to [-1, 1]."""
+    scale = gain / 32768.0
+    samples = [value * scale for value in _samples(data)]
+    if gain > 1.0:
+        for i, value in enumerate(samples):
+            if value > 1.0:
+                samples[i] = 1.0
+            elif value < -1.0:
+                samples[i] = -1.0
+    return samples
 
 
 def open_recorder(source):

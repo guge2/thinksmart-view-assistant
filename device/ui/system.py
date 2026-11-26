@@ -70,6 +70,10 @@ def write_atomic(path, data):
         raise
 
 
+def write_json(path, value):
+    write_atomic(path, json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
 def read_wake_phrase():
     try:
         with open(WAKE_PHRASE_FILE, encoding="utf-8") as source:
@@ -161,7 +165,7 @@ class Settings:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 current = Settings().data
                 current.update(values)
-                write_atomic(SETTINGS_FILE, json.dumps(current, ensure_ascii=False).encode("utf-8"))
+                write_json(SETTINGS_FILE, current)
                 self.data = current
             return True
         except OSError as error:
@@ -378,9 +382,9 @@ class SystemStatus:
         self.weather_failed = False
         self.places = []
         self.places_state = "idle"
-        self.pending_lock = threading.Lock()
-        self.pending_volume = None
-        self.pending_brightness = None
+        self.controls = threading.Condition()
+        self.pending_controls = {}
+        self.location_lock = threading.Lock()
         self.search_seq = 0
         self.jobs = queue.Queue()
         self.interval = max(10, env_float("THINKSMART_UI_WEATHER_MINUTES", 30)) * 60
@@ -389,9 +393,9 @@ class SystemStatus:
         if self.weather and time.time() - self.weather["fetched"] < self.interval:
             self.next_weather = time.monotonic() + self.interval - (time.time() - self.weather["fetched"])
         self.next_network = 0.0
-        self.next_volume = 0.0
         self.next_ssid = 0.0
         self.ssid = ""
+        threading.Thread(target=self.run_controls, name="controls", daemon=True).start()
         threading.Thread(target=self.run, name="status", daemon=True).start()
 
     def load_weather_cache(self):
@@ -425,80 +429,84 @@ class SystemStatus:
     def changed(self):
         self.version += 1
 
-    def set_volume(self, percent):
-        with self.pending_lock:
-            self.pending_volume = percent
-        self.jobs.put(None)
+    def request_controls(self, **changes):
+        # One pending value per control, even if the finger moves faster than wpctl.
+        with self.controls:
+            if "volume" in changes:
+                self.volume = changes["volume"]
+                self.muted = self.volume == 0
+            self.pending_controls.update(changes)
+            self.controls.notify()
 
-    def set_brightness(self, percent):
-        with self.pending_lock:
-            self.pending_brightness = percent
-        self.jobs.put(None)
+    def run_controls(self):
+        next_read = 0.0
+        while True:
+            with self.controls:
+                self.controls.wait_for(lambda: self.pending_controls, max(0, next_read - time.monotonic()))
+                changes, self.pending_controls = self.pending_controls, {}
+            if "brightness" in changes:
+                self.backlight.write_percent(changes["brightness"])
+            if "volume" in changes:
+                try:
+                    write_volume(changes["volume"])
+                    next_read = time.monotonic() + 5
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    logging.warning("音量设置失败：%s", error)
+                    next_read = 0.0
+            if changes.get("read_volume") or time.monotonic() >= next_read:
+                try:
+                    volume, muted = read_volume()
+                except (OSError, subprocess.SubprocessError):
+                    volume, muted = None, False
+                with self.controls:
+                    if "volume" not in self.pending_controls and (volume, muted) != (self.volume, self.muted):
+                        self.volume, self.muted = volume, muted
+                        self.changed()
+                next_read = time.monotonic() + 5
 
     def refresh_weather(self):
-        self.weather = None
-        self.weather_failed = False
-        self.failures = 0
-        self.next_weather = 0.0
-        self.changed()
+        with self.location_lock:
+            self.weather = None
+            self.weather_failed = False
+            self.failures = 0
+            self.next_weather = 0.0
+            self.changed()
         self.jobs.put(None)
 
     def find_places(self, name):
-        with self.pending_lock:
+        with self.location_lock:
             self.search_seq += 1
             seq = self.search_seq
-        self.places = []
-        self.places_state = "searching"
-        self.changed()
+            self.places = []
+            self.places_state = "searching"
+            self.changed()
         self.jobs.put(lambda: self.search(name, seq))
 
     def search(self, name, seq):
         try:
             places = search_places(name)
-            with self.pending_lock:
-                if seq != self.search_seq:
-                    return
-            self.places = places
-            self.places_state = "done" if places else "empty"
+            state = "done" if places else "empty"
         except Exception as error:
             logging.warning("城市搜索失败：%s", error)
-            with self.pending_lock:
-                if seq != self.search_seq:
-                    return
-            self.places_state = "error"
-        self.changed()
+            places, state = [], "error"
+        with self.location_lock:
+            if seq == self.search_seq:
+                self.places, self.places_state = places, state
+                self.changed()
 
     def run(self):
         while True:
             try:
-                job = self.jobs.get(timeout=1.0)
+                job = self.jobs.get(timeout=max(0, min(self.next_network, self.next_weather) - time.monotonic()))
             except queue.Empty:
                 job = None
             try:
-                self.apply_pending()
                 if job:
                     job()
-                self.apply_pending()
                 self.poll()
             except Exception:
                 logging.exception("状态更新失败")
                 time.sleep(1)
-
-    def apply_pending(self):
-        with self.pending_lock:
-            brightness, self.pending_brightness = self.pending_brightness, None
-            volume, self.pending_volume = self.pending_volume, None
-        if brightness is not None:
-            self.backlight.write_percent(brightness)
-        if volume is not None:
-            try:
-                write_volume(volume)
-                self.volume = volume
-                self.muted = volume == 0
-            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                logging.warning("音量设置失败：%s", error)
-            self.next_volume = time.monotonic() + 3
-            self.changed()
 
     def poll(self):
         now = time.monotonic()
@@ -507,15 +515,6 @@ class SystemStatus:
             network = self.read_network(now)
             if network != self.network:
                 self.network = network
-                self.changed()
-        if now >= self.next_volume and self.pending_volume is None:
-            self.next_volume = now + 5
-            try:
-                volume, muted = read_volume()
-            except (OSError, subprocess.SubprocessError):
-                volume, muted = None, False
-            if (volume, muted) != (self.volume, self.muted):
-                self.volume, self.muted = volume, muted
                 self.changed()
         if now >= self.next_weather:
             self.update_weather(now)
@@ -544,28 +543,32 @@ class SystemStatus:
 
     def update_weather(self, now):
         location = self.settings["location"]
-        if self.network["kind"] == "none":
-            self.next_weather = now + 60
-            if not self.weather_failed:
-                self.weather_failed = True
-                self.changed()
-            return
-        try:
-            weather = fetch_weather(location)
-        except Exception as error:
-            logging.warning("天气获取失败：%s", error)
-            self.failures += 1
-            self.next_weather = now + min(1800, 120 * 2 ** min(self.failures, 4))
-            self.weather_failed = True
+        online = self.network["kind"] != "none"
+        weather = None
+        if online:
+            try:
+                weather = fetch_weather(location)
+            except Exception as error:
+                logging.warning("天气获取失败：%s", error)
+        with self.location_lock:
+            if location != self.settings["location"]:
+                return
+            if weather is None:
+                if online:
+                    self.failures += 1
+                delay = min(1800, 120 * 2 ** min(self.failures, 4)) if online else 60
+                self.next_weather = now + delay
+                if not self.weather_failed:
+                    self.weather_failed = True
+                    self.changed()
+                return
+            self.failures = 0
+            self.weather = weather
+            self.weather_failed = False
+            self.next_weather = now + self.interval
             self.changed()
-            return
-        self.failures = 0
-        self.weather = weather
-        self.weather_failed = False
-        self.next_weather = now + self.interval
-        self.changed()
         try:
-            write_atomic(WEATHER_FILE, json.dumps(weather, ensure_ascii=False).encode("utf-8"))
+            write_json(WEATHER_FILE, weather)
         except OSError as error:
             logging.warning("天气缓存保存失败：%s", error)
 
@@ -584,8 +587,6 @@ class VoiceLink:
         )
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
         self.sock.bind(self.path)
-        self.out = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
-        self.out.setblocking(False)
 
     def fileno(self):
         return self.sock.fileno()
@@ -608,14 +609,13 @@ class VoiceLink:
     def send(self, command, **fields):
         fields["c"] = command
         try:
-            self.out.sendto(json.dumps(fields).encode("utf-8"), CONTROL_SOCKET)
+            self.sock.sendto(json.dumps(fields).encode("utf-8"), CONTROL_SOCKET)
             return True
         except OSError:
             return False
 
     def close(self):
         self.sock.close()
-        self.out.close()
         try:
             os.unlink(self.path)
         except OSError:

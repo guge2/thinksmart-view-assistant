@@ -2,6 +2,7 @@ import bisect
 import glob
 import importlib.util
 import logging
+import threading
 import unicodedata
 
 VENV_GLOB = "/data/thinksmart/voice/venv/lib/python3*/site-packages/pypinyin/pinyin_dict.py"
@@ -65,16 +66,14 @@ def load_pinyin_dict():
 
 class PinyinInput:
     def __init__(self):
-        self.loaded = False
+        self.loader = threading.Thread(target=self.build, name="pinyin", daemon=True)
         self.index = {}
         self.keys = []
         self.rank = {}
 
-    def available(self):
-        if not self.loaded:
-            self.loaded = True
-            self.build()
-        return bool(self.index)
+    def prepare(self):
+        if self.loader.ident is None:
+            self.loader.start()
 
     def build(self):
         table = load_pinyin_dict()
@@ -111,7 +110,7 @@ class PinyinInput:
 
     def candidates(self, buffer, limit=96):
         """Returns candidate characters and how many buffer letters a pick consumes."""
-        if not buffer or not self.available():
+        if not buffer or self.loader.is_alive() or not self.keys:
             return [], 0
         if self.has_prefix(buffer):
             chosen = list(self.index.get(buffer, ()))

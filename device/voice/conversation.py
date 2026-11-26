@@ -56,9 +56,6 @@ SEARCH_RULES = (
 )
 SPOKEN_RULES = "回复会被直接朗读：不要输出网址、链接、来源标注、引用编号或Markdown标记。"
 
-# The turn a dismissed morning alarm starts; its words make the model call daily_briefing.
-BRIEFING_TEXT = "（闹钟刚被我关掉）早安"
-BRIEFING_WAIT_SECONDS = 4
 # Shorter gaps than this keep the history without comment; longer ones tell the model how long ago it was.
 CONTEXT_GAP_SECONDS = 120
 
@@ -148,13 +145,13 @@ class Conversation:
         self.offline_mode = False
         self.over = False
 
-    def handle_turn(self, user_text, shown=True):
+    def handle_turn(self, user_text):
         self.session.turn_models = {"started_at": time.time(), "chat_model": None, "speech": None}
         self.speaker.heard = ""
         self.local_result = ""
         self.model_turn = False
         try:
-            self._answer(user_text, shown)
+            self._answer(user_text)
         finally:
             # The model records its own turns; local ones are noted so it knows what happened.
             if not self.model_turn:
@@ -165,7 +162,7 @@ class Conversation:
                     reply += f"（设备已执行：{self.local_result}）"
                 self.brain.note(user_text, reply)
 
-    def _answer(self, user_text, shown):
+    def _answer(self, user_text):
         logging.info("用户：%s", user_text)
         phrase = self.wake_word.phrase
         stripped_text = strip_wake_prefix(user_text, phrase)
@@ -175,11 +172,9 @@ class Conversation:
                 self.alarms.dismiss()
             self.cue(LISTEN_TONE)
             self.followup_question = False
-            self.next_followup = (BRIEFING_WAIT_SECONDS if self.alarms.briefing_at is not None
-                                  else self.settings.speech_wait_seconds)
+            self.next_followup = self.settings.speech_wait_seconds
             return
-        if shown:
-            self.ui.emit("user", text=user_text)
+        self.ui.emit("user", text=user_text)
         self.set_phase("think")
         self.music_started = False
         self.over = False

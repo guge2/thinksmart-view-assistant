@@ -26,7 +26,7 @@ from capture import AudioRecovery, Microphone
 from config import (KWS_MODEL, MODEL_NAME, OFFLINE_KEYWORDS_FILE, RUNTIME_DIR, Credentials, Models, Preferences,
                     Settings, clamp_rate, load_chat_config, read_hardware_mic, read_model_overrides)
 from control import NO_ACK, ControlServer
-from conversation import BRIEFING_TEXT, BRIEFING_WAIT_SECONDS, Conversation, create_brain
+from conversation import Conversation, create_brain
 from device_skills import DeviceSkills
 from errors import apology, classify_error
 from listen import Listener
@@ -216,8 +216,7 @@ class ThinkSmartAssistant:
         logging.info("%s检测到唤醒词：%s (%s)", self.session.phase, result, source)
 
     def wait_for_wake(self):
-        """True on a wake word or the talk button, "briefing" when a dismissed alarm asks for the
-        morning briefing, False when the service stops."""
+        """Wait for the wake word or talk button, or return False on shutdown."""
         session = self.session
         logging.info("等待唤醒词：%s", self.wake_word.phrase)
         while not session.stop_requested:
@@ -229,10 +228,6 @@ class ThinkSmartAssistant:
                     session.start_timing("button")
                 self.set_phase("wake")
                 return True
-            if not self.alarms.ringing and self.alarms.take_briefing():
-                session.start_timing("briefing")
-                self.set_phase("wake")
-                return "briefing"
             session.check_cancel()
             if not self.mic.alive():
                 raise RuntimeError("microphone stream ended")
@@ -301,8 +296,8 @@ class ThinkSmartAssistant:
             "stop": stop,
             "alarm_stop": accepted(lambda m: alarms.dismiss()),
             "alarm_snooze": accepted(lambda m: alarms.snooze(m.get("minutes") or 5)),
-            "alarm_cmd": accepted(lambda m: alarms.ui_command(m.get("a"), id=m.get("id"), minutes=m.get("minutes"),
-                                                              label=m.get("label"))),
+            "alarm_cmd": accepted(lambda m: alarms.ui_command(m.get("a"), id=m.get("alarm_id", m.get("id")),
+                                                              minutes=m.get("minutes"), label=m.get("label"))),
             "mic": lambda m, sender: self.set_mic(bool(m.get("on"))) or "applied",
             "hardware_mic": accepted(lambda m: self.refresh_hardware_mic()),
             "hello": lambda m, sender: self.announce() or NO_ACK,
@@ -410,7 +405,6 @@ class ThinkSmartAssistant:
                     if self.recovery.requested.is_set() and not self.alarms.ringing:
                         self.recovery.recover()
                     session.cancel_requested.clear()
-                    woke = True
                     if session.barge_in_requested.is_set():
                         self.set_phase("wake")
                         session.barge_in_requested.clear()
@@ -420,21 +414,14 @@ class ThinkSmartAssistant:
                         if session.screen_off_pending:
                             session.screen_off_pending = False
                             self.ui.emit("sleep")
-                        woke = self.wait_for_wake()
-                        if not woke:
+                        if not self.wait_for_wake():
                             break
                         self.brain.forget_if_idle(self.settings.context_idle_seconds)
                     threading.Thread(target=self.link.prepare, name="link-prepare", daemon=True).start()
                     self.duck()
                     self.begin_turn()
                     self.conversation.begin()
-                    if woke == "briefing":
-                        self.set_cloud("busy")
-                        self.brief()
-                    else:
-                        self.converse()
-                        if self.alarms.take_briefing():
-                            self.brief()
+                    self.converse()
                     self.set_cloud("offline" if self.conversation.offline_mode else "ready")
                 except TurnCancelled:
                     logging.info("本轮对话已取消")
@@ -466,10 +453,7 @@ class ThinkSmartAssistant:
         self.session.check_cancel()
         self.set_cloud("busy")
         try:
-            # Waking only to turn off an alarm should not keep the briefing waiting long.
-            briefing = self.alarms.briefing_at is not None
-            text = self.listener.transcribe(BRIEFING_WAIT_SECONDS if briefing else None,
-                                            playback_active=self.music.active() and not briefing)
+            text = self.listener.transcribe(playback_active=self.music.active())
         except TurnCancelled:
             raise
         except Exception as error:
@@ -512,15 +496,6 @@ class ThinkSmartAssistant:
                 return
             self.duck()
             conversation.handle_turn(text)
-
-    def brief(self):
-        """The day's briefing once a morning alarm is turned off, unless the user moved on to something else."""
-        conversation = self.conversation
-        if conversation.offline_mode or conversation.over or self.music.active():
-            return
-        logging.info("闹钟已关闭，播报今日简报")
-        conversation.handle_turn(BRIEFING_TEXT, shown=False)
-        self.follow_up()
 
     def stop(self, *_args):
         # Signal handlers must stay async-signal-safe; cleanup runs in shutdown() from run().

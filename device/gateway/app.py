@@ -315,7 +315,7 @@ def make_app():
             ident = str(body.get('id') or '').strip()
             if not re.fullmatch(r'[a-f0-9]{4,12}', ident):
                 raise ValueError('编号无效')
-            await voice('alarm_cmd', a='cancel', id=ident)
+            await voice('alarm_cmd', a='cancel', alarm_id=ident)
         elif name == 'volume':
             value = round(number(body.get('value'), 0, 100))
             await asyncio.to_thread(write_volume, value)

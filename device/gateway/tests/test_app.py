@@ -73,7 +73,7 @@ class ActionTests(GatewayTestCase):
         cases = [({"action": "talk"}, ("talk",), {}),
                  ({"action": "music_stop"}, ("music",), {"a": "stop"}),
                  ({"action": "sleep_timer", "minutes": 30.4}, ("music",), {"a": "sleep", "minutes": 30}),
-                 ({"action": "alarm_cancel", "id": "a1b2"}, ("alarm_cmd",), {"a": "cancel", "id": "a1b2"})]
+                 ({"action": "alarm_cancel", "id": "a1b2"}, ("alarm_cmd",), {"a": "cancel", "alarm_id": "a1b2"})]
         for body, args, kwargs in cases:
             with self.subTest(body=body):
                 self.voice.reset_mock()

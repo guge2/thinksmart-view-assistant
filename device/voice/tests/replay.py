@@ -20,7 +20,6 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import assistant as A  # noqa: E402
 from config import Settings  # noqa: E402
-from conversation import BRIEFING_TEXT  # noqa: E402
 from skills import Result  # noqa: E402
 
 DEVICE_SKILLS = ("control_device", "play_music", "control_music", "set_volume", "end_conversation")
@@ -41,7 +40,7 @@ CASES = [
     ]),
     ("早安简报", [], [
         {"say": "早上好", "tool": "daily_briefing", "reply": "度|℃|雨|晴|阴|云"},
-        {"say": BRIEFING_TEXT, "tool": "daily_briefing"},
+        {"say": "今天有什么安排", "tool": "daily_briefing"},
     ]),
     ("天气", [], [
         {"say": "明天杭州会下雨吗", "tool": "get_weather", "args": {"day": 1}},

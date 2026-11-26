@@ -84,11 +84,9 @@ class WakeStream:
         self.spotter = spotter
         self.stream = spotter.create_stream(keywords)
 
-    def feed(self, samples, gain=1.0):
+    def feed(self, samples):
         # Feed silence too: dropping quiet blocks reduced detections on the
         # device's own known wake-word recording.
-        if gain != 1.0:
-            samples = [max(-1.0, min(1.0, v * gain)) for v in samples]
         self.stream.accept_waveform(SAMPLE_RATE, samples)
         while self.spotter.is_ready(self.stream):
             self.spotter.decode_stream(self.stream)
@@ -113,10 +111,10 @@ class MusicWake:
 
     def feed(self, samples, player):
         self.frames += 1
-        full = self.full.feed(samples, gain=RAW_GAIN)
+        full = self.full.feed(samples)
         if full:
             return full
-        partial = self.prefix.feed(samples, gain=RAW_GAIN) if self.prefix else ""
+        partial = self.prefix.feed(samples) if self.prefix else ""
         if partial != "music-prefix":
             return partial
         gap = (self.frames - self.last_prefix) * FRAME_BYTES / (2 * SAMPLE_RATE)
@@ -229,20 +227,17 @@ class WakeDetector:
                 frame = bytes(self.raw_buffer[:FRAME_BYTES])
                 del self.raw_buffer[:FRAME_BYTES]
                 mic.levels["raw"] = frame_level(frame)
-                samples = pcm_to_floats(frame)
+                samples = pcm_to_floats(frame, RAW_GAIN)
                 if self.music_wake is not None:
                     detected = self.music_wake.feed(samples, player)
                 else:
-                    detected = self.raw_stream.feed(samples, gain=RAW_GAIN)
+                    detected = self.raw_stream.feed(samples)
                 result = result or detected
             return result
         except (OSError, RuntimeError, ValueError) as error:
             logging.warning("读取原始麦克风流失败: %s", error)
             self.close_raw()
             return ""
-
-    def decode(self, stream, data, gain=1.0):
-        return stream.feed(pcm_to_floats(data), gain)
 
     def poll(self, capture):
         """Waits up to 0.25 s for audio. Returns (frame, wake word, source): the next complete
@@ -273,7 +268,7 @@ class WakeDetector:
         if self.aec_enabled and not wake_enabled:
             self.stream = WakeStream(self.spotter)
         self.aec_enabled = wake_enabled
-        aec = self.decode(self.stream, frame, gain=AEC_GAIN) if frame and wake_enabled else ""
+        aec = self.stream.feed(pcm_to_floats(frame, AEC_GAIN)) if frame and wake_enabled else ""
         if aec and (self.music.player.state == "playing" or session.phase == "speak" or self.alarms.ringing):
             self.read_raw(False)
             return frame, aec, "AEC"

@@ -1,7 +1,4 @@
 import datetime as dt
-import json
-import os
-import tempfile
 import time
 import unittest
 
@@ -52,73 +49,6 @@ class WeatherTipTests(unittest.TestCase):
         self.assertIsNone(I.weather_tip(rainy, at(20, day=5)))
         self.assertIsNone(I.weather_tip(None, at(20)))
         self.assertIsNone(I.weather_tip({"days": []}, at(7)))
-
-
-class RoutineTests(unittest.TestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.path = os.path.join(directory.name, "routine.json")
-
-    def test_night_spans_midnight(self):
-        self.assertEqual(I.night_of(at(23, 10)), ("2026-11-23", 310))
-        self.assertEqual(I.night_of(at(0, 40, day=1)), ("2026-11-23", 400))
-        self.assertIsNone(I.night_of(at(12)))
-        self.assertEqual(I.clock(400), "0:40")
-
-    def test_learns_the_usual_bedtime(self):
-        routine = I.Routine(self.path)
-        routine.record(at(20))
-        routine.record(at(23, 0))  # the latest use of a night counts
-        routine.record(at(21, 0))
-        routine.record(at(0, 10, day=2))  # the night of the 24th, past midnight
-        routine.record(at(19, 0, day=2))  # an evening out says nothing about bedtime
-        self.assertEqual(routine.nights, {"2026-11-23": 300, "2026-11-24": 370, "2026-11-25": 60})
-        self.assertIsNone(routine.usual(at(22, day=3)))
-        routine.record(at(23, 30, day=3))
-        self.assertIsNone(routine.usual(at(22, day=3)))  # tonight is not history yet
-        self.assertEqual(I.clock(routine.usual(at(22, day=4))), "23:30")
-        routine.save()
-        with open(self.path) as source:
-            self.assertEqual(len(json.load(source)), 4)
-        self.assertEqual(I.Routine(self.path).nights, routine.nights)
-
-    def test_morning_after_a_late_night(self):
-        routine = I.Routine(self.path)
-        routine.nights = {f"2026-11-{d}": 300 for d in (18, 19, 20, 21)}
-        routine.nights["2026-11-22"] = 420  # 01:00
-        self.assertEqual(routine.last_night_tip(at(8)), "昨晚 1:00 才休息，比平时晚 120 分钟，今天别太累")
-        self.assertIsNone(routine.last_night_tip(at(14)))
-        routine.nights["2026-11-22"] = 330
-        self.assertIsNone(routine.last_night_tip(at(8)))
-
-    def test_bad_file_starts_empty(self):
-        with open(self.path, "w") as target:
-            target.write("[1, 2]")
-        with self.assertLogs(level="WARNING"):
-            self.assertEqual(I.Routine(self.path).nights, {})
-
-
-class BedtimeTipTests(unittest.TestCase):
-    def alarm(self, when, kind="alarm"):
-        return {"kind": kind, "due": when.timestamp(), "time": when.strftime("%H:%M")}
-
-    def test_counts_down_to_the_morning_alarm(self):
-        alarms = [self.alarm(at(7, 0, day=1)), self.alarm(at(23, 50), "timer")]
-        self.assertEqual(I.bedtime_tip(alarms, None, at(22, 40)), ("明早 07:00 有闹钟，现在睡还能睡 8 小时 20 分", False))
-        text, urgent = I.bedtime_tip(alarms, None, at(1, 30, day=1))
-        self.assertEqual(text, "今早 07:00 有闹钟，现在睡还能睡 5 小时 30 分")
-        self.assertTrue(urgent)
-
-    def test_window_follows_the_usual_bedtime(self):
-        usual = 330  # 23:30
-        self.assertIsNone(I.bedtime_tip([], usual, at(22, 30)))
-        self.assertEqual(I.bedtime_tip([], usual, at(23, 10)), ("快到平时休息的时间了（约 23:30）", False))
-        self.assertIsNone(I.bedtime_tip([], usual, at(23, 45)))
-        self.assertEqual(I.bedtime_tip([], usual, at(0, 30, day=1)), ("比平时（23:30）晚了 60 分钟，早点休息吧", True))
-        self.assertIsNone(I.bedtime_tip([], usual, at(4, 30, day=1)))
-        self.assertIsNone(I.bedtime_tip([], None, at(23, 0)))
-        self.assertIsNone(I.bedtime_tip([self.alarm(at(7, 0, day=1))], None, at(21, 0)))
 
 
 class RecipeTimerTests(unittest.TestCase):

@@ -14,6 +14,7 @@ import time
 import uuid
 import wave
 
+from shared import system
 from skills import Result
 
 
@@ -163,7 +164,6 @@ class AlarmService:
         self.ringing = False
         self.ringing_id = None
         self.last_rang = None
-        self.briefing_at = None
         self.monotonic_due = {}
         self.retry_after = {}
         self.items = self._load()
@@ -257,28 +257,15 @@ class AlarmService:
     def _save(self):
         parent = os.path.dirname(self.state_file)
         os.makedirs(parent, mode=0o700, exist_ok=True)
-        temporary = self.state_file + ".tmp"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        system.write_json(self.state_file, self.items)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as target:
-                json.dump(self.items, target, ensure_ascii=False)
-                target.flush()
-                os.fsync(target.fileno())
-            os.replace(temporary, self.state_file)
+            directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-            except OSError:
-                logging.warning("闹钟文件已替换，目录同步未完成")
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            logging.warning("闹钟文件已替换，目录同步未完成")
 
     def start(self):
         if self.thread is None:
@@ -295,18 +282,8 @@ class AlarmService:
         with self.lock:
             if not self.ringing:
                 return False
-            if self.last_rang and self.last_rang[0]["kind"] == "alarm":
-                self.briefing_at = time.monotonic()
             self.silence.set()
             return True
-
-    def take_briefing(self):
-        """True once after a morning alarm was dismissed rather than snoozed."""
-        if self.briefing_at is None:
-            return False
-        with self.lock:
-            at, self.briefing_at = self.briefing_at, None
-        return at is not None and time.monotonic() - at < 180 and 4 <= dt.datetime.now().hour < 11
 
     def today_plan(self):
         end = dt.datetime.combine(dt.date.today() + dt.timedelta(days=1), dt.time()).timestamp()
@@ -326,7 +303,6 @@ class AlarmService:
                 source = self.last_rang[0]
             if source is None and not self.ringing:
                 return None
-            self.briefing_at = None
             seconds = minutes * 60
             now = time.time()
             ident = uuid.uuid4().hex[:6]

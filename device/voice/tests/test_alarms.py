@@ -8,7 +8,8 @@ from unittest import mock
 os.environ["TZ"] = "Asia/Shanghai"
 time.tzset()
 
-import alarms
+import device_stubs  # noqa: F401
+from assistant import ThinkSmartAssistant
 from alarms import NOTHING_RINGING, AlarmService, plan_time
 
 
@@ -58,14 +59,6 @@ class PlanTime(unittest.TestCase):
                 plan_time(args, kind, NOW)
 
 
-def clock(hour):
-    class Fixed(dt.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return dt.datetime(2026, 11, 9, hour, 0, tzinfo=tz)
-    return mock.patch.object(alarms.dt, "datetime", Fixed)
-
-
 class Service(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -91,6 +84,15 @@ class Service(unittest.TestCase):
         self.assertEqual(AlarmService(state_file=self.path).items, [])
         self.assertFalse(self.command(action="cancel", id="nope").ok)
 
+    def test_failed_cancel_preserves_saved_alarm(self):
+        self.assertTrue(self.command(action="create", kind="timer", minutes=10).ok)
+        saved = list(self.service.items)
+        with mock.patch.object(os, "replace", side_effect=OSError("disk full")):
+            self.assertFalse(self.command(action="cancel", id=saved[0]["id"]).ok)
+        self.assertEqual(self.service.items, saved)
+        self.assertEqual(AlarmService(state_file=self.path).items, saved)
+        self.assertEqual(os.listdir(self.dir.name), ["alarms.json"])
+
     def test_alarms_and_reminders_ring_with_music(self):
         for kind, expected in (("alarm", "music"), ("reminder", "music"), ("timer", "beep")):
             with self.subTest(kind=kind):
@@ -114,20 +116,19 @@ class Service(unittest.TestCase):
         self.service.last_rang = (self.service.last_rang[0], time.monotonic() - 61)
         self.assertFalse(self.command(action="dismiss").ok)
 
-    def test_briefing_after_morning_alarm(self):
+    def test_stopping_a_morning_alarm_waits_for_an_explicit_wake(self):
+        assistant = mock.Mock(alarms=self.service)
+        assistant.session.stop_requested = False
+        assistant.session.talk_requested.wait.side_effect = [False, True]  # idle poll, then a tap
         self.ring()
-        self.service.dismiss()
-        with clock(7):
-            self.assertTrue(self.service.take_briefing())
-            self.assertFalse(self.service.take_briefing())
-        self.ring()
-        self.service.dismiss()
-        with clock(14):
-            self.assertFalse(self.service.take_briefing())
-        self.ring("timer")
-        self.service.dismiss()
-        with clock(7):
-            self.assertFalse(self.service.take_briefing())
+        with mock.patch.object(dt, "datetime") as clock:
+            clock.now.return_value.hour = 7
+            self.assertTrue(self.service.dismiss())
+            self.assertTrue(self.service.silence.is_set())
+            self.service.ringing = False
+            self.assertIs(ThinkSmartAssistant.wait_for_wake(assistant), True)
+        self.assertEqual(assistant.session.talk_requested.wait.call_count, 2)
+        assistant.session.start_timing.assert_called_once_with("button")
 
     def test_snooze(self):
         self.assertFalse(self.command(action="snooze").ok)
@@ -135,7 +136,6 @@ class Service(unittest.TestCase):
         self.service.dismiss()
         self.service.ringing = False
         self.assertEqual(self.command(action="snooze", minutes=10).message, "好的，10分钟后再提醒")
-        self.assertIsNone(self.service.briefing_at)
         [item] = self.service.items
         self.assertEqual((item["kind"], item["label"]), ("alarm", "起床"))
         self.assertAlmostEqual(item["due"], time.time() + 600, delta=5)
